@@ -17,26 +17,31 @@ In massive codebases, AI coding agents (Claude, Antigravity, Cursor) face four c
 
 `cargo-canon` resolves this by transforming the agent workflow into a **closed-loop verification loop**:
 
-```text
-                            ┌────────────────────────────────────────┐
-                            │        AI Coding Agent (Claude/AGY)    │
-                            └───────┬────────────────────────▲───────┘
-                                    │                        │
-                  Tool / Hook Calls │                        │ Slices / Counterexamples
-                                    ▼                        │
-       ┌─────────────────────────────────────────────────────┴───────────────┐
-       │                    `cargo-canon` CLI Router                         │
-       └───────┬────────────┬─────────────┬─────────────┬────────────┬───────┘
-               │            │             │             │            │
-               ▼            ▼             ▼             ▼            ▼
-         ┌──────────┐ ┌──────────┐  ┌──────────┐  ┌──────────┐ ┌──────────┐
-         │  Slice   │ │ Simulate │  │Diff-Fuzz │  │  Verify  │ │State-Mach│
-         │ (AST/SCIP│ │ (DST/RNG)│  │ (Fuzzer) │  │  (Kani)  │ │ (Sans-IO)│
-         └────┬─────┘ └────┬─────┘  └────┬─────┘  └────┬─────┘ └────┬─────┘
-              │            │             │             │            │
-              ▼            ▼             ▼             ▼            ▼
-       [Fast Skeleton] [Seed Loop]   [Dual Run]   [SMT Model]  [State Space]
-       [Call Graph   ] [Replay Log]  [Shrinker]   [Counterex]  [>10M ops/s ]
+```mermaid
+flowchart TD
+    Agent["AI Coding Agent (Claude / Antigravity)"]
+    Router["cargo-canon CLI Router"]
+
+    subgraph Oracles["Ground-Truth Oracles & Context Slicers"]
+        Slice["Slice (AST Skeletons)"]
+        Sim["Simulate (DST & Replay)"]
+        Diff["Diff-Fuzz (Shadow Trait)"]
+        Verify["Verify (Formal Proofs)"]
+        State["State Machine (Sans-I/O)"]
+    end
+
+    Agent -->|"Tool / Hook Calls"| Router
+    Router --> Slice
+    Router --> Sim
+    Router --> Diff
+    Router --> Verify
+    Router --> State
+
+    Slice -->|"Skeletons & Contracts"| Agent
+    Sim -->|"Seeded Traces & Repair Prompts"| Agent
+    Diff -->|"Shrunk Test Repros"| Agent
+    Verify -->|"SMT Counterexamples"| Agent
+    State -->|"Transition Matrix & Fuzz Reports"| Agent
 ```
 
 ---
@@ -61,8 +66,7 @@ Ensure you have Rust installed (Rust 2024 / 1.85.0+):
 
 ```sh
 # Clone the repository
-git clone https://github.com/your-org/cargo-canon.git
-cd cargo-canon
+git clone https://github.com/your-org/cargo-canon.git && cd cargo-canon
 
 # Build release binaries
 make build
@@ -99,6 +103,7 @@ cargo canon slice src/engine.rs --format json
 ```
 
 Example output:
+
 ```markdown
 # Canon Context Slice: `src/engine.rs`
 > **Token Reduction:** 74.2% context saved vs raw source.
@@ -113,7 +118,6 @@ impl Engine {
     pub fn new(id: u64) -> Self;
     pub fn start(&self) -> Result<(), EngineError>;
 }
-```
 ```
 
 ---
@@ -233,6 +237,7 @@ cargo canon daemon --hook-post-read --file src/engine.rs
 ```
 
 #### Non-Destructive Advisory Context Injection Invariant
+>
 > **CRITICAL:** `cargo canon daemon --hook-post-read` delivers skeletons, contracts, and call hierarchies **exclusively out-of-band** (via stdout or JSON IPC). Source files on disk are guaranteed strictly byte-identical, ensuring line numbers and byte offsets in AI patch/diff editing tools remain 100% accurate.
 
 ---
