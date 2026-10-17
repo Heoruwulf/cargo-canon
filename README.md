@@ -10,18 +10,12 @@
 
 In large codebases, AI coding assistants suffer from four systemic failure modes. Here is how `cargo-canon` approaches and solves each one:
 
-```
-┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                       THE FOUR CORE FAILURE MODES                                      │
-├───────────────────────────────┬───────────────────────────────┬────────────────────────────────────────┤
-│ Failure Mode                  │ How cargo-canon Approaches It │ Concrete Solution in cargo-canon       │
-├───────────────────────────────┼───────────────────────────────┼────────────────────────────────────────┤
-│ 1. Context Dilution & Drift   │ Compiler-aware AST slicing    │ syn skeleton stripping + call-graph    │
-│ 2. Tool Hook File Desync      │ Out-of-band advisory delivery │ Non-destructive post-read verification │
-│ 3. Concurrency Flakiness      │ Seeded deterministic runtime  │ Discrete-event DST + AI repair prompt  │
-│ 4. Shallow Test Hallucination │ Closed-loop adversarial test  │ Diff-fuzzing, Kani SMT & proptest      │
-└───────────────────────────────┴───────────────────────────────┴────────────────────────────────────────┘
-```
+| Failure Mode | How `cargo-canon` Approaches It | Concrete Solution in `cargo-canon` |
+|:---|:---|:---|
+| **1. Context Dilution & Drift** | Compiler-aware AST slicing | `syn` skeleton stripping + call-graph indexing |
+| **2. Tool Hook File Desync** | Out-of-band advisory delivery | Non-destructive post-read verification |
+| **3. Concurrency Flakiness** | Seeded deterministic runtime | Discrete-event DST + AI repair prompt |
+| **4. Shallow Test Hallucination** | Closed-loop adversarial testing | Diff-fuzzing, Kani model proofs & `proptest` |
 
 ### 1. Context Window Dilution & Semantic Drift
 
@@ -97,10 +91,12 @@ flowchart TD
 ## The 6 Ground-Truth Pillars
 
 ### Pillar 1: Deterministic Simulation Testing (`simulate`)
+
 - **Engine:** Seeded discrete-event simulator with virtual clock, message delivery queue, and fault injection.
 - **Execution:** Run $N$ pseudo-random simulation passes (`cargo canon simulate --seeds 5000`).
 - **Reproducibility:** Replay any specific failure deterministically (`cargo canon simulate --seed 0x081e074d89bffda5`).
 - **AI Feedback Loop:** Converts timeline traces directly into repair instructions:
+
   ```text
   # Canon Deterministic Simulation Testing (DST) Oracle: Bug Report
   - Reproducible Seed: 0x081e074d89bffda5
@@ -114,16 +110,19 @@ flowchart TD
   ```
 
 ### Pillar 2: Differential Fuzzing Oracle (`diff-fuzz`)
+
 - **Pattern:** Dual-run shadow trait pattern comparing legacy reference vs. candidate implementation.
 - **Shrinking:** Automatically minimizes failing operation sequences down to the smallest reproducing subset.
 - **Export Reproducer:** Emits a standalone, copy-pasteable Rust `#[test]` reproducer file (`--export-repro`).
 
 ### Pillar 3: Proof-Carrying Patches via Model Checking (`verify`)
+
 - **Engine:** Invokes `cargo kani` with JSON output parsing and unwind bounds (`--unwind 4`).
 - **Counterexample Synthesis:** Parses raw SMT failures into concrete Rust struct initializers detailing the exact input state that triggered the failure.
 - **Scaffolding:** Generates starter `#[kani::proof]` verification stubs (`--scaffold <SYMBOL>`).
 
 ### Pillar 4: Metamorphic Invariant Synthesis (`invariants`)
+
 - **Concept:** Replaces shallow tests with algebraic property suites:
   - *Round-trip:* $f^{-1}(f(x)) \equiv x$
   - *Idempotence:* $f(f(x)) \equiv f(x)$
@@ -132,11 +131,13 @@ flowchart TD
 - **Scaffolding:** Emits complete `proptest` suites ready for production use (`--scaffold <SYMBOL>`).
 
 ### Pillar 5: Sans-I/O Pure State Machine Framework (`state-machine`)
+
 - **Purity:** Pure synchronous domain transitions (`step(&mut State, Event) -> Result<Vec<Action>, Error>`) with caller-injected deterministic time. `#![no_std]` compatible.
 - **Throughput:** Benchmarked at **>10,000,000 transitions/second** with zero heap allocations in steady state.
 - **Reachability Analysis:** Dumps complete transition tables and flags dead/unreachable states (`--matrix`).
 
 ### Pillar 6: Compiler-Aware Context Slicing (`slice`)
+
 - **Extraction:** Sub-millisecond type skeleton extraction using `syn`, stripping function bodies while preserving all trait bounds, visibility, and doc comments.
 - **Graph Queries:** Explores upstream callers and downstream callees up to `--depth <N>`.
 - **Contracts:** Extracts all `impl Trait for Target` blocks associated with the target type.
@@ -166,6 +167,7 @@ Run either as a cargo subcommand (`cargo canon <COMMAND>`) or as a standalone bi
 ## CLI Command Reference
 
 ### Context Slicing
+
 ```sh
 # Stripped type skeleton (default)
 cargo canon slice src/engine.rs
@@ -184,6 +186,7 @@ cargo canon slice src/engine.rs --format json
 ```
 
 ### Deterministic Simulation Testing
+
 ```sh
 # Run 5,000 randomized simulation passes
 cargo canon simulate --seeds 5000
@@ -199,6 +202,7 @@ cargo canon simulate --seeds 5000 --ai-prompt-on-fail
 ```
 
 ### Differential Fuzzing
+
 ```sh
 # Compare legacy vs candidate over 50,000 iterations
 cargo canon diff-fuzz --target-trait KvStore --legacy LegacyMap --candidate CandidateMap --iterations 50000
@@ -208,6 +212,7 @@ cargo canon diff-fuzz --iterations 10000 --export-repro tests/repro.rs
 ```
 
 ### Model Checking
+
 ```sh
 # Run bounded proofs with loop unwinding depth 4
 cargo canon verify --unwind 4
@@ -220,6 +225,7 @@ cargo canon verify --scaffold ConnectionEngine
 ```
 
 ### Metamorphic Invariants
+
 ```sh
 # Run metamorphic property test suite
 cargo canon invariants --run
@@ -229,6 +235,7 @@ cargo canon invariants --scaffold TransactionCoordinator
 ```
 
 ### Sans-I/O State Machine
+
 ```sh
 # Transition matrix and dead-state analysis
 cargo canon state-machine --matrix
@@ -238,6 +245,7 @@ cargo canon state-machine --fuzz-transitions --transitions 500000
 ```
 
 ### Background Daemon & Agent Hooks
+
 ```sh
 # Start background IPC daemon on /tmp/canon.sock
 cargo canon daemon --start
@@ -287,7 +295,9 @@ Annotated template available in [`configs/.canon.toml`](configs/.canon.toml).
 ## Agent Tool Integration
 
 ### Claude Code (`.claude/config.json`)
+
 Configure an advisory post-read hook:
+
 ```json
 {
   "hooks": {
@@ -297,6 +307,7 @@ Configure an advisory post-read hook:
 ```
 
 Pre-packaged configuration templates and starter kits are provided in the [`configs/`](configs/) folder:
+
 - [`configs/.canon.toml`](configs/.canon.toml): Full repository configuration template.
 - [`configs/claude-config.json`](configs/claude-config.json): Claude Code hook setup.
 - [`configs/ground-truth.yml`](configs/ground-truth.yml): GitHub Actions CI verification workflow.
