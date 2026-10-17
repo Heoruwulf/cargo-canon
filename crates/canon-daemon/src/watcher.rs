@@ -23,7 +23,7 @@ pub fn start_watcher(
                     if path.extension().is_some_and(|ext| {
                         matches!(
                             ext.to_str().unwrap_or(""),
-                            "rs" | "ts" | "tsx" | "js" | "jsx"
+                            "rs" | "ts" | "tsx" | "js" | "jsx" | "go"
                         )
                     }) {
                         let _ = tx.blocking_send(path);

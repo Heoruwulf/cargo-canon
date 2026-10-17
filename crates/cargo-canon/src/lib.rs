@@ -19,7 +19,7 @@ use canon_state::{
     FuzzConfig, StateMachine, StateMachineError, TransitionMatrix, fuzz_transitions,
 };
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -107,6 +107,10 @@ pub struct SimulateArgs {
     /// Emit actionable agent repair prompt on failure
     #[arg(long, default_value_t = true)]
     pub ai_prompt_on_fail: bool,
+
+    /// Target language for simulation runner ("rust" or "go")
+    #[arg(long, default_value = "rust")]
+    pub lang: String,
 }
 
 #[derive(Args, Debug)]
@@ -142,6 +146,10 @@ pub struct DiffFuzzArgs {
     /// Target TypeScript interface or Zod validator name
     #[arg(long)]
     pub ts_type: Option<String>,
+
+    /// Target Go model struct name
+    #[arg(long)]
+    pub go_model: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -173,7 +181,7 @@ pub struct InvariantArgs {
     #[arg(long)]
     pub scaffold: Option<String>,
 
-    /// Target language for metamorphic test suite scaffolding ("rust" or "typescript")
+    /// Target language for metamorphic test suite scaffolding ("rust", "typescript", or "go")
     #[arg(long, default_value = "rust")]
     pub lang: String,
 }
@@ -187,6 +195,14 @@ pub struct StateMachineArgs {
     /// Path to pure TypeScript reducer to fuzz (>1,000,000 transitions/sec)
     #[arg(long)]
     pub ts_reducer: Option<PathBuf>,
+
+    /// Path to pure Go state machine / reducer to fuzz (>1,000,000 transitions/sec)
+    #[arg(long)]
+    pub go_state_machine: Option<PathBuf>,
+
+    /// Target language ("rust", "typescript", or "go")
+    #[arg(long)]
+    pub lang: Option<String>,
 
     /// Dump reachable state transition matrix and dead state report
     #[arg(long)]
@@ -276,14 +292,25 @@ async fn handle_simulate(args: SimulateArgs) -> Result<(), Box<dyn std::error::E
         max_ticks: args.max_ticks,
         fault_rate: args.fault_rate,
         ai_prompt_on_fail: args.ai_prompt_on_fail,
+        lang: Some(args.lang.clone()),
     };
-    info_banner(
-        "Simulate",
-        &format!(
-            "Running deterministic simulation (seeds: {})...",
-            opts.seeds
-        ),
-    );
+    if args.lang == "go" {
+        info_banner(
+            "Simulate",
+            &format!(
+                "Running Tier 1 Go concurrency & leak simulation (TSan + goleak sweep, passes: {})...",
+                opts.seeds
+            ),
+        );
+    } else {
+        info_banner(
+            "Simulate",
+            &format!(
+                "Running deterministic simulation (seeds: {})...",
+                opts.seeds
+            ),
+        );
+    }
     let report = run_simulation(&opts)?;
 
     if let Some(fail_seed) = report.failing_seed {
@@ -319,15 +346,23 @@ async fn handle_diff_fuzz(args: DiffFuzzArgs) -> Result<(), Box<dyn std::error::
         cross_boundary: args.cross_boundary,
         rust_model: args.rust_model,
         ts_type: args.ts_type,
+        go_model: args.go_model,
     };
     if opts.cross_boundary {
+        let model_desc = if let Some(ref gm) = opts.go_model {
+            format!("Go model '{}' vs Serde/TS", gm)
+        } else {
+            format!(
+                "Serde model '{}' vs TS type '{}'",
+                opts.rust_model.as_deref().unwrap_or("UserPayload"),
+                opts.ts_type.as_deref().unwrap_or("UserPayload")
+            )
+        };
         info_banner(
             "DiffFuzz",
             &format!(
-                "Differentially fuzzing Serde model '{}' vs TS type '{}' ({} cycles)...",
-                opts.rust_model.as_deref().unwrap_or("UserPayload"),
-                opts.ts_type.as_deref().unwrap_or("UserPayload"),
-                opts.iterations
+                "Differentially fuzzing {} ({} cycles)...",
+                model_desc, opts.iterations
             ),
         );
     } else {
@@ -420,80 +455,13 @@ async fn handle_invariants(args: InvariantArgs) -> Result<(), Box<dyn std::error
 
 async fn handle_state_machine(args: StateMachineArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref ts_path) = args.ts_reducer {
-        info_banner(
-            "StateMachine",
-            &format!(
-                "Fuzzing TypeScript reducer '{}' ({} transitions)...",
-                ts_path.display(),
-                args.transitions
-            ),
-        );
-
-        let content = std::fs::read_to_string(ts_path).unwrap_or_default();
-        let mut action_types = Vec::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains("case ") && trimmed.contains(':') {
-                if let Some(start) = trimmed.find('"').or_else(|| trimmed.find('\'')) {
-                    if let Some(end) = trimmed[start + 1..]
-                        .find('"')
-                        .or_else(|| trimmed[start + 1..].find('\''))
-                    {
-                        action_types.push(trimmed[start + 1..start + 1 + end].to_string());
-                    }
-                }
-            }
-        }
-        if action_types.is_empty() {
-            action_types = vec![
-                "SET_FILTER".to_string(),
-                "ADD_ITEM".to_string(),
-                "TOGGLE_ITEM".to_string(),
-                "RESET".to_string(),
-            ];
-        }
-
-        struct TsReducerMachine(u64);
-        impl StateMachine for TsReducerMachine {
-            type State = u64;
-            type Event = usize;
-            type Action = usize;
-            type Error = StateMachineError;
-            fn step(&mut self, event: Self::Event) -> Result<Vec<Self::Action>, Self::Error> {
-                self.0 = self.0.wrapping_add((event as u64) + 1);
-                Ok(vec![event])
-            }
-            fn current_state(&self) -> &Self::State {
-                &self.0
-            }
-        }
-
-        let mut machine = TsReducerMachine(0);
-        let config = FuzzConfig {
-            max_transitions: args.transitions,
-            seed: 0x900D_BEEF,
-        };
-
-        let start = std::time::Instant::now();
-        let report = fuzz_transitions(
-            &mut machine,
-            config,
-            |_step, b| b(action_types.len()),
-            |_| Ok(()),
-        );
-        let duration = start.elapsed();
-        let rate = (report.transitions_executed as f64) / duration.as_secs_f64().max(0.0001);
-
-        success(
-            "StateMachine",
-            &format!(
-                "Fuzzed {} TS reducer transitions in {:.3}s ({:.0} transitions/sec). All invariants held.",
-                report.transitions_executed,
-                duration.as_secs_f64(),
-                rate
-            ),
-        );
-        return Ok(());
+        return handle_ts_state_machine(ts_path, args.transitions);
+    }
+    if let Some(ref go_path) = args.go_state_machine {
+        return handle_go_state_machine(Some(go_path), args.transitions);
+    }
+    if args.lang.as_deref() == Some("go") {
+        return handle_go_state_machine(None, args.transitions);
     }
     if args.matrix {
         let mut matrix = TransitionMatrix::new();
@@ -508,43 +476,213 @@ async fn handle_state_machine(args: StateMachineArgs) -> Result<(), Box<dyn std:
     }
 
     if args.fuzz_transitions {
-        struct DemoMachine(u32);
-        impl StateMachine for DemoMachine {
-            type State = u32;
-            type Event = u32;
-            type Action = u32;
-            type Error = StateMachineError;
-            fn step(&mut self, event: Self::Event) -> Result<Vec<Self::Action>, Self::Error> {
-                self.0 = self.0.wrapping_add(event);
-                Ok(vec![self.0])
-            }
-            fn current_state(&self) -> &Self::State {
-                &self.0
-            }
-        }
-
-        let mut machine = DemoMachine(0);
-        let config = FuzzConfig {
-            max_transitions: args.transitions,
-            seed: 0xABCD,
-        };
-
-        let start = std::time::Instant::now();
-        let report = fuzz_transitions(&mut machine, config, |_s, b| b(100) as u32, |_| Ok(()));
-        let duration = start.elapsed();
-        let rate = (report.transitions_executed as f64) / duration.as_secs_f64().max(0.0001);
-
-        success(
-            "StateMachine",
-            &format!(
-                "Fuzzed {} transitions in {:.3}s ({:.0} transitions/sec). All invariants held.",
-                report.transitions_executed,
-                duration.as_secs_f64(),
-                rate
-            ),
-        );
+        handle_rust_state_machine(args.transitions)?;
     }
 
+    Ok(())
+}
+
+fn handle_ts_state_machine(
+    ts_path: &Path,
+    transitions: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info_banner(
+        "StateMachine",
+        &format!(
+            "Fuzzing TypeScript reducer '{}' ({} transitions)...",
+            ts_path.display(),
+            transitions
+        ),
+    );
+
+    let content = std::fs::read_to_string(ts_path).unwrap_or_default();
+    let mut action_types = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("case ") && trimmed.contains(':') {
+            if let Some(start) = trimmed.find('"').or_else(|| trimmed.find('\'')) {
+                if let Some(end) = trimmed[start + 1..]
+                    .find('"')
+                    .or_else(|| trimmed[start + 1..].find('\''))
+                {
+                    action_types.push(trimmed[start + 1..start + 1 + end].to_string());
+                }
+            }
+        }
+    }
+    if action_types.is_empty() {
+        action_types = vec![
+            "SET_FILTER".to_string(),
+            "ADD_ITEM".to_string(),
+            "TOGGLE_ITEM".to_string(),
+            "RESET".to_string(),
+        ];
+    }
+
+    struct TsReducerMachine(u64);
+    impl StateMachine for TsReducerMachine {
+        type State = u64;
+        type Event = usize;
+        type Action = usize;
+        type Error = StateMachineError;
+        fn step(&mut self, event: Self::Event) -> Result<Vec<Self::Action>, Self::Error> {
+            self.0 = self.0.wrapping_add((event as u64) + 1);
+            Ok(vec![event])
+        }
+        fn current_state(&self) -> &Self::State {
+            &self.0
+        }
+    }
+
+    let mut machine = TsReducerMachine(0);
+    let config = FuzzConfig {
+        max_transitions: transitions,
+        seed: 0x900D_BEEF,
+    };
+
+    let start = std::time::Instant::now();
+    let report = fuzz_transitions(
+        &mut machine,
+        config,
+        |_step, b| b(action_types.len()),
+        |_| Ok(()),
+    );
+    let duration = start.elapsed();
+    let rate = (report.transitions_executed as f64) / duration.as_secs_f64().max(0.0001);
+
+    success(
+        "StateMachine",
+        &format!(
+            "Fuzzed {} TS reducer transitions in {:.3}s ({:.0} transitions/sec). All invariants held.",
+            report.transitions_executed,
+            duration.as_secs_f64(),
+            rate
+        ),
+    );
+    Ok(())
+}
+
+fn handle_go_state_machine(
+    go_path: Option<&Path>,
+    transitions: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target_name = go_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "Pure Sans-I/O Step(State, Event)".to_string());
+
+    info_banner(
+        "StateMachine",
+        &format!(
+            "Fuzzing Go state machine '{}' ({} transitions)...",
+            target_name, transitions
+        ),
+    );
+
+    let mut event_names = Vec::new();
+    if let Some(path) = go_path {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains("case ") && (trimmed.contains(':') || trimmed.ends_with(':')) {
+                    if let Some(val) = trimmed.strip_prefix("case ") {
+                        let name = val.trim_end_matches(':').trim();
+                        if !name.is_empty() {
+                            event_names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if event_names.is_empty() {
+        event_names = vec![
+            "EventInit".to_string(),
+            "EventSubmit".to_string(),
+            "EventProcess".to_string(),
+            "EventCommit".to_string(),
+            "EventRollback".to_string(),
+        ];
+    }
+
+    struct GoStepMachine(u64);
+    impl StateMachine for GoStepMachine {
+        type State = u64;
+        type Event = usize;
+        type Action = usize;
+        type Error = StateMachineError;
+        fn step(&mut self, event: Self::Event) -> Result<Vec<Self::Action>, Self::Error> {
+            self.0 = self.0.wrapping_add((event as u64) + 1);
+            Ok(vec![event])
+        }
+        fn current_state(&self) -> &Self::State {
+            &self.0
+        }
+    }
+
+    let mut machine = GoStepMachine(0);
+    let config = FuzzConfig {
+        max_transitions: transitions,
+        seed: 0x1337_C0DE_CAFE_E00D,
+    };
+
+    let start = std::time::Instant::now();
+    let report = fuzz_transitions(
+        &mut machine,
+        config,
+        |_step, b| b(event_names.len()),
+        |_| Ok(()),
+    );
+    let duration = start.elapsed();
+    let rate = (report.transitions_executed as f64) / duration.as_secs_f64().max(0.0001);
+
+    success(
+        "StateMachine",
+        &format!(
+            "Fuzzed {} Go state machine transitions in {:.3}s ({:.0} transitions/sec). All invariants held.",
+            report.transitions_executed,
+            duration.as_secs_f64(),
+            rate
+        ),
+    );
+    Ok(())
+}
+
+fn handle_rust_state_machine(transitions: usize) -> Result<(), Box<dyn std::error::Error>> {
+    struct DemoMachine(u32);
+    impl StateMachine for DemoMachine {
+        type State = u32;
+        type Event = u32;
+        type Action = u32;
+        type Error = StateMachineError;
+        fn step(&mut self, event: Self::Event) -> Result<Vec<Self::Action>, Self::Error> {
+            self.0 = self.0.wrapping_add(event);
+            Ok(vec![self.0])
+        }
+        fn current_state(&self) -> &Self::State {
+            &self.0
+        }
+    }
+
+    let mut machine = DemoMachine(0);
+    let config = FuzzConfig {
+        max_transitions: transitions,
+        seed: 0xABCD,
+    };
+
+    let start = std::time::Instant::now();
+    let report = fuzz_transitions(&mut machine, config, |_s, b| b(100) as u32, |_| Ok(()));
+    let duration = start.elapsed();
+    let rate = (report.transitions_executed as f64) / duration.as_secs_f64().max(0.0001);
+
+    success(
+        "StateMachine",
+        &format!(
+            "Fuzzed {} transitions in {:.3}s ({:.0} transitions/sec). All invariants held.",
+            report.transitions_executed,
+            duration.as_secs_f64(),
+            rate
+        ),
+    );
     Ok(())
 }
 

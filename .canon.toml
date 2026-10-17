@@ -23,3 +23,29 @@ corpus_dir = "tests/fuzz/corpus"
 [daemon]
 socket_path = "/tmp/canon.sock"
 enable_file_watcher = true
+
+[go]
+enabled = true
+module_root = "backend"
+extensions = ["go"]
+strip_function_bodies = true
+index_implicit_interfaces = true
+include_private_types = false
+
+[go.concurrency]
+race_detector = true
+goleak_check = true
+gomaxprocs_sweep = [1, 2, 4, 8]
+default_passes = 100
+
+[go.state_machine]
+fuzz_transitions = 100000
+seed = "0x1337C0DECAFEE00D"
+
+[cross_boundary]
+rust_models = "crates/shared-types/src"
+ts_types = "frontend/src/types"
+go_models = "backend/pkg/models"
+strict_casing_check = true
+strict_omitempty_check = true
+strict_nil_slice_check = true

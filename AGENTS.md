@@ -9,39 +9,42 @@ Guidance for AI coding agents working in this repository. This is a Rust **2024*
   - `crates/cargo-canon` (or root binary crate): executable CLI entrypoint and cargo subcommand router (`cargo canon <COMMAND>` / `cargo groundtruth <COMMAND>`). Dispatches to subcommands: `slice`, `simulate`, `diff-fuzz`, `verify`, `invariants`, `state-machine`, `daemon`.
   - `crates/canon-core`: workspace foundation:
     - CLI argument parsing via `clap` (derive API with structured subcommands).
-    - Configuration discovery and deserialization (`.groundtruth.toml` / `.canon.toml`) including `TypeScriptConfig` and `CrossBoundaryConfig`.
+    - Configuration discovery and deserialization (`.groundtruth.toml` / `.canon.toml`) including `TypeScriptConfig`, `GoConfig`, and `CrossBoundaryConfig`.
     - Structured logging initialization (`tracing`, `tracing-subscriber`).
     - Standardized terminal diagnostics (`colored`, `anstream`).
     - Core error primitives (`thiserror`).
   - `crates/canon-slice`: AST parsing and compiler-aware context slicing engine:
     - Fast Rust AST parser using `syn` and `quote` (with fallback to `tree-sitter-rust` for resilient parsing during syntax errors).
     - Fast TypeScript / TSX AST parser using `oxc_parser` (`oxc_allocator`, `oxc_ast`, `oxc_span`).
-    - Polyglot type skeleton stripper: empties Rust function/method bodies (`syn::visit_mut::VisitMut`) and strips TypeScript function bodies, React hook internals (`useEffect`, `useState`), and JSX elements (`extract_ts_skeleton`) to `/* implementation omitted */`, preserving visibility, exported types, interfaces, contracts, and signatures.
-    - Semantic call-graph, contract, and cross-boundary indexer: ingests local SCIP (`scip-rust`) SQLite databases, interfaces via JSON-RPC with `rust-analyzer`, and correlates backend Rust routes/models with frontend TypeScript fetch calls and consumer interfaces (`CrossBoundaryImpact`).
+    - Fast Go AST parser and interface resolver using `tree-sitter-go`.
+    - Polyglot type skeleton stripper: empties Rust function/method bodies (`syn::visit_mut::VisitMut`), strips TypeScript function bodies, React hook internals (`useEffect`, `useState`), and JSX elements (`extract_ts_skeleton`), and strips Go function and method bodies (`extract_go_skeleton`) to `/* implementation omitted */`, preserving visibility, exported types, interfaces, contracts, and signatures.
+    - Implicit interface & method-set resolver: computes value receiver $\mathcal{M}(T)$ and pointer receiver $\mathcal{M}(*T)$ method sets to resolve structural interface satisfaction ($T \text{ satisfies } I \iff \mathcal{M}(I) \subseteq \mathcal{M}(T)$, $*T \text{ satisfies } I \iff \mathcal{M}(I) \subseteq \mathcal{M}(*T)$).
+    - Semantic call-graph, contract, and cross-boundary indexer: ingests local SCIP (`scip-rust`) SQLite databases, interfaces via JSON-RPC with `rust-analyzer`, extracts Go HTTP routes (Gin, Chi, Echo, `net/http`), and correlates backend Rust/Go routes/models with frontend TypeScript fetch calls and consumer interfaces (`CrossBoundaryImpact`).
     - Markdown and JSON formatters for agent prompt injection.
   - `crates/canon-harness`: verification oracles and ground-truth harnesses:
     - Deterministic Simulation Testing (DST) runner integrating with `madsim` for seeded async execution, simulated time, and fault injection.
-    - Differential fuzzing runner wrapping `bolero::check!()` comparing legacy against candidate implementations, plus cross-boundary Serde $\leftrightarrow$ TypeScript serialization contract fuzzing and standalone reproducer generation.
+    - Tier 1 Go concurrency & leak runner (`simulate --lang go`): executes `go test -race` (TSan) paired with `uber-go/goleak` across randomized `GOMAXPROCS` sweeps (`[1, 2, 4, 8]`) with automated AI repair prompt generation.
+    - Differential fuzzing runner wrapping `bolero::check!()` comparing legacy against candidate implementations, plus cross-boundary Serde $\leftrightarrow$ TypeScript $\leftrightarrow$ Go serialization contract fuzzing and standalone reproducer generation (`#[test]`, `.ts`, `_test.go`).
     - Bounded model checking runner invoking `cargo kani` with JSON output parsing and automated counterexample extraction.
-    - Metamorphic property testing harnesses powered by `proptest` (Rust) and `fast-check` suite synthesis (TypeScript).
+    - Metamorphic property testing harnesses powered by `proptest` (Rust), `fast-check` (TypeScript), and `pgregory.net/rapid` (Go).
   - `crates/canon-state`: Sans-I/O pure state machine framework:
-    - Enforces pure domain logic (`step(&mut State, Event) -> (State, Vec<Action>)`).
+    - Enforces pure domain logic (`step(&mut State, Event) -> (State, Vec<Action>)` in Rust, `Step(State, Event) (State, []Action)` in Go).
     - Strictly `#![no_std]` compatible; pure synchronous execution, caller-provided deterministic time, isolated from external side effects.
-    - Exhaustive transition matrix fuzzer capable of >1,000,000 state transitions/sec for Rust state machines and pure TypeScript reducers (`--ts-reducer`).
+    - Exhaustive transition matrix fuzzer capable of >1,000,000 state transitions/sec for Rust state machines, pure TypeScript reducers (`--ts-reducer`), and pure Go state machines (`--lang go` / `--go-state-machine`).
   - `crates/canon-daemon`: agent sidecar and background indexing daemon:
     - High-throughput IPC / Unix domain socket server (`/tmp/groundtruth.sock` or `/tmp/canon.sock`) for sub-millisecond agent tool responses.
-    - Incremental file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, and `.jsx` to update the local symbol index in < 20ms on file mutations.
+    - Incremental file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.go` to update the local symbol index in < 20ms on file mutations.
     - Non-destructive tool hook handlers (`hook post-read`).
 - **NON-DESTRUCTIVE ADVISORY CONTEXT INJECTION (CRITICAL INVARIANT)**:
-  - **Preserve target source files strictly byte-identical on disk at all times during tool hook execution** (e.g., `hook post-read` across `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`). Keep line numbers and byte offsets perfectly stable so downstream patch and diff editing tools (Claude Code, Antigravity) operate with complete accuracy.
+  - **Preserve target source files strictly byte-identical on disk at all times during tool hook execution** (e.g., `hook post-read` across `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`). Keep line numbers and byte offsets perfectly stable so downstream patch and diff editing tools (Claude Code, Antigravity) operate with complete accuracy.
   - **Deliver all injected context** (skeletons, caller hierarchies, trait contracts, cross-boundary bindings, invariants) **exclusively out-of-band** as advisory stdout, JSON-RPC responses, or formatted markdown blocks.
 - **CLOSED-LOOP GROUND-TRUTH VERIFICATION (CRITICAL INVARIANT)**:
   - In codebases exceeding 1M LOC, maintain continuous ground-truth feedback to eliminate context dilution, attention decay, and semantic drift.
   - **Pair every implementation and refactor of critical logic** (parsers, state machines, concurrency coordinators, network protocols) **with an automated, mathematically rigorous ground-truth oracle**:
     - Bounded model proof (`#[kani::proof]`) formally proving panic-freedom, absence of overflows, and complete invariant adherence across all symbolic inputs.
-    - Differential property harness (`bolero`) verifying exact byte-for-byte behavioral and checksum equivalence against legacy code across $10^5+$ randomized inputs, and cross-boundary Serde $\leftrightarrow$ TypeScript contract equivalence.
-    - Deterministic simulation test (`madsim`) passing $\ge 5,000$ randomized seeds under simulated network and scheduling faults.
-    - Metamorphic invariant suite (`proptest` / `fast-check`) proving universal algebraic properties (round-trip, idempotence, permutation invariance, state bounds).
+    - Differential property harness (`bolero`) verifying exact byte-for-byte behavioral and checksum equivalence against legacy code across $10^5+$ randomized inputs, and cross-boundary Serde $\leftrightarrow$ TypeScript $\leftrightarrow$ Go contract equivalence.
+    - Deterministic simulation test (`madsim` for Rust, TSan + `uber-go/goleak` for Go) passing $\ge 5,000$ randomized seeds under simulated network and scheduling faults.
+    - Metamorphic invariant suite (`proptest` / `fast-check` / `pgregory.net/rapid`) proving universal algebraic properties (round-trip, idempotence, permutation invariance, state bounds).
 - **`make` & `cargo` Workflow**:
   - Execute builds, tests, and quality checks exclusively through defined `make <target>` recipes and standard `cargo` commands. Maintain all tool dependencies (`cargo-audit`, `cargo-deny`, `cargo-machete`, `cargo-kani`, `cargo-bolero`, `cargo-miri`) strictly pinned in workspace configuration.
 
@@ -72,16 +75,21 @@ make loc               # scripts/loc.sh: fail on any Rust file over 1500 lines o
 make clean             # cargo clean
 
 # CLI & Engine Tool Invocations (`cargo canon` / `cargo groundtruth`)
-cargo canon slice <FILE>                                           # extract type skeleton (Rust / TS / TSX)
-cargo canon slice <FILE> --cross-boundary                          # slice with Rust <-> TS route & interface correlation
+cargo canon slice <FILE>                                           # extract type skeleton (Rust / TS / TSX / Go)
+cargo canon slice <FILE> --cross-boundary                          # slice with Rust <-> TS <-> Go route & interface correlation
+cargo canon simulate --seeds 5000                                  # deterministic simulation passes (madsim)
+cargo canon simulate --lang go --seeds 100                         # Tier 1 Go concurrency & leak simulation (TSan + goleak)
 cargo canon diff-fuzz --target-trait <TRAIT>                       # differential fuzzing between implementations
 cargo canon diff-fuzz --cross-boundary --rust-model M --ts-type T  # cross-boundary Serde vs TypeScript contract fuzzing
-cargo canon invariants --scaffold <SYMBOL> --lang rust             # scaffold proptest metamorphic suite
-cargo canon invariants --scaffold <SYMBOL> --lang typescript       # scaffold fast-check metamorphic suite
+cargo canon diff-fuzz --cross-boundary --go-model M                # cross-boundary Serde vs Go struct contract fuzzing
+cargo canon invariants --scaffold <SYMBOL> --lang rust             # scaffold proptest metamorphic suite (Rust)
+cargo canon invariants --scaffold <SYMBOL> --lang typescript       # scaffold fast-check metamorphic suite (TypeScript)
+cargo canon invariants --scaffold <SYMBOL> --lang go               # scaffold rapid metamorphic suite (Go)
 cargo canon state-machine --fuzz-transitions                       # fuzz pure Sans-I/O Rust state machine
 cargo canon state-machine --ts-reducer <PATH> --fuzz-transitions   # fuzz pure TypeScript reducer transitions
+cargo canon state-machine --lang go --transitions 500000           # fuzz pure Sans-I/O Go state machine transitions
 cargo canon daemon --start                                         # start background indexing daemon
-cargo canon daemon --hook-post-read --file <PATH>                  # advisory post-read tool hook (.rs / .ts / .tsx)
+cargo canon daemon --hook-post-read --file <PATH>                  # advisory post-read tool hook (.rs / .ts / .tsx / .go)
 ```
 
 - **Run `cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test` immediately after editing any Rust source file (`.rs`).** Restrict execution of the QA suite strictly to Rust source file modifications, reserving documentation, Markdown files (`.md`), and non-Rust assets for direct updates. In the event of a compiler or linter diagnostic, report the complete output immediately, and proceed only once both clippy and the test suite pass with zero errors and zero warnings.
@@ -311,17 +319,18 @@ In codebases >1M LOC, coding agents cannot maintain global architecture in-conte
       [Call Graph   ] [Replay Log]  [Shrinker]   [Counterex]  [Transition ]
 ```
 
-### Pillar 1: Deterministic Simulation Testing (DST) with `madsim`
+### Pillar 1: Deterministic Simulation Testing (DST) with `madsim` & Go Concurrency Sweep
 
 - **Purpose**: Concurrency, async networking, timers, and storage fault testing, guaranteeing 100% deterministic reproducibility across runs.
 - **Harness**: Uses `madsim` as Tokio's deterministic drop-in replacement in test targets.
+- **Tier 1 Go Concurrency & Leak Sweep (`simulate --lang go`)**: Zero-intrusion concurrency and goroutine leak oracle running `go test -race` (TSan) paired with `uber-go/goleak` inspection across randomized `GOMAXPROCS` sweeps (`[1, 2, 4, 8]`) with automated AI repair prompt generation.
 - **Execution**: Run $N$ pseudo-random simulation seeds (`cargo canon simulate --seeds 5000`).
 - **Reproducibility**: Reproduce any failure deterministically from its single `u64` seed (`cargo canon simulate --seed 0xDEADBEEF`).
 - **AI Feedback Loop (`--ai-prompt-on-fail`)**: Automatically format the seed, event timeline, task schedules, and panic trace into an actionable repair prompt for the agent.
 
 ### Pillar 2: Differential Fuzzing with `bolero` / `cargo-fuzz` & Cross-Boundary Oracles
 
-- **Purpose**: Validating that refactored or AI-generated modules exactly preserve legacy behavior across arbitrary inputs, and verifying cross-boundary Serde $\leftrightarrow$ TypeScript contract equivalence.
+- **Purpose**: Validating that refactored or AI-generated modules exactly preserve legacy behavior across arbitrary inputs, and verifying cross-boundary Serde $\leftrightarrow$ TypeScript $\leftrightarrow$ Go contract equivalence.
 - **Shadow Trait Pattern (Rust <-> Rust)**:
   - Define a common interface trait.
   - Maintain the battle-tested code as `LegacyImpl` and candidate code as `CandidateImpl`.
@@ -340,14 +349,15 @@ In codebases >1M LOC, coding agents cannot maintain global architecture in-conte
         });
     ```
 
-- **Cross-Boundary Contract Fuzzing (Rust <-> TypeScript)**:
-  - Fuzz Serde serialized Rust models against TypeScript/Zod interface expectations via `cargo canon diff-fuzz --cross-boundary --rust-model <RustModel> --ts-type <TsInterface>`.
+- **Cross-Boundary Contract Fuzzing (Rust <-> TypeScript <-> Go)**:
+  - Fuzz Serde serialized Rust models against TypeScript/Zod interface expectations and Go models via `cargo canon diff-fuzz --cross-boundary --rust-model <RustModel> --ts-type <TsInterface> --go-model <GoModel>`.
   - Catch subtle cross-language edge cases:
     - JavaScript `Number.MAX_SAFE_INTEGER` ($2^{53}-1$) truncation on large 64-bit integers.
-    - Field casing discrepancies (`snake_case` in Rust vs `camelCase` in TypeScript).
+    - Field casing discrepancies (`snake_case` in Rust vs `camelCase` in TypeScript and Go).
+    - Uninitialized nil slice vs empty slice serialization divergence (Go `null` vs TypeScript/Serde `[]`).
     - Optionality divergence (`Option::None` serializing to explicit `null` vs TypeScript expecting omitted `undefined`).
     - Enum tagging divergences (externally tagged `{"Active":{}}` vs internally tagged `{"type":"Active"}`).
-- **Shrinking & Reproduction**: When a discrepancy occurs, allow `bolero` or the cross-boundary runner to minimize the input to the smallest reproducing payload. Export standalone Rust `#[test]` and companion TypeScript test cases via `--export-repro <PATH>`.
+- **Shrinking & Reproduction**: When a discrepancy occurs, allow `bolero` or the cross-boundary runner to minimize the input to the smallest reproducing payload. Export standalone Rust `#[test]`, companion TypeScript, and Go (`_test.go`) test cases via `--export-repro <PATH>`.
 
 ### Pillar 3: "Proof-Carrying Patches" via Model Checking (`kani`)
 
@@ -355,18 +365,19 @@ In codebases >1M LOC, coding agents cannot maintain global architecture in-conte
 - **Policy**: Pair critical algorithms (ring buffers, state machines, parsers, cryptographic routines) with a `#[kani::proof]` verification harness.
 - **Counterexample Synthesis**: When a proof fails, parse Kani's SMT output into formatted Rust struct initializers detailing the exact failing input state (`cargo canon verify`).
 
-### Pillar 4: Metamorphic Invariant Testing (`proptest` / `fast-check`)
+### Pillar 4: Metamorphic Invariant Testing (`proptest` / `fast-check` / `rapid`)
 
 - **Purpose**: Synthesizing high-level algebraic properties that hold universally across the input space.
 - **Polyglot Property Suites**:
   - Rust: Powered by `proptest` for algebraic properties across models and coordinators (`cargo canon invariants --scaffold <Symbol> --lang rust`).
   - TypeScript: Powered by `fast-check` for frontend models and reducers (`cargo canon invariants --scaffold <Symbol> --lang typescript`).
+  - Go: Powered by `pgregory.net/rapid` for algebraic properties across Go models and state machines (`cargo canon invariants --scaffold <Symbol> --lang go`).
 - **Standard Invariants**:
   - *Round-trip*: $f^{-1}(f(x)) \equiv x$ (serialization, AST parsing/unparsing, compression).
   - *Idempotence*: $f(f(x)) \equiv f(x)$ (formatting, normalization, reconciliation).
   - *Permutation Invariance*: $f(\text{shuffle}(x)) \equiv f(x)$ (set evaluation, query planning).
   - *Monotonicity / Bounds*: State bounds and monotonic counters strictly increase or decrease.
-- **Minimized inputs**: Capture failing cases automatically shrunk by `proptest` or `fast-check` to minimal reproducible test vectors.
+- **Minimized inputs**: Capture failing cases automatically shrunk by `proptest`, `fast-check`, or `rapid` to minimal reproducible test vectors.
 
 ### Pillar 5: Architectural Decoupling: "Sans-I/O" Pure State Machines
 
@@ -380,17 +391,18 @@ In codebases >1M LOC, coding agents cannot maintain global architecture in-conte
   - Total context clarity: Agents only require the `Event`, `Action`, and `State` types, eliminating hundreds of lines of plumbing.
   - Ultra-high throughput: Pure functions execute $>1,000,000$ transitions/sec in a single thread, enabling exhaustive transition fuzzing (`cargo canon state-machine --fuzz-transitions`).
   - TypeScript Reducer Fuzzing: Apply high-throughput transition fuzzing directly to pure TypeScript state reducers (`(state, action) => state`) via `cargo canon state-machine --ts-reducer <PATH> --fuzz-transitions`.
+  - Tier 2 Go State Machine Fuzzing: Pure Sans-I/O discrete-event state machine fuzzing (`Step(State, Event) (State, []Action)`) at >1,000,000 transitions/sec via `cargo canon state-machine --lang go --transitions <N>` or `--go-state-machine <PATH>`.
   - Exhaustive state matrix verification: Inspect reachable states and detect disconnected transitions via `--matrix`.
 
 ### Pillar 6: Compiler-Aware Context Slicing (`slice`)
 
-- **Purpose**: Delivering compact, compiler-accurate context to agents, achieving $>85\%$ token reduction while retaining full type fidelity across Rust and TypeScript/TSX codebases.
+- **Purpose**: Delivering compact, compiler-accurate context to agents, achieving $>85\%$ token reduction while retaining full type fidelity across Rust, TypeScript/TSX, and Go codebases.
 - **Modes & Flags**:
-  - `--mode skeleton` (Default): Uses `syn` for Rust and `oxc_parser` for TypeScript/TSX to strip function bodies, React hook internals, and JSX blocks, emitting exclusively visibility, structs, interfaces, enums, type aliases, and function signatures in $< 10$ms.
+  - `--mode skeleton` (Default): Uses `syn` for Rust, `oxc_parser` for TypeScript/TSX, and `tree-sitter-go` for Go to strip function bodies, React hook internals, and JSX blocks, emitting exclusively visibility, structs, interfaces, enums, type aliases, and function signatures in $< 10$ms.
   - `--mode hierarchy`: Queries local SCIP/LSP symbol graphs to extract upstream callers and downstream callees up to `--depth <N>`.
-  - `--mode contracts`: Extracts all `impl Trait for Target` blocks associated with the target symbol.
+  - `--mode contracts`: Extracts all `impl Trait for Target` blocks (Rust) and resolves structural interface satisfaction for value $\mathcal{M}(T)$ and pointer $\mathcal{M}(*T)$ receiver method sets (Go).
   - `--mode bundle`: Combines skeleton, contracts, and call hierarchy into a single markdown block for LLM prompts.
-  - `--cross-boundary`: Analyzes cross-boundary impact between Rust backend route bindings/data models and TypeScript frontend client call sites and consumer interfaces.
+  - `--cross-boundary`: Analyzes cross-boundary impact between Rust/Go backend route bindings/data models (Gin, Chi, Echo, `net/http`) and TypeScript frontend client call sites and consumer interfaces.
 
 ---
 
@@ -412,7 +424,7 @@ In codebases >1M LOC, coding agents cannot maintain global architecture in-conte
 
 ## Standing Rules
 
-1. **Non-Destructive Context Delivery**: Preserve source files on disk strictly unmodified during tool hook execution (across `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`). Deliver all generated skeletons, contracts, call graphs, and cross-boundary impacts out-of-band to ensure agent line and byte offsets remain perfectly stable.
+1. **Non-Destructive Context Delivery**: Preserve source files on disk strictly unmodified during tool hook execution (across `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`). Deliver all generated skeletons, contracts, call graphs, and cross-boundary impacts out-of-band to ensure agent line and byte offsets remain perfectly stable.
 2. **Quality Gate Verification**: Run `cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test` immediately after every Rust source edit, ensuring compiler and linter passes are fully green before proceeding.
 3. **Rigorous Ground-Truth Oracles**: Validate all critical domain algorithms, parsers, and state transitions using bounded model proofs (`#[kani::proof]`), differential property harnesses (`bolero`), or deterministic simulation passes (`madsim`).
 4. **Sans-I/O Domain Purity**: Confine `crates/canon-state` strictly to pure synchronous state transitions (`step(&mut State, Event) -> (State, Vec<Action>)`), accepting deterministic time from caller inputs.

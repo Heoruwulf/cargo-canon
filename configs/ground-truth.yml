@@ -20,14 +20,28 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+        if: hashFiles('**/*.go') != ''
+
       - name: Install cargo-canon
         run: cargo install cargo-canon
 
-      - name: Run Sans-I/O State Machine Transition Fuzzer & Matrix
-        run: cargo canon state-machine --matrix --fuzz-transitions --transitions 500000
+      - name: Run Sans-I/O State Machine Transition Fuzzer & Matrix (Rust & Go)
+        run: |
+          cargo canon state-machine --matrix --fuzz-transitions --transitions 500000
+          if [ -n "$(find . -name '*.go' -not -path './.*' | head -n 1)" ]; then
+            cargo canon state-machine --lang go --transitions 500000
+          fi
 
-      - name: Run Deterministic Simulation Testing (DST)
-        run: cargo canon simulate --seeds 5000 --ai-prompt-on-fail
+      - name: Run Deterministic Simulation Testing (DST & Go Concurrency Sweep)
+        run: |
+          cargo canon simulate --seeds 5000 --ai-prompt-on-fail
+          if [ -n "$(find . -name '*.go' -not -path './.*' | head -n 1)" ]; then
+            cargo canon simulate --lang go --seeds 100 --ai-prompt-on-fail
+          fi
 
       - name: Run Differential Fuzzing
         run: cargo canon diff-fuzz --iterations 50000

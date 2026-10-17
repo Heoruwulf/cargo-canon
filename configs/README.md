@@ -1,6 +1,6 @@
 # Configuration Templates & Starter Kits
 
-This directory contains drop-in configuration templates and starter kits for integrating `cargo-canon` into your Rust projects and AI coding agent toolchains.
+This directory contains drop-in configuration templates and starter kits for integrating `cargo-canon` into your Rust, TypeScript, and Go projects and AI coding agent toolchains.
 
 ---
 
@@ -8,9 +8,9 @@ This directory contains drop-in configuration templates and starter kits for int
 
 | Template | Target Path in Your Project | Purpose |
 | :--- | :--- | :--- |
-| [`.canon.toml`](.canon.toml) | `.canon.toml` (repo root) | Full configuration options for slicing, simulation, fuzzing, Kani, daemon, TypeScript, and cross-boundary contracts. |
-| [`claude-config.json`](claude-config.json) | `.claude/config.json` | Configures Claude Code to automatically invoke the post-read advisory context hook. |
-| [`ground-truth.yml`](ground-truth.yml) | `.github/workflows/ground-truth.yml` | GitHub Actions CI workflow running deterministic simulation, differential fuzzing, and model checking. |
+| [`.canon.toml`](.canon.toml) | `.canon.toml` (repo root) | Full configuration options for slicing, simulation, fuzzing, Kani, daemon, TypeScript, Go (Tier 1 TSan/goleak & Tier 2 state machine), and cross-boundary contracts. |
+| [`claude-config.json`](claude-config.json) | `.claude/config.json` | Configures Claude Code to automatically invoke the post-read advisory context hook (`.rs`, `.ts`, `.tsx`, `.go`). |
+| [`ground-truth.yml`](ground-truth.yml) | `.github/workflows/ground-truth.yml` | GitHub Actions CI workflow running deterministic simulation, differential fuzzing, and model checking across Rust and Go. |
 | [`pre-commit.sh`](pre-commit.sh) | `.git/hooks/pre-commit` or `.githooks/pre-commit` | Fast local git pre-commit hook verifying state machine reachability and running 500 simulation seeds. |
 
 ---

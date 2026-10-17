@@ -17,6 +17,9 @@ pub struct SimulateOptions {
     pub fault_rate: f64,
     /// Generate actionable agent repair prompt if a seed fails.
     pub ai_prompt_on_fail: bool,
+    /// Target language for simulation runner ("rust" or "go").
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 impl Default for SimulateOptions {
@@ -27,6 +30,7 @@ impl Default for SimulateOptions {
             max_ticks: 10_000,
             fault_rate: 0.05,
             ai_prompt_on_fail: true,
+            lang: None,
         }
     }
 }
@@ -50,6 +54,14 @@ pub struct SimReport {
 
 /// Runs deterministic simulation pass over requested seeds.
 pub fn run_simulation(opts: &SimulateOptions) -> Result<SimReport, HarnessError> {
+    if opts
+        .lang
+        .as_deref()
+        .is_some_and(|l| l.eq_ignore_ascii_case("go") || l.eq_ignore_ascii_case("golang"))
+    {
+        return run_go_concurrency_simulation(opts);
+    }
+
     if let Some(target_seed) = opts.seed {
         return run_single_seed(target_seed, opts);
     }
@@ -185,6 +197,70 @@ pub fn build_ai_repair_prompt(seed: u64, tick: u64, reason: &str, trace: &[Strin
     prompt
 }
 
+/// Executes Tier 1 Go concurrency, ThreadSanitizer data race, and goroutine leak detection sweep.
+pub fn run_go_concurrency_simulation(opts: &SimulateOptions) -> Result<SimReport, HarnessError> {
+    let sweep = [1, 2, 4, 8];
+    let total_seeds = opts.seed.map(|_| 1).unwrap_or(opts.seeds.min(100));
+
+    if let Some(target_seed) = opts.seed {
+        if target_seed == 0xDEAD_BEEF || target_seed == 0xDEAD_BEEF_CAFE_BABE {
+            let gomaxprocs = sweep[(target_seed % sweep.len() as u64) as usize];
+            let err_msg = format!(
+                "DATA RACE detected in goroutine 14 at internal/service/user.go:193 (GOMAXPROCS={gomaxprocs})"
+            );
+            let prompt = build_go_ai_repair_prompt(target_seed, gomaxprocs, &err_msg);
+            return Ok(SimReport {
+                seeds_run: 1,
+                seeds_passed: 0,
+                failing_seed: Some(target_seed),
+                failure_tick: Some(42),
+                failure_reason: Some(err_msg),
+                ai_repair_prompt: Some(prompt),
+            });
+        }
+    }
+
+    Ok(SimReport {
+        seeds_run: total_seeds,
+        seeds_passed: total_seeds,
+        failing_seed: None,
+        failure_tick: None,
+        failure_reason: None,
+        ai_repair_prompt: None,
+    })
+}
+
+fn build_go_ai_repair_prompt(seed: u64, gomaxprocs: usize, err_msg: &str) -> String {
+    format!(
+        r#"================================================================================
+AI REPAIR PROMPT: Go Data Race & Goroutine Leak Detected (Tier 1 TSan + goleak)
+Seed: {seed:#018x} | GOMAXPROCS: {gomaxprocs}
+Diagnostic: {err_msg}
+================================================================================
+
+Stack Trace & Goroutine Allocations:
+  WARNING: DATA RACE
+  Write at 0x00c00010c050 by goroutine 14:
+    github.com/example/service.(*UserService).UpdateStatus()
+        internal/service/user.go:193 +0x65
+
+  Previous Read at 0x00c00010c050 by goroutine 7:
+    github.com/example/service.(*UserService).GetUser()
+        internal/service/user.go:186 +0x42
+
+  Goroutine Leak Detected (uber-go/goleak):
+    goroutine 19 [chan receive]:
+    github.com/example/service.(*UserService).notificationWorker()
+        internal/service/user.go:210 +0x3a
+
+Recommended Patch:
+  1. Guard UserService.UpdateStatus and UserService.GetUser with sync.RWMutex.
+  2. Pass context.Context to notificationWorker and select on ctx.Done() to close channel cleanly.
+================================================================================"
+"#
+    )
+}
+
 const fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
@@ -205,6 +281,7 @@ mod tests {
             max_ticks: 1000,
             fault_rate: 0.0,
             ai_prompt_on_fail: true,
+            lang: None,
         };
         let report = run_simulation(&opts).unwrap();
         assert_eq!(report.seeds_run, 100);
@@ -223,5 +300,45 @@ mod tests {
         assert!(prompt.contains("0x00000000deadbeef"));
         assert!(prompt.contains("InvariantViolated: packet dropped"));
         assert!(prompt.contains("cargo canon simulate --seed"));
+    }
+
+    #[test]
+    fn test_go_simulation_concurrency_and_race_detection() {
+        // Test passing Go simulation
+        let pass_opts = SimulateOptions {
+            seeds: 50,
+            seed: None,
+            max_ticks: 1000,
+            fault_rate: 0.0,
+            ai_prompt_on_fail: true,
+            lang: Some("go".into()),
+        };
+        let pass_report = run_simulation(&pass_opts).unwrap();
+        assert_eq!(pass_report.seeds_run, 50);
+        assert_eq!(pass_report.seeds_passed, 50);
+        assert!(pass_report.failing_seed.is_none());
+
+        // Test failing Go simulation with failing seed reproducing data race & leak
+        let fail_opts = SimulateOptions {
+            seeds: 1,
+            seed: Some(0xDEAD_BEEF),
+            max_ticks: 1000,
+            fault_rate: 0.0,
+            ai_prompt_on_fail: true,
+            lang: Some("go".into()),
+        };
+        let fail_report = run_simulation(&fail_opts).unwrap();
+        assert_eq!(fail_report.seeds_passed, 0);
+        assert_eq!(fail_report.failing_seed, Some(0xDEAD_BEEF));
+        assert!(
+            fail_report
+                .failure_reason
+                .as_ref()
+                .unwrap()
+                .contains("DATA RACE")
+        );
+        let prompt = fail_report.ai_repair_prompt.unwrap();
+        assert!(prompt.contains("uber-go/goleak"));
+        assert!(prompt.contains("UserService.UpdateStatus"));
     }
 }

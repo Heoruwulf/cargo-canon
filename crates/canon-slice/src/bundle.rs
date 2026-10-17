@@ -50,6 +50,8 @@ impl SliceBundle {
             || self.target.ends_with(".jsx")
         {
             "typescript"
+        } else if self.target.ends_with(".go") {
+            "go"
         } else {
             "rust"
         };
@@ -94,6 +96,9 @@ impl SliceBundle {
 
         if let Some(ref cb) = self.cross_boundary {
             out.push_str("## Cross-Boundary Impact\n\n");
+            if let Some(ref go_def) = cb.go_definition {
+                out.push_str(&format!("- **Go Backend Model:** `{}`\n", go_def));
+            }
             if let Some(ref rust_def) = cb.rust_definition {
                 out.push_str(&format!("- **Rust Backend Definition:** `{}`\n", rust_def));
             }
@@ -144,6 +149,9 @@ impl SliceBundle {
 
         if let Some(ref cb) = self.cross_boundary {
             out.push_str("--- Cross-Boundary Impact ---\n");
+            if let Some(ref go_def) = cb.go_definition {
+                out.push_str(&format!("Go Backend Model: {}\n", go_def));
+            }
             if let Some(ref rust_def) = cb.rust_definition {
                 out.push_str(&format!("Rust Backend Definition: {}\n", rust_def));
             }
@@ -151,7 +159,7 @@ impl SliceBundle {
                 out.push_str(&format!("TypeScript Consumer Interface: {}\n", ts_def));
             }
             for site in &cb.api_call_sites {
-                out.push_str(&format!("Frontend Call Site: {}\n", site));
+                out.push_str(&format!("Call Site: {}\n", site));
             }
             out.push('\n');
         }

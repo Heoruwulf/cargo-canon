@@ -21,6 +21,8 @@ oxc_parser = { workspace = true }
 oxc_span = { workspace = true }
 oxc_ast = { workspace = true }
 regex = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -9,12 +9,16 @@
 
 pub mod bundle;
 pub mod error;
+pub mod go_skeleton;
 pub mod indexer;
 pub mod skeleton;
 pub mod ts_skeleton;
 
 pub use bundle::SliceBundle;
 pub use error::SliceError;
+pub use go_skeleton::{
+    extract_go_file_skeleton, extract_go_skeleton, extract_go_skeleton_with_options,
+};
 pub use indexer::{
     CallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, SymbolDef, SymbolIndex,
 };
@@ -38,9 +42,12 @@ pub fn slice_target(
         .and_then(|e| e.to_str())
         .unwrap_or("");
     let is_ts = matches!(ext, "ts" | "tsx" | "js" | "jsx");
+    let is_go = ext == "go";
     let skeleton = if is_ts {
         let is_jsx = matches!(ext, "tsx" | "jsx");
         extract_ts_skeleton(&raw_source, is_jsx)?
+    } else if is_go {
+        extract_go_skeleton(&raw_source)?
     } else {
         extract_skeleton(&raw_source)?
     };
@@ -75,7 +82,8 @@ pub fn slice_target(
             .trim_end_matches(".tsx")
             .trim_end_matches(".ts")
             .trim_end_matches(".jsx")
-            .trim_end_matches(".js");
+            .trim_end_matches(".js")
+            .trim_end_matches(".go");
         cross_boundary = idx
             .get_cross_boundary_impact(sym_stem)
             .or_else(|| idx.get_cross_boundary_impact(target_name))
@@ -196,5 +204,46 @@ mod tests {
         assert!(md.contains("## Cross-Boundary Impact"));
         assert!(md.contains("Rust Backend Definition:"));
         assert!(md.contains("TypeScript Consumer Interface:"));
+    }
+
+    #[test]
+    fn test_slice_target_bundle_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let go_path = dir.path().join("user.go");
+        let ts_path = dir.path().join("user.ts");
+
+        std::fs::write(
+            &go_path,
+            r#"
+            package model
+            type UserPayload struct {
+                ID uint64 `json:"user_id"`
+            }
+            func (u *UserPayload) Validate() bool {
+                return u.ID > 0
+            }
+            "#,
+        )
+        .unwrap();
+
+        std::fs::write(&ts_path, "export interface UserPayload { id: number; }").unwrap();
+
+        let mut index = SymbolIndex::new();
+        index.index_directory(dir.path()).unwrap();
+
+        let bundle = slice_target(&go_path, SliceMode::Bundle, Some(&index)).unwrap();
+        assert!(bundle.skeleton.contains("type UserPayload struct"));
+        assert!(
+            bundle
+                .skeleton
+                .contains("func (u *UserPayload) Validate() bool;")
+        );
+        assert!(!bundle.skeleton.contains("return u.ID > 0"));
+
+        let md = bundle.format_markdown();
+        assert!(md.contains("```go"));
+        assert!(md.contains("Token Reduction:"));
+        assert!(md.contains("## Cross-Boundary Impact"));
+        assert!(md.contains("Go Backend Model:"));
     }
 }

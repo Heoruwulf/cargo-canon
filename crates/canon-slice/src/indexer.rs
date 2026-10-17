@@ -72,7 +72,7 @@ pub struct RouteBinding {
     pub is_backend: bool,
 }
 
-/// Cross-boundary correlation between Rust backend and TypeScript frontend contracts.
+/// Cross-boundary correlation between Rust backend, Go backend, and TypeScript frontend contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossBoundaryImpact {
     /// Inspected target symbol.
@@ -81,6 +81,9 @@ pub struct CrossBoundaryImpact {
     pub rust_definition: Option<String>,
     /// TypeScript consumer interface, e.g. "frontend/src/types/user.ts:18 (UpdateUserPayload)".
     pub ts_interface: Option<String>,
+    /// Go backend definition site, e.g. "internal/model/user.go:18 (User)".
+    #[serde(default)]
+    pub go_definition: Option<String>,
     /// Frontend client call sites.
     pub api_call_sites: Vec<String>,
 }
@@ -124,7 +127,7 @@ impl SymbolIndex {
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("");
-                if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx") {
+                if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "go") {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
                         let path_str = entry.path().to_string_lossy().to_string();
                         let _ = self.index_any_source_str(&path_str, &content);
@@ -136,21 +139,48 @@ impl SymbolIndex {
         Ok(indexed_count)
     }
 
-    /// Indexes source from any supported language (Rust, TypeScript, TSX, JS).
+    /// Indexes source from any supported language (Rust, TypeScript, TSX, JS, Go).
     pub fn index_any_source_str(
         &mut self,
         file_path: &str,
         content: &str,
     ) -> Result<(), SliceError> {
-        let is_ts = file_path.ends_with(".ts")
+        if file_path.ends_with(".go") {
+            self.index_go_source_str(file_path, content)
+        } else if file_path.ends_with(".ts")
             || file_path.ends_with(".tsx")
             || file_path.ends_with(".js")
-            || file_path.ends_with(".jsx");
-        if is_ts {
+            || file_path.ends_with(".jsx")
+        {
             self.index_ts_source_str(file_path, content)
         } else {
             self.index_source_str(file_path, content)
         }
+    }
+
+    /// Indexes a single Go source string.
+    pub fn index_go_source_str(
+        &mut self,
+        file_path: &str,
+        content: &str,
+    ) -> Result<(), SliceError> {
+        let data = crate::go_skeleton::index_go_ast(file_path, content)?;
+        for sym in data.symbols {
+            self.symbols_map
+                .entry(sym.name.clone())
+                .or_default()
+                .push(sym);
+        }
+        for contract in data.contracts {
+            self.contracts_map
+                .entry(contract.target_type.clone())
+                .or_default()
+                .push(contract);
+        }
+        for route in data.routes {
+            self.routes.push(route);
+        }
+        Ok(())
     }
 
     /// Indexes a single Rust source string.
@@ -404,6 +434,15 @@ impl SymbolIndex {
             })
             .map(|d| format!("{}:{} (`{}`)", d.file, d.line, d.name));
 
+        let go_def = self
+            .symbols_map
+            .get(symbol)
+            .and_then(|defs| {
+                defs.iter()
+                    .find(|d| d.language == "go" || d.file.ends_with(".go"))
+            })
+            .map(|d| format!("{}:{} (`{}`)", d.file, d.line, d.name));
+
         let mut call_sites = Vec::new();
         let sym_trimmed = symbol
             .trim_end_matches("Payload")
@@ -413,17 +452,22 @@ impl SymbolIndex {
         let trimmed_lower = sym_trimmed.to_lowercase();
 
         for r in &self.routes {
-            if !r.is_backend {
-                let r_lower = r.route_path.to_lowercase();
-                let handler_lower = r.handler_or_caller.to_lowercase();
-                let matched = r_lower.contains(&sym_lower)
-                    || handler_lower.contains(&sym_lower)
-                    || handler_lower.contains(&trimmed_lower)
-                    || (!trimmed_lower.is_empty() && r_lower.contains(&trimmed_lower))
-                    || (trimmed_lower.len() >= 4
-                        && (r_lower.contains(&trimmed_lower[..4])
-                            || handler_lower.contains(&trimmed_lower[..4])));
-                if matched {
+            let r_lower = r.route_path.to_lowercase();
+            let handler_lower = r.handler_or_caller.to_lowercase();
+            let matched = r_lower.contains(&sym_lower)
+                || handler_lower.contains(&sym_lower)
+                || handler_lower.contains(&trimmed_lower)
+                || (!trimmed_lower.is_empty() && r_lower.contains(&trimmed_lower))
+                || (trimmed_lower.len() >= 4
+                    && (r_lower.contains(&trimmed_lower[..4])
+                        || handler_lower.contains(&trimmed_lower[..4])));
+            if matched {
+                if r.is_backend && r.file.ends_with(".go") {
+                    call_sites.push(format!(
+                        "Go Router: {}:{} -> `{}`",
+                        r.file, r.line, r.route_path
+                    ));
+                } else if !r.is_backend {
                     call_sites.push(format!(
                         "{}:{} (`{}()`)",
                         r.file, r.line, r.handler_or_caller
@@ -435,11 +479,12 @@ impl SymbolIndex {
         call_sites.sort();
         call_sites.dedup();
 
-        if rust_def.is_some() || ts_def.is_some() || !call_sites.is_empty() {
+        if rust_def.is_some() || ts_def.is_some() || go_def.is_some() || !call_sites.is_empty() {
             Some(CrossBoundaryImpact {
                 symbol: symbol.to_string(),
                 rust_definition: rust_def,
                 ts_interface: ts_def,
+                go_definition: go_def,
                 api_call_sites: call_sites,
             })
         } else {
@@ -489,10 +534,53 @@ impl SymbolIndex {
 
     /// Retrieves trait contracts associated with a target type.
     pub fn get_contracts(&self, target_type: &str) -> Vec<ContractInfo> {
-        self.contracts_map
+        let mut list = self
+            .contracts_map
             .get(target_type)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        if !target_type.starts_with('*') {
+            let ptr_name = format!("*{}", target_type);
+            if let Some(ptr_contracts) = self.contracts_map.get(&ptr_name) {
+                list.extend(ptr_contracts.clone());
+            }
+        }
+
+        if list.is_empty() {
+            for contracts in self.contracts_map.values() {
+                for c in contracts {
+                    if c.trait_name == target_type
+                        || c.trait_name.ends_with(&format!(".{target_type}"))
+                    {
+                        list.push(c.clone());
+                    }
+                }
+            }
+        }
+        list
+    }
+
+    /// Returns satisfied interfaces for a Go struct type (both value and pointer receiver sets).
+    pub fn get_satisfied_interfaces(&self, struct_name: &str) -> Vec<ContractInfo> {
+        self.get_contracts(struct_name)
+    }
+
+    /// Returns concrete implementor type names of an interface.
+    pub fn get_interface_implementors(&self, interface_name: &str) -> Vec<String> {
+        let mut implementors = Vec::new();
+        for (target_type, contracts) in &self.contracts_map {
+            for c in contracts {
+                if c.trait_name == interface_name
+                    || c.trait_name.ends_with(&format!(".{interface_name}"))
+                {
+                    implementors.push(target_type.clone());
+                }
+            }
+        }
+        implementors.sort();
+        implementors.dedup();
+        implementors
     }
 }
 

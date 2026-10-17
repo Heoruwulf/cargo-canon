@@ -20,9 +20,9 @@ if [ ! -f "$TARGET_FILE" ]; then
     exit 0
 fi
 
-# Process Rust and TypeScript source files
+# Process Rust, TypeScript, and Go source files
 case "$TARGET_FILE" in
-    *.rs|*.ts|*.tsx|*.js|*.jsx)
+    *.rs|*.ts|*.tsx|*.js|*.jsx|*.go)
         ;;
     *)
         exit 0

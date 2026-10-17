@@ -29,6 +29,9 @@ pub struct CanonConfig {
     /// Configuration for TypeScript / TSX context slicing.
     #[serde(default)]
     pub typescript: TypeScriptConfig,
+    /// Configuration for Go context slicing and verification.
+    #[serde(default)]
+    pub go: GoConfig,
     /// Configuration for cross-boundary contract correlation.
     #[serde(default)]
     pub cross_boundary: CrossBoundaryConfig,
@@ -268,9 +271,18 @@ pub struct CrossBoundaryConfig {
     /// Directory containing TypeScript contract definitions.
     #[serde(default = "default_ts_types")]
     pub ts_types: String,
+    /// Directory containing Go backend models.
+    #[serde(default = "default_go_models")]
+    pub go_models: String,
     /// Enforce camelCase vs snake_case consistency checks.
     #[serde(default = "default_true")]
     pub strict_casing_check: bool,
+    /// Enforce omitempty zero-value discrepancy validation.
+    #[serde(default = "default_true")]
+    pub strict_omitempty_check: bool,
+    /// Enforce nil slice vs empty slice serialization consistency.
+    #[serde(default = "default_true")]
+    pub strict_nil_slice_check: bool,
 }
 
 fn default_rust_models() -> String {
@@ -281,12 +293,135 @@ fn default_ts_types() -> String {
     "frontend/src/types".to_string()
 }
 
+fn default_go_models() -> String {
+    "backend/pkg/models".to_string()
+}
+
 impl Default for CrossBoundaryConfig {
     fn default() -> Self {
         Self {
             rust_models: default_rust_models(),
             ts_types: default_ts_types(),
+            go_models: default_go_models(),
             strict_casing_check: true,
+            strict_omitempty_check: true,
+            strict_nil_slice_check: true,
+        }
+    }
+}
+
+/// Configuration for Go context slicing and verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoConfig {
+    /// Enable Go parsing and slicing.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Root directory for Go modules or monorepo root.
+    #[serde(default = "default_go_module_root")]
+    pub module_root: String,
+    /// Supported Go file extensions.
+    #[serde(default = "default_go_extensions")]
+    pub extensions: Vec<String>,
+    /// Strip function and method bodies.
+    #[serde(default = "default_true")]
+    pub strip_function_bodies: bool,
+    /// Compute implicit interface satisfaction matrix.
+    #[serde(default = "default_true")]
+    pub index_implicit_interfaces: bool,
+    /// Include unexported (lowercase) types and helpers.
+    #[serde(default)]
+    pub include_private_types: bool,
+    /// Tier 1: Concurrency and race verification settings.
+    #[serde(default)]
+    pub concurrency: GoConcurrencyConfig,
+    /// Tier 2: Pure Sans-I/O state machine settings.
+    #[serde(default)]
+    pub state_machine: GoStateMachineConfig,
+}
+
+fn default_go_module_root() -> String {
+    "backend".to_string()
+}
+
+fn default_go_extensions() -> Vec<String> {
+    vec!["go".to_string()]
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            module_root: default_go_module_root(),
+            extensions: default_go_extensions(),
+            strip_function_bodies: true,
+            index_implicit_interfaces: true,
+            include_private_types: false,
+            concurrency: GoConcurrencyConfig::default(),
+            state_machine: GoStateMachineConfig::default(),
+        }
+    }
+}
+
+/// Tier 1: Go concurrency and goroutine leak options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoConcurrencyConfig {
+    /// Enable Go race detector (TSan).
+    #[serde(default = "default_true")]
+    pub race_detector: bool,
+    /// Enable uber-go/goleak inspection.
+    #[serde(default = "default_true")]
+    pub goleak_check: bool,
+    /// GOMAXPROCS randomized sweep values.
+    #[serde(default = "default_gomaxprocs")]
+    pub gomaxprocs_sweep: Vec<usize>,
+    /// Default number of passes.
+    #[serde(default = "default_go_passes")]
+    pub default_passes: u64,
+}
+
+fn default_gomaxprocs() -> Vec<usize> {
+    vec![1, 2, 4, 8]
+}
+
+fn default_go_passes() -> u64 {
+    100
+}
+
+impl Default for GoConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            race_detector: true,
+            goleak_check: true,
+            gomaxprocs_sweep: default_gomaxprocs(),
+            default_passes: default_go_passes(),
+        }
+    }
+}
+
+/// Tier 2: Pure Sans-I/O Go state machine verification options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoStateMachineConfig {
+    /// Number of transitions to fuzz.
+    #[serde(default = "default_fuzz_transitions")]
+    pub fuzz_transitions: usize,
+    /// Deterministic 64-bit seed (hex string).
+    #[serde(default = "default_go_seed")]
+    pub seed: String,
+}
+
+fn default_fuzz_transitions() -> usize {
+    100_000
+}
+
+fn default_go_seed() -> String {
+    "0x1337C0DECAFEE00D".to_string()
+}
+
+impl Default for GoStateMachineConfig {
+    fn default() -> Self {
+        Self {
+            fuzz_transitions: default_fuzz_transitions(),
+            seed: default_go_seed(),
         }
     }
 }
@@ -408,5 +543,59 @@ watch_paths = ["crates", "frontend/src"]
         assert_eq!(cfg.cross_boundary.ts_types, "frontend/src/types");
         assert!(cfg.cross_boundary.strict_casing_check);
         assert_eq!(cfg.daemon.watch_paths.len(), 2);
+    }
+
+    #[test]
+    fn test_load_go_config() {
+        use std::io::Write;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[general]
+codebase_scale = "massive"
+
+[go]
+enabled = true
+module_root = "backend"
+extensions = ["go"]
+strip_function_bodies = true
+index_implicit_interfaces = true
+include_private_types = false
+
+[go.concurrency]
+race_detector = true
+goleak_check = true
+gomaxprocs_sweep = [1, 2, 4, 8]
+default_passes = 100
+
+[go.state_machine]
+fuzz_transitions = 100000
+seed = "0x1337C0DECAFEE00D"
+
+[cross_boundary]
+rust_models = "crates/core/src/types"
+ts_types = "frontend/src/types"
+go_models = "backend/pkg/models"
+strict_casing_check = true
+strict_omitempty_check = true
+strict_nil_slice_check = true
+"#
+        )
+        .unwrap();
+
+        let cfg = CanonConfig::load(file.path()).unwrap();
+        assert!(cfg.go.enabled);
+        assert_eq!(cfg.go.module_root, "backend");
+        assert_eq!(cfg.go.extensions, vec!["go"]);
+        assert!(cfg.go.strip_function_bodies);
+        assert!(cfg.go.index_implicit_interfaces);
+        assert!(!cfg.go.include_private_types);
+        assert!(cfg.go.concurrency.race_detector);
+        assert_eq!(cfg.go.concurrency.gomaxprocs_sweep, vec![1, 2, 4, 8]);
+        assert_eq!(cfg.go.state_machine.fuzz_transitions, 100000);
+        assert_eq!(cfg.cross_boundary.go_models, "backend/pkg/models");
+        assert!(cfg.cross_boundary.strict_omitempty_check);
+        assert!(cfg.cross_boundary.strict_nil_slice_check);
     }
 }

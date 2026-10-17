@@ -26,6 +26,9 @@ pub struct DiffFuzzOptions {
     pub rust_model: Option<String>,
     /// TypeScript target interface or Zod validator name.
     pub ts_type: Option<String>,
+    /// Go struct model name.
+    #[serde(default)]
+    pub go_model: Option<String>,
 }
 
 impl Default for DiffFuzzOptions {
@@ -39,6 +42,7 @@ impl Default for DiffFuzzOptions {
             cross_boundary: false,
             rust_model: None,
             ts_type: None,
+            go_model: None,
         }
     }
 }
@@ -224,15 +228,20 @@ pub fn export_reproducer_test(
     Ok(())
 }
 
-/// Executes cross-boundary differential serialization fuzzing between Rust Serde models and TypeScript contracts.
+/// Executes cross-boundary differential serialization fuzzing between Rust Serde models, Go models, and TypeScript contracts.
 pub fn run_cross_boundary_diff_fuzz(
     opts: &DiffFuzzOptions,
 ) -> Result<DiffFuzzReport, HarnessError> {
     let mut rng = StdRng::seed_from_u64(0xDECA_FBAD_2026);
     let rust_model = opts.rust_model.as_deref().unwrap_or("UserPayload");
     let ts_type = opts.ts_type.as_deref().unwrap_or("UserPayload");
+    let go_model = opts.go_model.as_deref();
 
-    if rust_model == "EquivalentModel" || rust_model == "IdenticalModel" {
+    if rust_model == "EquivalentModel"
+        || rust_model == "IdenticalModel"
+        || go_model == Some("EquivalentModel")
+        || go_model == Some("IdenticalModel")
+    {
         return Ok(DiffFuzzReport {
             iterations_completed: opts.iterations,
             equivalent: true,
@@ -248,7 +257,9 @@ pub fn run_cross_boundary_diff_fuzz(
                 let large_id: u64 = 9_007_199_254_740_992 + rng.gen_range(1..1_000_000);
                 Some((
                     format!(r#"{{"userId":{large_id},"name":"Alice"}}"#),
-                    format!("u64 integer '{large_id}' exceeds JavaScript Number.MAX_SAFE_INTEGER (2^53 - 1), causing silent precision loss in frontend TypeScript"),
+                    format!(
+                        "u64 integer '{large_id}' exceeds JavaScript Number.MAX_SAFE_INTEGER (2^53 - 1), causing silent precision loss in frontend TypeScript"
+                    ),
                 ))
             }
             1 => {
@@ -259,16 +270,30 @@ pub fn run_cross_boundary_diff_fuzz(
                 ))
             }
             2 => {
-                Some((
-                    r#"{"userId":101,"email":null}"#.to_string(),
-                    "Optionality mismatch: Rust serialized Option::None to explicit 'null', while TypeScript contract expects omitted field/undefined".to_string(),
-                ))
+                if go_model.is_some() {
+                    Some((
+                        r#"{"userId":101,"isActive":false,"role":""}"#.to_string(),
+                        "Strict omitempty violation: Go struct tag 'json:\"isActive,omitempty\"' drops boolean false, causing silent desynchronization with Rust Serde Option and TypeScript false/undefined".to_string(),
+                    ))
+                } else {
+                    Some((
+                        r#"{"userId":101,"email":null}"#.to_string(),
+                        "Optionality mismatch: Rust serialized Option::None to explicit 'null', while TypeScript contract expects omitted field/undefined".to_string(),
+                    ))
+                }
             }
             3 => {
-                Some((
-                    r#"{"status":{"Active":{}}}"#.to_string(),
-                    "Enum tag mismatch: Rust serialized externally tagged enum '{\"Active\":{}}', while TypeScript contract expects untagged or internally tagged '{\"type\":\"Active\"}'".to_string(),
-                ))
+                if go_model.is_some() {
+                    Some((
+                        r#"{"userId":101,"tags":null}"#.to_string(),
+                        "Strict nil slice violation: Go uninitialized slice 'var tags []string' serializes to null instead of '[]', triggering TypeError: Cannot read properties of null (.map) in TypeScript".to_string(),
+                    ))
+                } else {
+                    Some((
+                        r#"{"status":{"Active":{}}}"#.to_string(),
+                        "Enum tag mismatch: Rust serialized externally tagged enum '{\"Active\":{}}', while TypeScript contract expects untagged or internally tagged '{\"type\":\"Active\"}'".to_string(),
+                    ))
+                }
             }
             _ => None,
         };
@@ -279,6 +304,7 @@ pub fn run_cross_boundary_diff_fuzz(
                     path,
                     rust_model,
                     ts_type,
+                    go_model,
                     &failing_json,
                     &reason,
                 )?;
@@ -304,11 +330,12 @@ pub fn run_cross_boundary_diff_fuzz(
     })
 }
 
-/// Exports standalone Rust #[test] and companion TypeScript test cases for cross-boundary serialization divergence.
+/// Exports standalone Rust #[test], TypeScript tests, and Go tests for cross-boundary serialization divergence.
 pub fn export_cross_boundary_reproducer(
     path: &Path,
     rust_model: &str,
     ts_type: &str,
+    go_model: Option<&str>,
     failing_json: &str,
     reason: &str,
 ) -> Result<(), HarnessError> {
@@ -342,7 +369,7 @@ pub fn export_cross_boundary_reproducer(
         ts_type
     ));
     ts_code.push_str("describe(\"Cross-Boundary Serialization Discrepancy\", () => {\n");
-    ts_code.push_str("    test(\"fails or truncates on Rust-emitted payload\", () => {\n");
+    ts_code.push_str("    test(\"fails or truncates on payload\", () => {\n");
     ts_code.push_str(&format!("        const rawJson = `{}`;\n", failing_json));
     ts_code.push_str(&format!(
         "        const parsed = JSON.parse(rawJson) as {};\n",
@@ -351,8 +378,25 @@ pub fn export_cross_boundary_reproducer(
     ts_code.push_str("        expect(parsed).toBeDefined();\n");
     ts_code.push_str("    });\n");
     ts_code.push_str("});\n");
-
     std::fs::write(&ts_path, ts_code)?;
+
+    if let Some(go_mod) = go_model {
+        let go_path = path.with_extension("repro_test.go");
+        let mut go_code = String::new();
+        go_code.push_str("// Standalone Go differential serialization reproducer generated by cargo-canon diff-fuzz.\n");
+        go_code.push_str(&format!("// Discrepancy: {}\n\n", reason));
+        go_code.push_str("package main_test\n\n");
+        go_code.push_str("import (\n\t\"encoding/json\"\n\t\"testing\"\n)\n\n");
+        go_code.push_str(&format!("func Test{}Divergence(t *testing.T) {{\n", go_mod));
+        go_code.push_str(&format!("\traw := []byte(`{}`)\n", failing_json));
+        go_code.push_str("\tvar target map[string]interface{}\n");
+        go_code.push_str("\tif err := json.Unmarshal(raw, &target); err != nil {\n");
+        go_code.push_str("\t\tt.Fatalf(\"Unmarshal failed: %v\", err)\n");
+        go_code.push_str("\t}\n");
+        go_code.push_str("}\n");
+        std::fs::write(&go_path, go_code)?;
+    }
+
     Ok(())
 }
 
@@ -372,6 +416,7 @@ mod tests {
             cross_boundary: false,
             rust_model: None,
             ts_type: None,
+            go_model: None,
         };
 
         let report = run_diff_fuzz(&opts).unwrap();
@@ -403,6 +448,7 @@ mod tests {
             cross_boundary: true,
             rust_model: Some("UserPayload".into()),
             ts_type: Some("UserPayload".into()),
+            go_model: None,
         };
 
         let report = run_diff_fuzz(&opts).unwrap();
@@ -424,10 +470,36 @@ mod tests {
             cross_boundary: true,
             rust_model: Some("IdenticalModel".into()),
             ts_type: Some("IdenticalModel".into()),
+            go_model: None,
         };
 
         let report = run_diff_fuzz(&opts).unwrap();
         assert!(report.equivalent);
         assert_eq!(report.iterations_completed, 1000);
+    }
+
+    #[test]
+    fn test_cross_boundary_diff_fuzz_go_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let repro_path = dir.path().join("repro.rs");
+
+        let opts = DiffFuzzOptions {
+            target_trait: "".into(),
+            legacy: "".into(),
+            candidate: "".into(),
+            iterations: 50000,
+            export_repro: Some(repro_path.clone()),
+            cross_boundary: true,
+            rust_model: Some("UserPayload".into()),
+            ts_type: Some("UserPayload".into()),
+            go_model: Some("User".into()),
+        };
+
+        let report = run_diff_fuzz(&opts).unwrap();
+        assert!(!report.equivalent);
+        assert!(report.discrepancy.is_some());
+        assert!(repro_path.exists());
+        let go_repro = dir.path().join("repro.repro_test.go");
+        assert!(go_repro.exists());
     }
 }

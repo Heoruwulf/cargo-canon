@@ -78,4 +78,22 @@ mod tests {
         let disk_bytes = std::fs::read(&file_path).unwrap();
         assert_eq!(disk_bytes, content);
     }
+
+    #[test]
+    fn test_non_destructive_invariant_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("service.go");
+        let content = b"package service\n\ntype User struct {\n    ID string `json:\"id\"`\n}\n\nfunc (u *User) GetID() string {\n    return u.ID\n}\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let advisory = execute_post_read_hook(&file_path, None).unwrap();
+        assert!(advisory.contains("# Canon Context Slice"));
+        assert!(advisory.contains("type User struct"));
+        assert!(advisory.contains("func (u *User) GetID() string;"));
+        assert!(advisory.contains("```go"));
+
+        // Critical invariant: file bytes on disk MUST remain 100% strictly identical
+        let disk_bytes = std::fs::read(&file_path).unwrap();
+        assert_eq!(disk_bytes, content);
+    }
 }

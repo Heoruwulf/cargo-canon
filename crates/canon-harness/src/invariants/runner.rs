@@ -45,8 +45,14 @@ pub fn run_invariants(opts: &InvariantOptions) -> Result<InvariantReport, Harnes
             .lang
             .as_deref()
             .is_some_and(|l| l.eq_ignore_ascii_case("typescript") || l.eq_ignore_ascii_case("ts"));
+        let is_go = opts
+            .lang
+            .as_deref()
+            .is_some_and(|l| l.eq_ignore_ascii_case("go") || l.eq_ignore_ascii_case("golang"));
         let code = if is_ts {
             scaffold_ts_invariant_suite(sym)
+        } else if is_go {
+            scaffold_go_invariant_suite(sym)
         } else {
             scaffold_invariant_suite(sym)
         };
@@ -215,9 +221,97 @@ describe("Metamorphic Invariant Suite: {symbol}", () => {{
     )
 }
 
+/// Generates Go property-based metamorphic test suite template using pgregory.net/rapid.
+pub fn scaffold_go_invariant_suite(symbol: &str) -> String {
+    format!(
+        r#"package state_test
+
+import (
+	"encoding/json"
+	"testing"
+
+	"pgregory.net/rapid"
+)
+
+// Metamorphic Invariant Suite synthesized by cargo-canon for {symbol}
+func Test{symbol}_MetamorphicProperties(t *testing.T) {{
+	// Invariant 1: Idempotence: applying identical idempotent event yields identical state
+	t.Run("prop_idempotence", rapid.MakeCheck(func(t *rapid.T) {{
+		val := rapid.String().Draw(t, "seed_input")
+		state := New{symbol}(val)
+		once := state.Apply("SYNC")
+		twice := once.Apply("SYNC")
+		if once != twice {{
+			t.Fatalf("Idempotence violated for {symbol}: once=%v, twice=%v", once, twice)
+		}}
+	}}))
+
+	// Invariant 2: Round-Trip: serialization preserves state identity exactly
+	t.Run("prop_round_trip", rapid.MakeCheck(func(t *rapid.T) {{
+		id := rapid.String().Draw(t, "id")
+		count := rapid.IntRange(0, 1000000).Draw(t, "count")
+		original := &{symbol}{{ID: id, Count: count}}
+		raw, err := json.Marshal(original)
+		if err != nil {{
+			t.Fatalf("Marshal failed: %v", err)
+		}}
+		var recovered {symbol}
+		if err := json.Unmarshal(raw, &recovered); err != nil {{
+			t.Fatalf("Unmarshal failed: %v", err)
+		}}
+		if original.ID != recovered.ID || original.Count != recovered.Count {{
+			t.Fatalf("Round-trip violated: original=%+v, recovered=%+v", original, recovered)
+		}}
+	}}))
+
+	// Invariant 3: Permutation Invariance: commuting action sequences yield identical checksum
+	t.Run("prop_permutation_invariance", rapid.MakeCheck(func(t *rapid.T) {{
+		n := rapid.IntRange(1, 20).Draw(t, "op_count")
+		items := make([]int, n)
+		for i := 0; i < n; i++ {{
+			items[i] = rapid.IntRange(1, 1000).Draw(t, "item")
+		}}
+		state1 := New{symbol}FromItems(items)
+		reversed := make([]int, n)
+		for i := 0; i < n; i++ {{
+			reversed[i] = items[n-1-i]
+		}}
+		state2 := New{symbol}FromItems(reversed)
+		if state1.Checksum() != state2.Checksum() {{
+			t.Fatalf("Permutation invariance violated: c1=%v, c2=%v", state1.Checksum(), state2.Checksum())
+		}}
+	}}))
+
+	// Invariant 4: Monotonicity & State Bounds
+	t.Run("prop_monotonic_progress", rapid.MakeCheck(func(t *rapid.T) {{
+		delta := rapid.IntRange(1, 1000).Draw(t, "delta")
+		state := Default{symbol}()
+		initial := state.SequenceNumber
+		next := state.Advance(delta)
+		if next.SequenceNumber < initial {{
+			t.Fatalf("Monotonicity violated: initial=%d, next=%d", initial, next.SequenceNumber)
+		}}
+	}}))
+}}
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scaffold_go_invariant_suite() {
+        let code = scaffold_go_invariant_suite("OrderService");
+        assert!(code.contains("package state_test"));
+        assert!(code.contains("pgregory.net/rapid"));
+        assert!(code.contains("TestOrderService_MetamorphicProperties"));
+        assert!(code.contains("prop_idempotence"));
+        assert!(code.contains("prop_round_trip"));
+        assert!(code.contains("prop_permutation_invariance"));
+        assert!(code.contains("prop_monotonic_progress"));
+    }
 
     #[test]
     fn test_scaffold_invariant_suite() {

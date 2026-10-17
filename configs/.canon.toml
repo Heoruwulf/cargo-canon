@@ -50,8 +50,8 @@ socket_path = "/tmp/canon.sock"
 # Enable background incremental file watching via notify
 enable_file_watcher = true
 
-# Paths to monitor for source modifications (.rs, .ts, .tsx, .js, .jsx)
-watch_paths = ["crates", "frontend/src"]
+# Paths to monitor for source modifications (.rs, .ts, .tsx, .js, .jsx, .go)
+watch_paths = ["crates", "frontend/src", "backend"]
 
 [typescript]
 # Enable TypeScript and TSX context slicing via oxc_parser
@@ -69,6 +69,45 @@ strip_jsx = true
 # Strips React hook internals (useEffect, useState) to signatures
 strip_hook_bodies = true
 
+[go]
+# Enable Go context slicing via tree-sitter-go and implicit interface resolver
+enabled = true
+
+# Root directory for Go modules or monorepo root
+module_root = "backend"
+
+# Supported Go file extensions for slicing and daemon watcher
+extensions = ["go"]
+
+# Strip function and method bodies to /* implementation omitted */
+strip_function_bodies = true
+
+# Compute implicit interface satisfaction matrix: M(T) and M(*T) method sets
+index_implicit_interfaces = true
+
+# Include unexported (lowercase) types and helpers
+include_private_types = false
+
+[go.concurrency]
+# Tier 1: Zero-refactor concurrency race detector (TSan)
+race_detector = true
+
+# Inspect goroutine stack traces at test teardown for abandoned goroutines
+goleak_check = true
+
+# Randomized GOMAXPROCS values to maximize concurrency jitter
+gomaxprocs_sweep = [1, 2, 4, 8]
+
+# Default number of simulation passes
+default_passes = 100
+
+[go.state_machine]
+# Tier 2: Pure Sans-I/O discrete-event state machine fuzzer transitions
+fuzz_transitions = 100000
+
+# 64-bit seed for 100% deterministic failure replay
+seed = "0x1337C0DECAFEE00D"
+
 [cross_boundary]
 # Directory containing shared Rust Serde models
 rust_models = "crates/shared-types/src"
@@ -76,6 +115,15 @@ rust_models = "crates/shared-types/src"
 # Directory containing TypeScript interface contracts
 ts_types = "frontend/src/types"
 
+# Directory containing Go backend models
+go_models = "backend/pkg/models"
+
 # Enforce camelCase vs snake_case naming verification
 strict_casing_check = true
+
+# Enforce omitempty zero-value discrepancy validation
+strict_omitempty_check = true
+
+# Enforce nil slice vs empty slice serialization consistency (null vs [])
+strict_nil_slice_check = true
 
