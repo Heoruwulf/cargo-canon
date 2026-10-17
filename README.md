@@ -1,5 +1,7 @@
 # `cargo-canon`
 
+![License](https://img.shields.io/badge/License-AGPLv3-red.svg?style=for-the-badge)
+
 > **AI Ground-Truth Verification & Context Slicing Engine for Rust**
 
 `cargo-canon` is a high-performance verification oracle and compiler-aware context delivery engine designed for large-scale Rust codebases (>1.2M LOC). It transforms AI coding agents (Claude, Antigravity, Cursor) from **unreliable open-loop generators** into **robust closed-loop engineers** by pairing them with deterministic simulation, differential fuzzing, bounded model proofs, and out-of-band type skeleton slicing.
