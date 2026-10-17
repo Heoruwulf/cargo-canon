@@ -1,21 +1,69 @@
 # `cargo-canon`
 
-**AI Ground-Truth & Context Slicing Engine for Rust**
+> **AI Ground-Truth Verification & Context Slicing Engine for Rust**
 
-`cargo-canon` is a high-performance verification oracle and compiler-aware context provider designed for large-scale Rust codebases (>1.2M LOC). It eliminates AI model drift, hallucinated implementations, and context dilution by replacing passive LLM generation with closed-loop verification, deterministic simulation, and out-of-band type skeleton slicing.
+`cargo-canon` is a high-performance verification oracle and compiler-aware context delivery engine designed for large-scale Rust codebases (>1.2M LOC). It transforms AI coding agents (Claude, Antigravity, Cursor) from **unreliable open-loop generators** into **robust closed-loop engineers** by pairing them with deterministic simulation, differential fuzzing, bounded model proofs, and out-of-band type skeleton slicing.
 
 ---
 
-## The Problem `cargo-canon` Solves
+## The Core Problems, Approaches & Solutions
 
-In massive codebases, AI coding agents (Claude, Antigravity, Cursor) face four critical failure modes:
+In large codebases, AI coding assistants suffer from four systemic failure modes. Here is how `cargo-canon` approaches and solves each one:
 
-1. **Context Window Dilution & Drift:** Dumping raw files into an agent's context window causes attention decay. Models lose track of trait bounds, drop semantics, and lock hierarchies defined thousands of lines away.
-2. **File Desynchronization in Tool Hooks:** Naive pre/post-read hooks that inject comments or modify files on disk corrupt byte offsets and line numbers, causing subsequent patch and diff editing tools to fail.
-3. **Unreproducible Concurrency Defects:** LLMs cannot mentally simulate async runtimes, race conditions, or network packet reordering. Standard unit tests fail to catch these non-deterministic bugs.
-4. **Shallow Unit Test Hallucinations:** When prompted to test its own code, an LLM typically writes shallow, happy-path assertions that miss edge cases, integer overflows, and invariant violations.
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                       THE FOUR CORE FAILURE MODES                                      │
+├───────────────────────────────┬───────────────────────────────┬────────────────────────────────────────┤
+│ Failure Mode                  │ How cargo-canon Approaches It │ Concrete Solution in cargo-canon       │
+├───────────────────────────────┼───────────────────────────────┼────────────────────────────────────────┤
+│ 1. Context Dilution & Drift   │ Compiler-aware AST slicing    │ syn skeleton stripping + call-graph    │
+│ 2. Tool Hook File Desync      │ Out-of-band advisory delivery │ Non-destructive post-read verification │
+│ 3. Concurrency Flakiness      │ Seeded deterministic runtime  │ Discrete-event DST + AI repair prompt  │
+│ 4. Shallow Test Hallucination │ Closed-loop adversarial test  │ Diff-fuzzing, Kani SMT & proptest      │
+└───────────────────────────────┴───────────────────────────────┴────────────────────────────────────────┘
+```
 
-`cargo-canon` resolves this by transforming the agent workflow into a **closed-loop verification loop**:
+### 1. Context Window Dilution & Semantic Drift
+
+- **The Problem:** Dumping raw source files into an LLM's context window leads to attention decay. The model loses track of trait bounds, drop semantics, lock hierarchies, and implicit contracts defined thousands of lines or dozens of files away, causing subtle semantic drift.
+- **The Approach:** Instead of feeding raw implementation bodies to the model, extract a synthetic, compilable interface skeleton containing only the structural types, signatures, attributes, and contracts directly relevant to the task.
+- **How `cargo-canon` Solves It:**
+  - Employs a `syn::visit_mut::VisitMut` AST pass ([`canon-slice::skeleton`](crates/canon-slice/src/skeleton.rs)) that strips function/method bodies in sub-milliseconds while preserving visibility, struct/enum layouts, trait definitions, and doc comments.
+  - Crawls call hierarchies and discovers all `impl Trait for Target` contracts across the workspace ([`canon-slice::indexer`](crates/canon-slice/src/indexer.rs)).
+  - Achieves **>60%–85% token reduction**, giving the model 100% of the type and contract context with a fraction of the token consumption.
+
+### 2. Tool Hook Desynchronization & Broken Patch Tools
+
+- **The Problem:** Naive pre-read or post-read hooks that inject comments, annotations, or skeletons directly into target source files rewrite file contents on disk. This breaks line numbers and byte offsets, causing subsequent patch and diff editing tools (Claude Code, Antigravity) to fail with offset mismatches.
+- **The Approach:** Maintain strict physical separation between on-disk target files and injected context.
+- **How `cargo-canon` Solves It:**
+  - Implements a **strictly non-destructive advisory tool hook** ([`canon-daemon::hook`](crates/canon-daemon/src/hook.rs)).
+  - Emits all skeletons, contracts, and call hierarchies **exclusively out-of-band** (via stdout or Unix domain socket JSON-RPC).
+  - Enforces a defensive post-read verification check: target source files are asserted byte-identical on disk before and after tool execution, ensuring zero offset drift.
+
+### 3. Non-Deterministic Concurrency & Unreproducible Race Conditions
+
+- **The Problem:** LLMs cannot mentally simulate complex async runtimes, thread schedules, mutex contention, or network packet reordering. Standard `cargo test` runs are non-deterministic and miss elusive race conditions.
+- **The Approach:** Run async and distributed workflows inside a seeded, discrete-event simulation environment where simulated time, timers, scheduling, and network latency are 100% reproducible from a single 64-bit seed.
+- **How `cargo-canon` Solves It:**
+  - Integrates a Deterministic Simulation Testing (DST) engine ([`canon-harness::simulate`](crates/canon-harness/src/simulate/engine.rs)) with configurable fault injection (packet drop rates, latency stalls, deadlock bounds).
+  - Evaluates thousands of randomized seeds in seconds (`cargo canon simulate --seeds 5000`).
+  - **100% Deterministic Replay:** Any failure reproduced from its exact seed (`cargo canon simulate --seed 0xDEADBEEF`).
+  - **Adversarial AI Repair Prompt:** Automatically converts the failing seed, timeline trace, and active state into an actionable repair prompt for the agent.
+
+### 4. Shallow Unit Testing Hallucinations
+
+- **The Problem:** When prompted to test its own code, an LLM generates superficial happy-path tests (`assert_eq!(add(2, 2), 4)`), giving a false sense of security while edge cases, integer wraparounds, and dropped invariants escape into production.
+- **The Approach:** Replace shallow unit test generation with automated, mathematically rigorous ground-truth verification: differential fuzzing, bounded model checking, and algebraic metamorphic properties.
+- **How `cargo-canon` Solves It:**
+  - **Differential Fuzzing (`diff-fuzz`):** Wraps legacy and candidate implementations in a shadow-trait harness, checks millions of randomized operations, minimizes failing inputs, and exports standalone Rust `#[test]` reproducers.
+  - **Bounded Model Checking (`verify`):** Formally proves panic-freedom and invariant adherence across all bounded symbolic inputs via Kani, parsing SMT solver outputs into formatted Rust struct initializers.
+  - **Metamorphic Invariant Testing (`invariants`):** Tests universal algebraic properties (Round-trip, Idempotence, Permutation Invariance, Monotonicity) powered by `proptest`.
+  - **Sans-I/O Pure State Machines (`state-machine`):** Decouples domain logic from I/O, fuzzing state transitions at **>10,000,000 transitions/second** with full reachability and dead-state analysis.
+
+---
+
+## Closed-Loop Verification Architecture
 
 ```mermaid
 flowchart TD
@@ -46,26 +94,62 @@ flowchart TD
 
 ---
 
-## Key Features
+## The 6 Ground-Truth Pillars
 
-- **Compiler-Aware Context Slicing (`slice`)**: Sub-millisecond type skeleton extraction using `syn`, stripping function bodies to `/* implementation omitted */` while preserving signatures, attributes, and trait contracts (>60%–85% token reduction).
-- **Deterministic Simulation Testing (`simulate`)**: Seeded async discrete-event simulation engine with virtual time, fault injection (network latency, message drops), deadlock detection, and automated AI prompt generation on failure.
-- **Differential Fuzzing (`diff-fuzz`)**: Compares legacy reference implementations against candidate refactors across arbitrary input sequences with automated test case minimization (`--export-repro`).
-- **Bounded Model Checking (`verify`)**: Formal verification runner parsing Kani SMT solver failures into structured Rust struct counterexamples, plus starter proof stub scaffolding.
-- **Metamorphic Invariant Synthesis (`invariants`)**: Discovers and tests algebraic properties (round-trip, idempotence, permutation invariance, monotonicity) instead of shallow unit tests.
-- **Sans-I/O State Machine Fuzzing (`state-machine`)**: High-throughput pure state machine runner capable of **>10,000,000 transitions/second**, with full reachability and dead-state matrix reporting.
-- **Non-Destructive Advisory Sidecar (`daemon`)**: Background IPC daemon with file watching (`notify`) providing sub-millisecond agent tool hook execution while keeping source files strictly byte-identical on disk.
+### Pillar 1: Deterministic Simulation Testing (`simulate`)
+- **Engine:** Seeded discrete-event simulator with virtual clock, message delivery queue, and fault injection.
+- **Execution:** Run $N$ pseudo-random simulation passes (`cargo canon simulate --seeds 5000`).
+- **Reproducibility:** Replay any specific failure deterministically (`cargo canon simulate --seed 0x081e074d89bffda5`).
+- **AI Feedback Loop:** Converts timeline traces directly into repair instructions:
+  ```text
+  # Canon Deterministic Simulation Testing (DST) Oracle: Bug Report
+  - Reproducible Seed: 0x081e074d89bffda5
+  - Failure Tick: 15
+  - Violation: SequenceInvariantViolated: PayloadReady received before Handshake acknowledged
+  
+  ## Execution Timeline Trace
+  [tick 00005] FAULT INJECTED: dropped message 'HandshakeSyn' destined for actor 1
+  [tick 00010] FAULT INJECTED: dropped message 'HandshakeAck' destined for actor 2
+  [tick 00015] DELIVERED: 'PayloadReady' to actor 1
+  ```
+
+### Pillar 2: Differential Fuzzing Oracle (`diff-fuzz`)
+- **Pattern:** Dual-run shadow trait pattern comparing legacy reference vs. candidate implementation.
+- **Shrinking:** Automatically minimizes failing operation sequences down to the smallest reproducing subset.
+- **Export Reproducer:** Emits a standalone, copy-pasteable Rust `#[test]` reproducer file (`--export-repro`).
+
+### Pillar 3: Proof-Carrying Patches via Model Checking (`verify`)
+- **Engine:** Invokes `cargo kani` with JSON output parsing and unwind bounds (`--unwind 4`).
+- **Counterexample Synthesis:** Parses raw SMT failures into concrete Rust struct initializers detailing the exact input state that triggered the failure.
+- **Scaffolding:** Generates starter `#[kani::proof]` verification stubs (`--scaffold <SYMBOL>`).
+
+### Pillar 4: Metamorphic Invariant Synthesis (`invariants`)
+- **Concept:** Replaces shallow tests with algebraic property suites:
+  - *Round-trip:* $f^{-1}(f(x)) \equiv x$
+  - *Idempotence:* $f(f(x)) \equiv f(x)$
+  - *Permutation Invariance:* $f(\text{shuffle}(x)) \equiv f(x)$
+  - *Monotonicity / State Bounds:* State counters strictly increase or decrease.
+- **Scaffolding:** Emits complete `proptest` suites ready for production use (`--scaffold <SYMBOL>`).
+
+### Pillar 5: Sans-I/O Pure State Machine Framework (`state-machine`)
+- **Purity:** Pure synchronous domain transitions (`step(&mut State, Event) -> Result<Vec<Action>, Error>`) with caller-injected deterministic time. `#![no_std]` compatible.
+- **Throughput:** Benchmarked at **>10,000,000 transitions/second** with zero heap allocations in steady state.
+- **Reachability Analysis:** Dumps complete transition tables and flags dead/unreachable states (`--matrix`).
+
+### Pillar 6: Compiler-Aware Context Slicing (`slice`)
+- **Extraction:** Sub-millisecond type skeleton extraction using `syn`, stripping function bodies while preserving all trait bounds, visibility, and doc comments.
+- **Graph Queries:** Explores upstream callers and downstream callees up to `--depth <N>`.
+- **Contracts:** Extracts all `impl Trait for Target` blocks associated with the target type.
+- **Prompt Bundling:** Formats LLM-ready markdown blocks with measured token reduction percentages.
 
 ---
 
-## Installation
+## Installation & Quick Start
 
-### From Source
-
-Ensure you have Rust installed (Rust 2024 / 1.85.0+):
+### Build and Install
 
 ```sh
-# Clone the repository
+# Clone repository
 git clone https://github.com/your-org/cargo-canon.git && cd cargo-canon
 
 # Build release binaries
@@ -75,176 +159,98 @@ make build
 cargo install --path crates/cargo-canon
 ```
 
-Once installed, the CLI can be invoked either as a cargo subcommand (`cargo canon <COMMAND>`) or as a standalone binary (`canon <COMMAND>`).
+Run either as a cargo subcommand (`cargo canon <COMMAND>`) or as a standalone binary (`canon <COMMAND>`).
 
 ---
 
-## CLI Usage & Commands
+## CLI Command Reference
 
-### 1. Context Slicing (`cargo canon slice`)
-
-Extracts compact, compiler-accurate context without loading unneeded implementation bodies.
-
+### Context Slicing
 ```sh
-# Extract stripped interface skeleton (default)
+# Stripped type skeleton (default)
 cargo canon slice src/engine.rs
 
-# Extract upstream callers and downstream callees up to depth 3
+# Call hierarchy up to depth 3
 cargo canon slice src/engine.rs --mode hierarchy --depth 3
 
-# Extract trait implementations (impl Trait for Target)
+# Trait contracts (impl Trait for Target)
 cargo canon slice src/engine.rs --mode contracts
 
-# Generate complete LLM-optimized bundle in Markdown
+# Complete LLM-optimized bundle in Markdown
 cargo canon slice src/engine.rs --mode bundle --format markdown
 
-# Output structured JSON for machine integration
+# Machine-readable JSON output
 cargo canon slice src/engine.rs --format json
 ```
 
-Example output:
-
-```markdown
-# Canon Context Slice: `src/engine.rs`
-> **Token Reduction:** 74.2% context saved vs raw source.
-
-## Type Skeleton & Interface Contracts
-```rust
-pub struct Engine {
-    pub id: u64,
-}
-
-impl Engine {
-    pub fn new(id: u64) -> Self;
-    pub fn start(&self) -> Result<(), EngineError>;
-}
-```
-
----
-
-### 2. Deterministic Simulation Testing (`cargo canon simulate`)
-
-Runs workloads under simulated time, randomized scheduling, and fault injection.
-
+### Deterministic Simulation Testing
 ```sh
 # Run 5,000 randomized simulation passes
 cargo canon simulate --seeds 5000
 
-# Replay a specific failure deterministically from a 64-bit seed
+# Replay a specific seed deterministically
 cargo canon simulate --seed 0x081e074d89bffda5
 
-# Configure fault injection rate and maximum virtual ticks
+# Configure fault rate and timeout bounds
 cargo canon simulate --seeds 1000 --fault-rate 0.10 --max-ticks 20000
 
-# Automatically emit an actionable prompt for Claude / AGY on failure
+# Generate actionable prompt on failure
 cargo canon simulate --seeds 5000 --ai-prompt-on-fail
 ```
 
-When an invariant fails, `cargo-canon` formats the timeline and exact seed into an adversarial repair prompt:
-
-```text
-# Canon Deterministic Simulation Testing (DST) Oracle: Bug Report
-
-- **Reproducible Seed:** `0x081e074d89bffda5`
-- **Failure Tick:** 15
-- **Violation:** `SequenceInvariantViolated: PayloadReady received before Handshake acknowledged`
-
-## Execution Timeline Trace
-[tick 00005] FAULT INJECTED: dropped message 'HandshakeSyn' destined for actor 1
-[tick 00010] FAULT INJECTED: dropped message 'HandshakeAck' destined for actor 2
-[tick 00015] DELIVERED: 'PayloadReady' to actor 1
-
-## Instructions for AI Agent
-1. Reproduce this exact defect locally with `cargo canon simulate --seed 0x081e074d89bffda5`.
-2. Analyze the timeline trace above for reordering, race condition, or dropped message handling.
-3. Surgically patch the coordination state machine to preserve safety under this fault.
-```
-
----
-
-### 3. Differential Fuzzing (`cargo canon diff-fuzz`)
-
-Verifies that a refactored candidate implementation behaves identically to a legacy baseline across arbitrary operations.
-
+### Differential Fuzzing
 ```sh
-# Differentially fuzz legacy vs candidate over 50,000 operation cycles
+# Compare legacy vs candidate over 50,000 iterations
 cargo canon diff-fuzz --target-trait KvStore --legacy LegacyMap --candidate CandidateMap --iterations 50000
 
-# Automatically minimize divergence and export a standalone Rust #[test] reproducer
-cargo canon diff-fuzz --iterations 10000 --export-repro tests/repro_divergence.rs
+# Automatically minimize and export #[test] reproducer
+cargo canon diff-fuzz --iterations 10000 --export-repro tests/repro.rs
 ```
 
----
-
-### 4. Bounded Model Checking (`cargo canon verify`)
-
-Runs formal model checking via `kani` and synthesizes structured counterexamples.
-
+### Model Checking
 ```sh
-# Run bounded proofs with loop unwind depth 4
+# Run bounded proofs with loop unwinding depth 4
 cargo canon verify --unwind 4
 
 # Target specific proof harness
-cargo canon verify --harness "verify_connection_state"
+cargo canon verify --harness "verify_connection"
 
-# Scaffold a starter #[kani::proof] stub for a struct or function
-cargo canon verify --scaffold ConnectionCoordinator
+# Scaffold a starter #[kani::proof] stub
+cargo canon verify --scaffold ConnectionEngine
 ```
 
----
-
-### 5. Metamorphic Invariant Testing (`cargo canon invariants`)
-
-Tests universal algebraic properties (Round-trip, Idempotence, Permutation Invariance, Monotonicity).
-
+### Metamorphic Invariants
 ```sh
 # Run metamorphic property test suite
 cargo canon invariants --run
 
-# Scaffold a complete proptest metamorphic test suite for a domain type
+# Scaffold proptest algebraic invariant suite
 cargo canon invariants --scaffold TransactionCoordinator
 ```
 
----
-
-### 6. Sans-I/O State Machine Fuzzing (`cargo canon state-machine`)
-
-Executes high-throughput transition fuzzing and reachability analysis on pure state machines.
-
+### Sans-I/O State Machine
 ```sh
-# Dump state transition table, reachability report, and flag dead states
+# Transition matrix and dead-state analysis
 cargo canon state-machine --matrix
 
-# Fuzz 500,000 state transitions at >10,000,000 transitions/sec
+# Transition fuzzer (>10M transitions/sec)
 cargo canon state-machine --fuzz-transitions --transitions 500000
 ```
 
----
-
-### 7. Agent Sidecar & Tool Hook Daemon (`cargo canon daemon`)
-
-Background service providing near-instant responses for AI agent integrations.
-
+### Background Daemon & Agent Hooks
 ```sh
-# Start background daemon on /tmp/canon.sock
+# Start background IPC daemon on /tmp/canon.sock
 cargo canon daemon --start
 
-# Specify custom socket path
-cargo canon daemon --start --socket /tmp/my-project-canon.sock
-
-# Execute advisory post-read tool hook (strictly preserves target file unmodified)
+# Advisory post-read hook (source file on disk remains strictly byte-identical)
 cargo canon daemon --hook-post-read --file src/engine.rs
 ```
-
-#### Non-Destructive Advisory Context Injection Invariant
->
-> **CRITICAL:** `cargo canon daemon --hook-post-read` delivers skeletons, contracts, and call hierarchies **exclusively out-of-band** (via stdout or JSON IPC). Source files on disk are guaranteed strictly byte-identical, ensuring line numbers and byte offsets in AI patch/diff editing tools remain 100% accurate.
 
 ---
 
 ## Configuration (`.canon.toml`)
 
-Configure default behaviors in the repository root by adding a `.canon.toml` file:
+Place a `.canon.toml` file in your repository root:
 
 ```toml
 [general]
@@ -274,14 +280,14 @@ socket_path = "/tmp/canon.sock"
 enable_file_watcher = true
 ```
 
+Annotated template available in [`configs/.canon.toml`](configs/.canon.toml).
+
 ---
 
-## Agent Integration Examples
+## Agent Tool Integration
 
-### Claude Code Tool Configuration
-
-Add a post-read hook to `.claude/config.json` or your tool wrapper script:
-
+### Claude Code (`.claude/config.json`)
+Configure an advisory post-read hook:
 ```json
 {
   "hooks": {
@@ -290,29 +296,24 @@ Add a post-read hook to `.claude/config.json` or your tool wrapper script:
 }
 ```
 
-Because the output is delivered out-of-band to stdout, Claude receives the type skeleton and trait contracts as advisory context without modifying the actual source file on disk.
-
-### Antigravity / Agent CLI Tool Call
-
-```sh
-# Fetch minimal interface context for a file before generating patches
-cargo canon slice crates/canon-slice/src/lib.rs --format markdown
-```
+Pre-packaged configuration templates and starter kits are provided in the [`configs/`](configs/) folder:
+- [`configs/.canon.toml`](configs/.canon.toml): Full repository configuration template.
+- [`configs/claude-config.json`](configs/claude-config.json): Claude Code hook setup.
+- [`configs/ground-truth.yml`](configs/ground-truth.yml): GitHub Actions CI verification workflow.
+- [`configs/pre-commit.sh`](configs/pre-commit.sh): Local git pre-commit hook script.
 
 ---
 
-## Development & Testing Workflow
-
-Run workspace tasks using `make`:
+## Development & Makefile Workflow
 
 ```sh
 make help              # List all available targets
-make check             # Fast workspace compilation check
-make test              # Run full unit and integration test suite
-make sim               # Run deterministic simulation testing (5000 seeds)
-make sim-replay SEED=  # Replay a specific seed (e.g. make sim-replay SEED=0xDEADBEEF)
-make diff-fuzz         # Run differential fuzzing harness (50000 cycles)
-make verify            # Run model checking or proof verification
+make check             # Fast compile check (cargo check)
+make test              # Run unit and integration tests
+make sim               # Run deterministic simulation (5000 seeds)
+make sim-replay SEED=  # Replay single seed (e.g. make sim-replay SEED=0xDEADBEEF)
+make diff-fuzz         # Run differential fuzzing (50000 cycles)
+make verify            # Run model checking / proof checks
 make qa                # Strict QA: fmt-check -> clippy (-D warnings) -> loc check
 make fmt               # Format code in-place
 make loc               # Enforce 1,500 line limit per Rust source file
