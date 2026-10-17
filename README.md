@@ -330,3 +330,9 @@ make fmt               # Format code in-place
 make loc               # Enforce 1,500 line limit per Rust source file
 make clean             # Clean build artifacts
 ```
+
+---
+
+## License
+
+This project is licensed under the [GNU Affero General Public License v3 (AGPL-3.0)](LICENSE).
