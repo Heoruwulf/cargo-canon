@@ -8,7 +8,7 @@ This directory contains drop-in configuration templates and starter kits for int
 
 | Template | Target Path in Your Project | Purpose |
 | :--- | :--- | :--- |
-| [`.canon.toml`](.canon.toml) | `.canon.toml` (repo root) | Full configuration options for slicing, simulation, fuzzing, Kani, and daemon. |
+| [`.canon.toml`](.canon.toml) | `.canon.toml` (repo root) | Full configuration options for slicing, simulation, fuzzing, Kani, daemon, TypeScript, and cross-boundary contracts. |
 | [`claude-config.json`](claude-config.json) | `.claude/config.json` | Configures Claude Code to automatically invoke the post-read advisory context hook. |
 | [`ground-truth.yml`](ground-truth.yml) | `.github/workflows/ground-truth.yml` | GitHub Actions CI workflow running deterministic simulation, differential fuzzing, and model checking. |
 | [`pre-commit.sh`](pre-commit.sh) | `.git/hooks/pre-commit` or `.githooks/pre-commit` | Fast local git pre-commit hook verifying state machine reachability and running 500 simulation seeds. |

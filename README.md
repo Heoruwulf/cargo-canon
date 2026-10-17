@@ -2,9 +2,9 @@
 
 ![License](https://img.shields.io/badge/License-AGPLv3-red.svg?style=for-the-badge)
 
-> **AI Ground-Truth Verification & Context Slicing Engine for Rust**
+> **AI Ground-Truth Verification & Context Slicing Engine for Rust & Polyglot TypeScript Codebases**
 
-`cargo-canon` is a high-performance verification oracle and compiler-aware context delivery engine designed for large-scale Rust codebases (>1.2M LOC). It transforms AI coding agents (Claude, Antigravity, Cursor) from **unreliable open-loop generators** into **robust closed-loop engineers** by pairing them with deterministic simulation, differential fuzzing, bounded model proofs, and out-of-band type skeleton slicing.
+`cargo-canon` is a high-performance verification oracle and compiler-aware context delivery engine designed for large-scale Rust and polyglot TypeScript / TSX codebases (>1.2M LOC). It transforms AI coding agents (Claude, Antigravity, Cursor) from **unreliable open-loop generators** into **robust closed-loop engineers** by pairing them with deterministic simulation, differential fuzzing, bounded model proofs, cross-boundary contract verification, and out-of-band type skeleton slicing.
 
 ---
 
@@ -14,18 +14,19 @@ In large codebases, AI coding assistants suffer from four systemic failure modes
 
 | Failure Mode | How `cargo-canon` Approaches It | Concrete Solution in `cargo-canon` |
 |:---|:---|:---|
-| **1. Context Dilution & Drift** | Compiler-aware AST slicing | `syn` skeleton stripping + call-graph indexing |
-| **2. Tool Hook File Desync** | Out-of-band advisory delivery | Non-destructive post-read verification |
+| **1. Context Dilution & Drift** | Compiler-aware AST slicing | `syn` & `oxc` skeleton stripping + cross-boundary route indexing |
+| **2. Tool Hook File Desync** | Out-of-band advisory delivery | Non-destructive post-read verification (`.rs`, `.ts`, `.tsx`, `.js`, `.jsx`) |
 | **3. Concurrency Flakiness** | Seeded deterministic runtime | Discrete-event DST + AI repair prompt |
-| **4. Shallow Test Hallucination** | Closed-loop adversarial testing | Diff-fuzzing, Kani model proofs & `proptest` |
+| **4. Shallow Test Hallucination** | Closed-loop adversarial testing | Diff-fuzzing (Rust & Serde $\leftrightarrow$ TS), Kani & `proptest` / `fast-check` |
 
 ### 1. Context Window Dilution & Semantic Drift
 
 - **The Problem:** Dumping raw source files into an LLM's context window leads to attention decay. The model loses track of trait bounds, drop semantics, lock hierarchies, and implicit contracts defined thousands of lines or dozens of files away, causing subtle semantic drift.
 - **The Approach:** Instead of feeding raw implementation bodies to the model, extract a synthetic, compilable interface skeleton containing only the structural types, signatures, attributes, and contracts directly relevant to the task.
 - **How `cargo-canon` Solves It:**
-  - Employs a `syn::visit_mut::VisitMut` AST pass ([`canon-slice::skeleton`](crates/canon-slice/src/skeleton.rs)) that strips function/method bodies in sub-milliseconds while preserving visibility, struct/enum layouts, trait definitions, and doc comments.
-  - Crawls call hierarchies and discovers all `impl Trait for Target` contracts across the workspace ([`canon-slice::indexer`](crates/canon-slice/src/indexer.rs)).
+  - Employs a `syn::visit_mut::VisitMut` AST pass ([`canon-slice::skeleton`](crates/canon-slice/src/skeleton.rs)) that strips Rust function/method bodies in sub-milliseconds while preserving visibility, struct/enum layouts, trait definitions, and doc comments.
+  - Employs an ultra-fast `oxc_parser` pass ([`canon-slice::ts_skeleton`](crates/canon-slice/src/ts_skeleton.rs)) that strips TypeScript and TSX function bodies, React hook internals (`useEffect`, `useState`), and JSX elements down to clean type signatures and exported interface contracts.
+  - Crawls call hierarchies and discovers all `impl Trait for Target` contracts across the workspace, and correlates cross-boundary impact between Rust API routes and TypeScript client fetch calls and interfaces ([`canon-slice::indexer`](crates/canon-slice/src/indexer.rs)).
   - Achieves **>60%–85% token reduction**, giving the model 100% of the type and contract context with a fraction of the token consumption.
 
 ### 2. Tool Hook Desynchronization & Broken Patch Tools
@@ -33,8 +34,8 @@ In large codebases, AI coding assistants suffer from four systemic failure modes
 - **The Problem:** Naive pre-read or post-read hooks that inject comments, annotations, or skeletons directly into target source files rewrite file contents on disk. This breaks line numbers and byte offsets, causing subsequent patch and diff editing tools (Claude Code, Antigravity) to fail with offset mismatches.
 - **The Approach:** Maintain strict physical separation between on-disk target files and injected context.
 - **How `cargo-canon` Solves It:**
-  - Implements a **strictly non-destructive advisory tool hook** ([`canon-daemon::hook`](crates/canon-daemon/src/hook.rs)).
-  - Emits all skeletons, contracts, and call hierarchies **exclusively out-of-band** (via stdout or Unix domain socket JSON-RPC).
+  - Implements a **strictly non-destructive advisory tool hook** ([`canon-daemon::hook`](crates/canon-daemon/src/hook.rs)) supporting `.rs`, `.ts`, `.tsx`, `.js`, and `.jsx`.
+  - Emits all skeletons, contracts, call hierarchies, and cross-boundary impacts **exclusively out-of-band** (via stdout or Unix domain socket JSON-RPC).
   - Enforces a defensive post-read verification check: target source files are asserted byte-identical on disk before and after tool execution, ensuring zero offset drift.
 
 ### 3. Non-Deterministic Concurrency & Unreproducible Race Conditions
@@ -50,12 +51,12 @@ In large codebases, AI coding assistants suffer from four systemic failure modes
 ### 4. Shallow Unit Testing Hallucinations
 
 - **The Problem:** When prompted to test its own code, an LLM generates superficial happy-path tests (`assert_eq!(add(2, 2), 4)`), giving a false sense of security while edge cases, integer wraparounds, and dropped invariants escape into production.
-- **The Approach:** Replace shallow unit test generation with automated, mathematically rigorous ground-truth verification: differential fuzzing, bounded model checking, and algebraic metamorphic properties.
+- **The Approach:** Replace shallow unit test generation with automated, mathematically rigorous ground-truth verification: differential fuzzing, bounded model checking, and algebraic metamorphic properties across both Rust and frontend TypeScript contracts.
 - **How `cargo-canon` Solves It:**
-  - **Differential Fuzzing (`diff-fuzz`):** Wraps legacy and candidate implementations in a shadow-trait harness, checks millions of randomized operations, minimizes failing inputs, and exports standalone Rust `#[test]` reproducers.
+  - **Differential Fuzzing (`diff-fuzz`):** Wraps legacy and candidate implementations in a shadow-trait harness, checks millions of randomized operations, minimizes failing inputs, and exports standalone Rust `#[test]` reproducers. Also runs **Cross-Boundary Contract Fuzzing** verifying Serde $\leftrightarrow$ TypeScript serialization (catching JS safe integer truncation, casing mismatches, null vs undefined optionality divergence, and enum tagging differences).
   - **Bounded Model Checking (`verify`):** Formally proves panic-freedom and invariant adherence across all bounded symbolic inputs via Kani, parsing SMT solver outputs into formatted Rust struct initializers.
-  - **Metamorphic Invariant Testing (`invariants`):** Tests universal algebraic properties (Round-trip, Idempotence, Permutation Invariance, Monotonicity) powered by `proptest`.
-  - **Sans-I/O Pure State Machines (`state-machine`):** Decouples domain logic from I/O, fuzzing state transitions at **>10,000,000 transitions/second** with full reachability and dead-state analysis.
+  - **Metamorphic Invariant Testing (`invariants`):** Tests universal algebraic properties (Round-trip, Idempotence, Permutation Invariance, Monotonicity) powered by `proptest` (Rust) and `fast-check` suite synthesis (TypeScript).
+  - **Sans-I/O Pure State Machines (`state-machine`):** Decouples domain logic from I/O, fuzzing state transitions at **>10,000,000 transitions/second** for Rust state machines and pure TypeScript reducers (`--ts-reducer`) with full reachability and dead-state analysis.
 
 ---
 
@@ -111,11 +112,16 @@ flowchart TD
   [tick 00015] DELIVERED: 'PayloadReady' to actor 1
   ```
 
-### Pillar 2: Differential Fuzzing Oracle (`diff-fuzz`)
+### Pillar 2: Differential Fuzzing Oracle & Cross-Boundary Oracles (`diff-fuzz`)
 
 - **Pattern:** Dual-run shadow trait pattern comparing legacy reference vs. candidate implementation.
+- **Cross-Boundary Contract Fuzzing:** Differentially fuzzes Serde models against TypeScript contracts (`--cross-boundary --rust-model <RustModel> --ts-type <TsType>`), detecting:
+  - 64-bit integer precision loss beyond JavaScript `Number.MAX_SAFE_INTEGER` ($2^{53}-1$).
+  - Naming discrepancies (`snake_case` in Rust vs. `camelCase` in TypeScript).
+  - Optionality divergence (`Option::None` serializing to `null` vs. TypeScript expecting omitted `undefined`).
+  - Enum tagging differences (externally tagged vs. untagged or internally tagged).
 - **Shrinking:** Automatically minimizes failing operation sequences down to the smallest reproducing subset.
-- **Export Reproducer:** Emits a standalone, copy-pasteable Rust `#[test]` reproducer file (`--export-repro`).
+- **Export Reproducer:** Emits standalone, copy-pasteable Rust `#[test]` and companion TypeScript test reproducers (`--export-repro <PATH>`).
 
 ### Pillar 3: Proof-Carrying Patches via Model Checking (`verify`)
 
@@ -130,19 +136,21 @@ flowchart TD
   - *Idempotence:* $f(f(x)) \equiv f(x)$
   - *Permutation Invariance:* $f(\text{shuffle}(x)) \equiv f(x)$
   - *Monotonicity / State Bounds:* State counters strictly increase or decrease.
-- **Scaffolding:** Emits complete `proptest` suites ready for production use (`--scaffold <SYMBOL>`).
+- **Scaffolding:** Emits complete `proptest` suites for Rust and `fast-check` suites for TypeScript models and reducers (`--scaffold <SYMBOL> --lang typescript`).
 
 ### Pillar 5: Sans-I/O Pure State Machine Framework (`state-machine`)
 
 - **Purity:** Pure synchronous domain transitions (`step(&mut State, Event) -> Result<Vec<Action>, Error>`) with caller-injected deterministic time. `#![no_std]` compatible.
 - **Throughput:** Benchmarked at **>10,000,000 transitions/second** with zero heap allocations in steady state.
+- **TypeScript Reducer Fuzzing:** High-throughput transition fuzzing directly on pure TypeScript state reducers (`(state, action) => state`) via `--ts-reducer <PATH> --fuzz-transitions`.
 - **Reachability Analysis:** Dumps complete transition tables and flags dead/unreachable states (`--matrix`).
 
 ### Pillar 6: Compiler-Aware Context Slicing (`slice`)
 
-- **Extraction:** Sub-millisecond type skeleton extraction using `syn`, stripping function bodies while preserving all trait bounds, visibility, and doc comments.
+- **Extraction:** Sub-millisecond type skeleton extraction using `syn` (Rust) and `oxc_parser` (TypeScript/TSX), stripping function bodies, React hook internals, and JSX blocks while preserving visibility, exported types, interfaces, and doc comments.
 - **Graph Queries:** Explores upstream callers and downstream callees up to `--depth <N>`.
 - **Contracts:** Extracts all `impl Trait for Target` blocks associated with the target type.
+- **Cross-Boundary Correlation:** Discovers cross-boundary impact between Rust backend routes/models and frontend TypeScript API call sites and consumer interfaces (`--cross-boundary`).
 - **Prompt Bundling:** Formats LLM-ready markdown blocks with measured token reduction percentages.
 
 ---
@@ -171,14 +179,20 @@ Run either as a cargo subcommand (`cargo canon <COMMAND>`) or as a standalone bi
 ### Context Slicing
 
 ```sh
-# Stripped type skeleton (default)
+# Stripped Rust type skeleton (default)
 cargo canon slice src/engine.rs
+
+# Stripped TypeScript / TSX type skeleton (strips JSX & hook internals)
+cargo canon slice frontend/src/components/Dashboard.tsx
 
 # Call hierarchy up to depth 3
 cargo canon slice src/engine.rs --mode hierarchy --depth 3
 
 # Trait contracts (impl Trait for Target)
 cargo canon slice src/engine.rs --mode contracts
+
+# Cross-boundary impact correlation (Rust backend <-> TS frontend)
+cargo canon slice src/routes/users.rs --cross-boundary
 
 # Complete LLM-optimized bundle in Markdown
 cargo canon slice src/engine.rs --mode bundle --format markdown
@@ -209,6 +223,9 @@ cargo canon simulate --seeds 5000 --ai-prompt-on-fail
 # Compare legacy vs candidate over 50,000 iterations
 cargo canon diff-fuzz --target-trait KvStore --legacy LegacyMap --candidate CandidateMap --iterations 50000
 
+# Cross-boundary Serde model vs TypeScript contract differential fuzzing
+cargo canon diff-fuzz --cross-boundary --rust-model UpdateUserPayload --ts-type UpdateUserPayload
+
 # Automatically minimize and export #[test] reproducer
 cargo canon diff-fuzz --iterations 10000 --export-repro tests/repro.rs
 ```
@@ -232,8 +249,11 @@ cargo canon verify --scaffold ConnectionEngine
 # Run metamorphic property test suite
 cargo canon invariants --run
 
-# Scaffold proptest algebraic invariant suite
-cargo canon invariants --scaffold TransactionCoordinator
+# Scaffold proptest algebraic invariant suite (Rust)
+cargo canon invariants --scaffold TransactionCoordinator --lang rust
+
+# Scaffold fast-check property suite (TypeScript)
+cargo canon invariants --scaffold UserStore --lang typescript
 ```
 
 ### Sans-I/O State Machine
@@ -242,8 +262,11 @@ cargo canon invariants --scaffold TransactionCoordinator
 # Transition matrix and dead-state analysis
 cargo canon state-machine --matrix
 
-# Transition fuzzer (>10M transitions/sec)
+# Pure Rust transition fuzzer (>10M transitions/sec)
 cargo canon state-machine --fuzz-transitions --transitions 500000
+
+# Pure TypeScript reducer fuzzer (>1M transitions/sec)
+cargo canon state-machine --ts-reducer frontend/src/reducers/chat.ts --fuzz-transitions
 ```
 
 ### Background Daemon & Agent Hooks
@@ -252,8 +275,11 @@ cargo canon state-machine --fuzz-transitions --transitions 500000
 # Start background IPC daemon on /tmp/canon.sock
 cargo canon daemon --start
 
-# Advisory post-read hook (source file on disk remains strictly byte-identical)
+# Advisory post-read hook on Rust source file
 cargo canon daemon --hook-post-read --file src/engine.rs
+
+# Advisory post-read hook on TypeScript/TSX source file
+cargo canon daemon --hook-post-read --file frontend/src/App.tsx
 ```
 
 ---
@@ -288,6 +314,19 @@ corpus_dir = "tests/fuzz/corpus"
 [daemon]
 socket_path = "/tmp/canon.sock"
 enable_file_watcher = true
+watch_paths = ["crates", "frontend/src"]
+
+[typescript]
+enabled = true
+tsconfig_path = "frontend/tsconfig.json"
+extensions = ["ts", "tsx", "js", "jsx"]
+strip_jsx = true
+strip_hook_bodies = true
+
+[cross_boundary]
+rust_models = "crates/shared-types/src"
+ts_types = "frontend/src/types"
+strict_casing_check = true
 ```
 
 Annotated template available in [`configs/.canon.toml`](configs/.canon.toml).

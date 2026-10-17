@@ -49,3 +49,33 @@ socket_path = "/tmp/canon.sock"
 
 # Enable background incremental file watching via notify
 enable_file_watcher = true
+
+# Paths to monitor for source modifications (.rs, .ts, .tsx, .js, .jsx)
+watch_paths = ["crates", "frontend/src"]
+
+[typescript]
+# Enable TypeScript and TSX context slicing via oxc_parser
+enabled = true
+
+# Path to tsconfig.json for module resolution
+tsconfig_path = "frontend/tsconfig.json"
+
+# Supported file extensions for slicing and daemon watcher
+extensions = ["ts", "tsx", "js", "jsx"]
+
+# Strips JSX elements down to clean interface signatures
+strip_jsx = true
+
+# Strips React hook internals (useEffect, useState) to signatures
+strip_hook_bodies = true
+
+[cross_boundary]
+# Directory containing shared Rust Serde models
+rust_models = "crates/shared-types/src"
+
+# Directory containing TypeScript interface contracts
+ts_types = "frontend/src/types"
+
+# Enforce camelCase vs snake_case naming verification
+strict_casing_check = true
+
