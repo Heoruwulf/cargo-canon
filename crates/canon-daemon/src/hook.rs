@@ -61,4 +61,21 @@ mod tests {
         let disk_bytes = std::fs::read(file.path()).unwrap();
         assert_eq!(disk_bytes, content);
     }
+
+    #[test]
+    fn test_non_destructive_invariant_tsx() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("Dashboard.tsx");
+        let content = b"export interface Props { id: string; }\nexport function Dashboard(props: Props) {\n    return <div>{props.id}</div>;\n}\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let advisory = execute_post_read_hook(&file_path, None).unwrap();
+        assert!(advisory.contains("# Canon Context Slice"));
+        assert!(advisory.contains("export interface Props"));
+        assert!(advisory.contains("```typescript"));
+
+        // Critical invariant: file bytes on disk MUST be strictly identical
+        let disk_bytes = std::fs::read(&file_path).unwrap();
+        assert_eq!(disk_bytes, content);
+    }
 }

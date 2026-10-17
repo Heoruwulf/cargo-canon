@@ -1,7 +1,7 @@
 //! Context bundling and prompt formatting for AI coding agents.
 
 use crate::error::SliceError;
-use crate::indexer::{CallEdge, ContractInfo};
+use crate::indexer::{CallEdge, ContractInfo, CrossBoundaryImpact};
 use canon_core::output::OutputFormat;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,9 @@ pub struct SliceBundle {
     pub callees: Vec<CallEdge>,
     /// Estimated context token reduction percentage compared to raw source.
     pub token_reduction_pct: f64,
+    /// Cross-boundary contract impact between Rust backend and TypeScript frontend.
+    #[serde(default)]
+    pub cross_boundary: Option<CrossBoundaryImpact>,
 }
 
 impl SliceBundle {
@@ -41,7 +44,18 @@ impl SliceBundle {
             self.token_reduction_pct
         ));
 
-        out.push_str("## Type Skeleton & Interface Contracts\n\n```rust\n");
+        let lang = if self.target.ends_with(".ts")
+            || self.target.ends_with(".tsx")
+            || self.target.ends_with(".js")
+            || self.target.ends_with(".jsx")
+        {
+            "typescript"
+        } else {
+            "rust"
+        };
+        out.push_str(&format!(
+            "## Type Skeleton & Interface Contracts\n\n```{lang}\n"
+        ));
         out.push_str(&self.skeleton);
         out.push_str("\n```\n\n");
 
@@ -78,6 +92,26 @@ impl SliceBundle {
             out.push('\n');
         }
 
+        if let Some(ref cb) = self.cross_boundary {
+            out.push_str("## Cross-Boundary Impact\n\n");
+            if let Some(ref rust_def) = cb.rust_definition {
+                out.push_str(&format!("- **Rust Backend Definition:** `{}`\n", rust_def));
+            }
+            if let Some(ref ts_def) = cb.ts_interface {
+                out.push_str(&format!(
+                    "- **TypeScript Consumer Interface:** `{}`\n",
+                    ts_def
+                ));
+            }
+            if !cb.api_call_sites.is_empty() {
+                out.push_str("- **Frontend API Call Sites:**\n");
+                for site in &cb.api_call_sites {
+                    out.push_str(&format!("  - `{}`\n", site));
+                }
+            }
+            out.push('\n');
+        }
+
         out
     }
 
@@ -104,6 +138,20 @@ impl SliceBundle {
             out.push_str("--- Callers ---\n");
             for c in &self.callers {
                 out.push_str(&format!("{} -> {}\n", c.caller, c.callee));
+            }
+            out.push('\n');
+        }
+
+        if let Some(ref cb) = self.cross_boundary {
+            out.push_str("--- Cross-Boundary Impact ---\n");
+            if let Some(ref rust_def) = cb.rust_definition {
+                out.push_str(&format!("Rust Backend Definition: {}\n", rust_def));
+            }
+            if let Some(ref ts_def) = cb.ts_interface {
+                out.push_str(&format!("TypeScript Consumer Interface: {}\n", ts_def));
+            }
+            for site in &cb.api_call_sites {
+                out.push_str(&format!("Frontend Call Site: {}\n", site));
             }
             out.push('\n');
         }

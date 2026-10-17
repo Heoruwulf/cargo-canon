@@ -20,10 +20,14 @@ if [ ! -f "$TARGET_FILE" ]; then
     exit 0
 fi
 
-# Only process Rust source files
-if [[ "$TARGET_FILE" != *.rs ]]; then
-    exit 0
-fi
+# Process Rust and TypeScript source files
+case "$TARGET_FILE" in
+    *.rs|*.ts|*.tsx|*.js|*.jsx)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
 
 # Dispatch to cargo-canon binary or local target build
 if command -v cargo-canon >/dev/null 2>&1; then

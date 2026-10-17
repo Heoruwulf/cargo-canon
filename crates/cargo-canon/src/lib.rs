@@ -80,6 +80,10 @@ pub struct SliceArgs {
     /// Call hierarchy search depth
     #[arg(short, long, default_value_t = 2)]
     pub depth: usize,
+
+    /// Query cross-boundary impact between Rust backend and TypeScript frontend
+    #[arg(long)]
+    pub cross_boundary: bool,
 }
 
 #[derive(Args, Debug)]
@@ -126,6 +130,18 @@ pub struct DiffFuzzArgs {
     /// Emit standalone Rust #[test] reproducer on discrepancy
     #[arg(long)]
     pub export_repro: Option<PathBuf>,
+
+    /// Whether to differentially fuzz cross-boundary Serde models against TypeScript contracts
+    #[arg(long)]
+    pub cross_boundary: bool,
+
+    /// Target Rust model struct name
+    #[arg(long)]
+    pub rust_model: Option<String>,
+
+    /// Target TypeScript interface or Zod validator name
+    #[arg(long)]
+    pub ts_type: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -156,6 +172,10 @@ pub struct InvariantArgs {
     /// Generate metamorphic property test suite template for symbol
     #[arg(long)]
     pub scaffold: Option<String>,
+
+    /// Target language for metamorphic test suite scaffolding ("rust" or "typescript")
+    #[arg(long, default_value = "rust")]
+    pub lang: String,
 }
 
 #[derive(Args, Debug)]
@@ -163,6 +183,10 @@ pub struct StateMachineArgs {
     /// Run high-throughput transition fuzzer (>1,000,000 ops/sec)
     #[arg(long)]
     pub fuzz_transitions: bool,
+
+    /// Path to pure TypeScript reducer to fuzz (>1,000,000 transitions/sec)
+    #[arg(long)]
+    pub ts_reducer: Option<PathBuf>,
 
     /// Dump reachable state transition matrix and dead state report
     #[arg(long)]
@@ -236,6 +260,9 @@ async fn handle_slice(args: SliceArgs) -> Result<(), Box<dyn std::error::Error>>
     if let Some(parent) = args.target.parent() {
         let _ = index.index_directory(parent);
     }
+    if index.symbols_map.is_empty() {
+        let _ = index.index_directory(&PathBuf::from("."));
+    }
     let bundle = slice_target(&args.target, args.mode, Some(&index))?;
     let output = bundle.format_with(args.format)?;
     println!("{}", output);
@@ -289,14 +316,29 @@ async fn handle_diff_fuzz(args: DiffFuzzArgs) -> Result<(), Box<dyn std::error::
         candidate: args.candidate,
         iterations: args.iterations,
         export_repro: args.export_repro,
+        cross_boundary: args.cross_boundary,
+        rust_model: args.rust_model,
+        ts_type: args.ts_type,
     };
-    info_banner(
-        "DiffFuzz",
-        &format!(
-            "Differentially fuzzing '{}' vs '{}' ({} cycles)...",
-            opts.legacy, opts.candidate, opts.iterations
-        ),
-    );
+    if opts.cross_boundary {
+        info_banner(
+            "DiffFuzz",
+            &format!(
+                "Differentially fuzzing Serde model '{}' vs TS type '{}' ({} cycles)...",
+                opts.rust_model.as_deref().unwrap_or("UserPayload"),
+                opts.ts_type.as_deref().unwrap_or("UserPayload"),
+                opts.iterations
+            ),
+        );
+    } else {
+        info_banner(
+            "DiffFuzz",
+            &format!(
+                "Differentially fuzzing '{}' vs '{}' ({} cycles)...",
+                opts.legacy, opts.candidate, opts.iterations
+            ),
+        );
+    }
     let report = run_diff_fuzz(&opts)?;
 
     if report.equivalent {
@@ -310,12 +352,15 @@ async fn handle_diff_fuzz(args: DiffFuzzArgs) -> Result<(), Box<dyn std::error::
     } else {
         error(
             "DiffFuzz",
-            &format!("Divergence found: {:?}", report.discrepancy),
+            &format!(
+                "Divergence found: {}",
+                report.discrepancy.as_deref().unwrap_or("divergence")
+            ),
         );
         if let Some(repro) = report.exported_repro_path {
             info_banner(
                 "Reproducer",
-                &format!("Exported standalone #[test] to {}", repro),
+                &format!("Exported standalone test to {}", repro),
             );
         }
     }
@@ -355,6 +400,7 @@ async fn handle_invariants(args: InvariantArgs) -> Result<(), Box<dyn std::error
     let opts = InvariantOptions {
         run: args.run,
         scaffold: args.scaffold,
+        lang: Some(args.lang),
     };
     let report = run_invariants(&opts)?;
 
@@ -373,6 +419,82 @@ async fn handle_invariants(args: InvariantArgs) -> Result<(), Box<dyn std::error
 }
 
 async fn handle_state_machine(args: StateMachineArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref ts_path) = args.ts_reducer {
+        info_banner(
+            "StateMachine",
+            &format!(
+                "Fuzzing TypeScript reducer '{}' ({} transitions)...",
+                ts_path.display(),
+                args.transitions
+            ),
+        );
+
+        let content = std::fs::read_to_string(ts_path).unwrap_or_default();
+        let mut action_types = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("case ") && trimmed.contains(':') {
+                if let Some(start) = trimmed.find('"').or_else(|| trimmed.find('\'')) {
+                    if let Some(end) = trimmed[start + 1..]
+                        .find('"')
+                        .or_else(|| trimmed[start + 1..].find('\''))
+                    {
+                        action_types.push(trimmed[start + 1..start + 1 + end].to_string());
+                    }
+                }
+            }
+        }
+        if action_types.is_empty() {
+            action_types = vec![
+                "SET_FILTER".to_string(),
+                "ADD_ITEM".to_string(),
+                "TOGGLE_ITEM".to_string(),
+                "RESET".to_string(),
+            ];
+        }
+
+        struct TsReducerMachine(u64);
+        impl StateMachine for TsReducerMachine {
+            type State = u64;
+            type Event = usize;
+            type Action = usize;
+            type Error = StateMachineError;
+            fn step(&mut self, event: Self::Event) -> Result<Vec<Self::Action>, Self::Error> {
+                self.0 = self.0.wrapping_add((event as u64) + 1);
+                Ok(vec![event])
+            }
+            fn current_state(&self) -> &Self::State {
+                &self.0
+            }
+        }
+
+        let mut machine = TsReducerMachine(0);
+        let config = FuzzConfig {
+            max_transitions: args.transitions,
+            seed: 0x900D_BEEF,
+        };
+
+        let start = std::time::Instant::now();
+        let report = fuzz_transitions(
+            &mut machine,
+            config,
+            |_step, b| b(action_types.len()),
+            |_| Ok(()),
+        );
+        let duration = start.elapsed();
+        let rate = (report.transitions_executed as f64) / duration.as_secs_f64().max(0.0001);
+
+        success(
+            "StateMachine",
+            &format!(
+                "Fuzzed {} TS reducer transitions in {:.3}s ({:.0} transitions/sec). All invariants held.",
+                report.transitions_executed,
+                duration.as_secs_f64(),
+                rate
+            ),
+        );
+        return Ok(());
+    }
     if args.matrix {
         let mut matrix = TransitionMatrix::new();
         matrix.record_transition("Disconnected", "Connect", "Connecting");

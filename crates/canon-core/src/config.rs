@@ -26,6 +26,12 @@ pub struct CanonConfig {
     /// Configuration for daemon sidecar service.
     #[serde(default)]
     pub daemon: DaemonConfig,
+    /// Configuration for TypeScript / TSX context slicing.
+    #[serde(default)]
+    pub typescript: TypeScriptConfig,
+    /// Configuration for cross-boundary contract correlation.
+    #[serde(default)]
+    pub cross_boundary: CrossBoundaryConfig,
 }
 
 /// General engine configuration options.
@@ -185,10 +191,17 @@ pub struct DaemonConfig {
     /// Whether background filesystem watching is enabled.
     #[serde(default = "default_true")]
     pub enable_file_watcher: bool,
+    /// Paths to monitor for source code modifications.
+    #[serde(default = "default_watch_paths")]
+    pub watch_paths: Vec<String>,
 }
 
 fn default_socket_path() -> String {
     "/tmp/canon.sock".to_string()
+}
+
+fn default_watch_paths() -> Vec<String> {
+    vec!["crates".to_string(), "frontend/src".to_string()]
 }
 
 impl Default for DaemonConfig {
@@ -196,6 +209,84 @@ impl Default for DaemonConfig {
         Self {
             socket_path: default_socket_path(),
             enable_file_watcher: true,
+            watch_paths: default_watch_paths(),
+        }
+    }
+}
+
+/// Configuration for TypeScript / TSX context slicing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeScriptConfig {
+    /// Enable TypeScript parsing and slicing.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Root tsconfig path for symbol resolution.
+    #[serde(default = "default_tsconfig_path")]
+    pub tsconfig_path: String,
+    /// Supported extensions for slicing and file watching.
+    #[serde(default = "default_ts_extensions")]
+    pub extensions: Vec<String>,
+    /// Strips JSX blocks down to clean type signatures.
+    #[serde(default = "default_true")]
+    pub strip_jsx: bool,
+    /// Strips React hook internals (useEffect, useState).
+    #[serde(default = "default_true")]
+    pub strip_hook_bodies: bool,
+}
+
+fn default_tsconfig_path() -> String {
+    "frontend/tsconfig.json".to_string()
+}
+
+fn default_ts_extensions() -> Vec<String> {
+    vec![
+        "ts".to_string(),
+        "tsx".to_string(),
+        "js".to_string(),
+        "jsx".to_string(),
+    ]
+}
+
+impl Default for TypeScriptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tsconfig_path: default_tsconfig_path(),
+            extensions: default_ts_extensions(),
+            strip_jsx: true,
+            strip_hook_bodies: true,
+        }
+    }
+}
+
+/// Configuration for cross-boundary contract correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossBoundaryConfig {
+    /// Directory containing shared Serde models.
+    #[serde(default = "default_rust_models")]
+    pub rust_models: String,
+    /// Directory containing TypeScript contract definitions.
+    #[serde(default = "default_ts_types")]
+    pub ts_types: String,
+    /// Enforce camelCase vs snake_case consistency checks.
+    #[serde(default = "default_true")]
+    pub strict_casing_check: bool,
+}
+
+fn default_rust_models() -> String {
+    "crates/shared-types/src".to_string()
+}
+
+fn default_ts_types() -> String {
+    "frontend/src/types".to_string()
+}
+
+impl Default for CrossBoundaryConfig {
+    fn default() -> Self {
+        Self {
+            rust_models: default_rust_models(),
+            ts_types: default_ts_types(),
+            strict_casing_check: true,
         }
     }
 }
@@ -280,5 +371,42 @@ max_call_depth = 5
         assert_eq!(cfg.general.default_format, OutputFormat::Json);
         assert_eq!(cfg.slice.max_call_depth, 5);
         assert_eq!(cfg.simulate.default_seeds, 5000);
+    }
+
+    #[test]
+    fn test_load_polyglot_config_file() {
+        use std::io::Write;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[general]
+codebase_scale = "massive"
+
+[typescript]
+enabled = true
+tsconfig_path = "frontend/tsconfig.json"
+extensions = ["ts", "tsx", "js", "jsx"]
+strip_jsx = true
+
+[cross_boundary]
+rust_models = "crates/shared-types/src"
+ts_types = "frontend/src/types"
+strict_casing_check = true
+
+[daemon]
+watch_paths = ["crates", "frontend/src"]
+"#
+        )
+        .unwrap();
+
+        let cfg = CanonConfig::load(file.path()).unwrap();
+        assert!(cfg.typescript.enabled);
+        assert_eq!(cfg.typescript.tsconfig_path, "frontend/tsconfig.json");
+        assert!(cfg.typescript.strip_jsx);
+        assert_eq!(cfg.cross_boundary.rust_models, "crates/shared-types/src");
+        assert_eq!(cfg.cross_boundary.ts_types, "frontend/src/types");
+        assert!(cfg.cross_boundary.strict_casing_check);
+        assert_eq!(cfg.daemon.watch_paths.len(), 2);
     }
 }

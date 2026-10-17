@@ -37,10 +37,52 @@ pub struct ContractInfo {
 pub struct SymbolDef {
     /// Symbol name.
     pub name: String,
-    /// Kind ("fn", "struct", "enum", "trait", "type").
+    /// Kind ("fn", "struct", "enum", "trait", "type", "interface").
     pub kind: String,
     /// File where symbol is declared.
     pub file: String,
+    /// Line number where declared (1-indexed).
+    #[serde(default = "default_line")]
+    pub line: usize,
+    /// Language origin ("rust" or "typescript").
+    #[serde(default = "default_rust_lang")]
+    pub language: String,
+}
+
+fn default_line() -> usize {
+    1
+}
+
+fn default_rust_lang() -> String {
+    "rust".to_string()
+}
+
+/// Information describing an API route, IPC command, or client fetch call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteBinding {
+    /// HTTP path or command name (e.g. "/api/users", "update_user").
+    pub route_path: String,
+    /// Handler function or calling function name.
+    pub handler_or_caller: String,
+    /// Source file path.
+    pub file: String,
+    /// Line number where route/call is defined (1-indexed).
+    pub line: usize,
+    /// Whether this is a backend definition (true) or frontend client call site (false).
+    pub is_backend: bool,
+}
+
+/// Cross-boundary correlation between Rust backend and TypeScript frontend contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossBoundaryImpact {
+    /// Inspected target symbol.
+    pub symbol: String,
+    /// Rust backend definition site, e.g. "crates/server/src/routes/users.rs:42 (UpdateUserPayload)".
+    pub rust_definition: Option<String>,
+    /// TypeScript consumer interface, e.g. "frontend/src/types/user.ts:18 (UpdateUserPayload)".
+    pub ts_interface: Option<String>,
+    /// Frontend client call sites.
+    pub api_call_sites: Vec<String>,
 }
 
 /// In-memory semantic index across a codebase.
@@ -54,6 +96,9 @@ pub struct SymbolIndex {
     pub contracts_map: HashMap<String, Vec<ContractInfo>>,
     /// Declared symbols indexed by name.
     pub symbols_map: HashMap<String, Vec<SymbolDef>>,
+    /// Recorded API routes and client fetch calls.
+    #[serde(default)]
+    pub routes: Vec<RouteBinding>,
 }
 
 impl SymbolIndex {
@@ -62,7 +107,7 @@ impl SymbolIndex {
         Self::default()
     }
 
-    /// Indexes all `.rs` files located under the target directory path.
+    /// Indexes all source files (.rs, .ts, .tsx, .js, .jsx) located under root path.
     pub fn index_directory(&mut self, root: &Path) -> Result<usize, SliceError> {
         let mut indexed_count = 0;
         for entry in WalkDir::new(root)
@@ -73,17 +118,39 @@ impl SymbolIndex {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if entry.file_type().is_file()
-                && entry.path().extension().is_some_and(|ext| ext == "rs")
-            {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    let _ =
-                        self.index_source_str(entry.path().to_string_lossy().as_ref(), &content);
-                    indexed_count += 1;
+            if entry.file_type().is_file() {
+                let ext = entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx") {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        let path_str = entry.path().to_string_lossy().to_string();
+                        let _ = self.index_any_source_str(&path_str, &content);
+                        indexed_count += 1;
+                    }
                 }
             }
         }
         Ok(indexed_count)
+    }
+
+    /// Indexes source from any supported language (Rust, TypeScript, TSX, JS).
+    pub fn index_any_source_str(
+        &mut self,
+        file_path: &str,
+        content: &str,
+    ) -> Result<(), SliceError> {
+        let is_ts = file_path.ends_with(".ts")
+            || file_path.ends_with(".tsx")
+            || file_path.ends_with(".js")
+            || file_path.ends_with(".jsx");
+        if is_ts {
+            self.index_ts_source_str(file_path, content)
+        } else {
+            self.index_source_str(file_path, content)
+        }
     }
 
     /// Indexes a single Rust source string.
@@ -94,7 +161,7 @@ impl SymbolIndex {
                 source,
             })?;
 
-        let mut visitor = IndexVisitor::new(file_path);
+        let mut visitor = IndexVisitor::new(file_path, content);
         visitor.visit_file(&ast);
 
         for edge in visitor.edges {
@@ -122,7 +189,262 @@ impl SymbolIndex {
                 .push(sym);
         }
 
+        for route in visitor.routes {
+            self.routes.push(route);
+        }
+
         Ok(())
+    }
+
+    /// Indexes a single TypeScript, TSX, or JavaScript source string.
+    pub fn index_ts_source_str(
+        &mut self,
+        file_path: &str,
+        content: &str,
+    ) -> Result<(), SliceError> {
+        let allocator = oxc_allocator::Allocator::default();
+        let is_jsx = file_path.ends_with(".tsx") || file_path.ends_with(".jsx");
+        let source_type = oxc_span::SourceType::default()
+            .with_typescript(true)
+            .with_jsx(is_jsx);
+        let ret = oxc_parser::Parser::new(&allocator, content, source_type).parse();
+
+        let get_line = |offset: u32| -> usize {
+            1 + content[..(offset as usize).min(content.len())]
+                .matches('\n')
+                .count()
+        };
+
+        for stmt in &ret.program.body {
+            match stmt {
+                oxc_ast::ast::Statement::ExportNamedDeclaration(decl) => {
+                    if let Some(ref d) = decl.declaration {
+                        self.index_ts_declaration(d, file_path, &get_line);
+                    }
+                }
+                oxc_ast::ast::Statement::TSInterfaceDeclaration(decl) => {
+                    let name = decl.id.name.to_string();
+                    let line = get_line(decl.span.start);
+                    self.symbols_map
+                        .entry(name.clone())
+                        .or_default()
+                        .push(SymbolDef {
+                            name,
+                            kind: "interface".to_string(),
+                            file: file_path.to_string(),
+                            line,
+                            language: "typescript".to_string(),
+                        });
+                }
+                oxc_ast::ast::Statement::TSTypeAliasDeclaration(decl) => {
+                    let name = decl.id.name.to_string();
+                    let line = get_line(decl.span.start);
+                    self.symbols_map
+                        .entry(name.clone())
+                        .or_default()
+                        .push(SymbolDef {
+                            name,
+                            kind: "type".to_string(),
+                            file: file_path.to_string(),
+                            line,
+                            language: "typescript".to_string(),
+                        });
+                }
+                oxc_ast::ast::Statement::TSEnumDeclaration(decl) => {
+                    let name = decl.id.name.to_string();
+                    let line = get_line(decl.span.start);
+                    self.symbols_map
+                        .entry(name.clone())
+                        .or_default()
+                        .push(SymbolDef {
+                            name,
+                            kind: "enum".to_string(),
+                            file: file_path.to_string(),
+                            line,
+                            language: "typescript".to_string(),
+                        });
+                }
+                oxc_ast::ast::Statement::FunctionDeclaration(func) => {
+                    if let Some(ref id) = func.id {
+                        let name = id.name.to_string();
+                        let line = get_line(func.span.start);
+                        self.symbols_map
+                            .entry(name.clone())
+                            .or_default()
+                            .push(SymbolDef {
+                                name,
+                                kind: "fn".to_string(),
+                                file: file_path.to_string(),
+                                line,
+                                language: "typescript".to_string(),
+                            });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.extract_ts_route_calls(file_path, content, &get_line);
+        Ok(())
+    }
+
+    fn index_ts_declaration(
+        &mut self,
+        decl: &oxc_ast::ast::Declaration<'_>,
+        file_path: &str,
+        get_line: &impl Fn(u32) -> usize,
+    ) {
+        match decl {
+            oxc_ast::ast::Declaration::TSInterfaceDeclaration(d) => {
+                let name = d.id.name.to_string();
+                let line = get_line(d.span.start);
+                self.symbols_map
+                    .entry(name.clone())
+                    .or_default()
+                    .push(SymbolDef {
+                        name,
+                        kind: "interface".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
+            }
+            oxc_ast::ast::Declaration::TSTypeAliasDeclaration(d) => {
+                let name = d.id.name.to_string();
+                let line = get_line(d.span.start);
+                self.symbols_map
+                    .entry(name.clone())
+                    .or_default()
+                    .push(SymbolDef {
+                        name,
+                        kind: "type".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
+            }
+            oxc_ast::ast::Declaration::TSEnumDeclaration(d) => {
+                let name = d.id.name.to_string();
+                let line = get_line(d.span.start);
+                self.symbols_map
+                    .entry(name.clone())
+                    .or_default()
+                    .push(SymbolDef {
+                        name,
+                        kind: "enum".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
+            }
+            oxc_ast::ast::Declaration::FunctionDeclaration(func) => {
+                if let Some(ref id) = func.id {
+                    let name = id.name.to_string();
+                    let line = get_line(func.span.start);
+                    self.symbols_map
+                        .entry(name.clone())
+                        .or_default()
+                        .push(SymbolDef {
+                            name,
+                            kind: "fn".to_string(),
+                            file: file_path.to_string(),
+                            line,
+                            language: "typescript".to_string(),
+                        });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_ts_route_calls(
+        &mut self,
+        file_path: &str,
+        content: &str,
+        get_line: &impl Fn(u32) -> usize,
+    ) {
+        let pattern = regex::Regex::new(r#"(?:fetch|invoke|axios\s*\.\s*(?:get|post|put|delete|patch))\s*\(\s*["'`]([^"'`]+)["'`]"#).unwrap();
+        for cap in pattern.captures_iter(content) {
+            if let Some(m) = cap.get(0) {
+                let route = cap.get(1).map(|c| c.as_str()).unwrap_or("");
+                let line = get_line(m.start() as u32);
+                let caller = find_enclosing_fn(content, m.start());
+                self.routes.push(RouteBinding {
+                    route_path: route.to_string(),
+                    handler_or_caller: caller,
+                    file: file_path.to_string(),
+                    line,
+                    is_backend: false,
+                });
+            }
+        }
+    }
+
+    /// Computes cross-boundary impact correlating Rust backend models/endpoints
+    /// with TypeScript types and frontend client API call sites.
+    pub fn get_cross_boundary_impact(&self, symbol: &str) -> Option<CrossBoundaryImpact> {
+        let rust_def = self
+            .symbols_map
+            .get(symbol)
+            .and_then(|defs| {
+                defs.iter()
+                    .find(|d| d.language == "rust" || d.file.ends_with(".rs"))
+            })
+            .map(|d| format!("{}:{} (`{}`)", d.file, d.line, d.name));
+
+        let ts_def = self
+            .symbols_map
+            .get(symbol)
+            .and_then(|defs| {
+                defs.iter().find(|d| {
+                    d.language == "typescript"
+                        || d.file.ends_with(".ts")
+                        || d.file.ends_with(".tsx")
+                })
+            })
+            .map(|d| format!("{}:{} (`{}`)", d.file, d.line, d.name));
+
+        let mut call_sites = Vec::new();
+        let sym_trimmed = symbol
+            .trim_end_matches("Payload")
+            .trim_end_matches("Request")
+            .trim_end_matches("Response");
+        let sym_lower = symbol.to_lowercase();
+        let trimmed_lower = sym_trimmed.to_lowercase();
+
+        for r in &self.routes {
+            if !r.is_backend {
+                let r_lower = r.route_path.to_lowercase();
+                let handler_lower = r.handler_or_caller.to_lowercase();
+                let matched = r_lower.contains(&sym_lower)
+                    || handler_lower.contains(&sym_lower)
+                    || handler_lower.contains(&trimmed_lower)
+                    || (!trimmed_lower.is_empty() && r_lower.contains(&trimmed_lower))
+                    || (trimmed_lower.len() >= 4
+                        && (r_lower.contains(&trimmed_lower[..4])
+                            || handler_lower.contains(&trimmed_lower[..4])));
+                if matched {
+                    call_sites.push(format!(
+                        "{}:{} (`{}()`)",
+                        r.file, r.line, r.handler_or_caller
+                    ));
+                }
+            }
+        }
+
+        call_sites.sort();
+        call_sites.dedup();
+
+        if rust_def.is_some() || ts_def.is_some() || !call_sites.is_empty() {
+            Some(CrossBoundaryImpact {
+                symbol: symbol.to_string(),
+                rust_definition: rust_def,
+                ts_interface: ts_def,
+                api_call_sites: call_sites,
+            })
+        } else {
+            None
+        }
     }
 
     /// Retrieves upstream callers of a symbol up to the requested depth.
@@ -179,22 +501,73 @@ fn is_ignored(path: &Path) -> bool {
     s.contains("/target/") || s.contains("/.git/")
 }
 
+fn find_line(content: &str, pattern: &str) -> usize {
+    if let Some(pos) = content.find(pattern) {
+        1 + content[..pos].matches('\n').count()
+    } else {
+        1
+    }
+}
+
+fn extract_string_literal(input: &str) -> Option<String> {
+    let start = input.find('"')?;
+    let end = input[start + 1..].find('"')?;
+    Some(input[start + 1..start + 1 + end].to_string())
+}
+
+fn find_enclosing_fn(content: &str, offset: usize) -> String {
+    let before = &content[..offset];
+    for line in before.lines().rev() {
+        let trimmed = line.trim();
+        for prefix in &[
+            "export async function ",
+            "async function ",
+            "export function ",
+            "function ",
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                if let Some(name) = rest.split(['(', ' ']).next() {
+                    let cleaned = name.trim();
+                    if !cleaned.is_empty() {
+                        return cleaned.to_string();
+                    }
+                }
+            }
+        }
+        for prefix in &["export const ", "const ", "export let ", "let "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                if let Some(name) = rest.split(['=', ':', '(']).next() {
+                    let cleaned = name.trim();
+                    if !cleaned.is_empty() {
+                        return cleaned.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "apiCall".to_string()
+}
+
 struct IndexVisitor<'a> {
     file_path: &'a str,
+    content: &'a str,
     current_fn: Option<String>,
     edges: Vec<CallEdge>,
     contracts: Vec<ContractInfo>,
     symbols: Vec<SymbolDef>,
+    routes: Vec<RouteBinding>,
 }
 
 impl<'a> IndexVisitor<'a> {
-    fn new(file_path: &'a str) -> Self {
+    fn new(file_path: &'a str, content: &'a str) -> Self {
         Self {
             file_path,
+            content,
             current_fn: None,
             edges: Vec::new(),
             contracts: Vec::new(),
             symbols: Vec::new(),
+            routes: Vec::new(),
         }
     }
 }
@@ -202,11 +575,41 @@ impl<'a> IndexVisitor<'a> {
 impl<'a> Visit<'_> for IndexVisitor<'a> {
     fn visit_item_fn(&mut self, node: &syn::ItemFn) {
         let name = node.sig.ident.to_string();
+        let pattern = format!("fn {}", name);
+        let line = find_line(self.content, &pattern);
         self.symbols.push(SymbolDef {
             name: name.clone(),
             kind: "fn".to_string(),
             file: self.file_path.to_string(),
+            line,
+            language: "rust".to_string(),
         });
+
+        for attr in &node.attrs {
+            let attr_str = attr.to_token_stream().to_string();
+            if attr_str.contains("tauri :: command") || attr_str.contains("tauri::command") {
+                self.routes.push(RouteBinding {
+                    route_path: name.clone(),
+                    handler_or_caller: name.clone(),
+                    file: self.file_path.to_string(),
+                    line,
+                    is_backend: true,
+                });
+            } else if attr_str.contains("get")
+                || attr_str.contains("post")
+                || attr_str.contains("put")
+                || attr_str.contains("delete")
+            {
+                let route_path = extract_string_literal(&attr_str).unwrap_or_else(|| name.clone());
+                self.routes.push(RouteBinding {
+                    route_path,
+                    handler_or_caller: name.clone(),
+                    file: self.file_path.to_string(),
+                    line,
+                    is_backend: true,
+                });
+            }
+        }
 
         let prev = self.current_fn.replace(name);
         syn::visit::visit_item_fn(self, node);
@@ -214,28 +617,43 @@ impl<'a> Visit<'_> for IndexVisitor<'a> {
     }
 
     fn visit_item_struct(&mut self, node: &syn::ItemStruct) {
+        let name = node.ident.to_string();
+        let pattern = format!("struct {}", name);
+        let line = find_line(self.content, &pattern);
         self.symbols.push(SymbolDef {
-            name: node.ident.to_string(),
+            name,
             kind: "struct".to_string(),
             file: self.file_path.to_string(),
+            line,
+            language: "rust".to_string(),
         });
         syn::visit::visit_item_struct(self, node);
     }
 
     fn visit_item_enum(&mut self, node: &syn::ItemEnum) {
+        let name = node.ident.to_string();
+        let pattern = format!("enum {}", name);
+        let line = find_line(self.content, &pattern);
         self.symbols.push(SymbolDef {
-            name: node.ident.to_string(),
+            name,
             kind: "enum".to_string(),
             file: self.file_path.to_string(),
+            line,
+            language: "rust".to_string(),
         });
         syn::visit::visit_item_enum(self, node);
     }
 
     fn visit_item_trait(&mut self, node: &syn::ItemTrait) {
+        let name = node.ident.to_string();
+        let pattern = format!("trait {}", name);
+        let line = find_line(self.content, &pattern);
         self.symbols.push(SymbolDef {
-            name: node.ident.to_string(),
+            name,
             kind: "trait".to_string(),
             file: self.file_path.to_string(),
+            line,
+            language: "rust".to_string(),
         });
         syn::visit::visit_item_trait(self, node);
     }
@@ -332,5 +750,62 @@ mod tests {
         let contracts = index.get_contracts("Rocket");
         assert_eq!(contracts.len(), 1);
         assert_eq!(contracts[0].trait_name, "Engine");
+    }
+
+    #[test]
+    fn test_cross_boundary_impact_indexing() {
+        let rust_code = r#"
+            pub struct UpdateUserPayload {
+                pub user_id: String,
+            }
+
+            #[tauri::command]
+            pub fn update_user(payload: UpdateUserPayload) {}
+        "#;
+
+        let ts_types = r#"
+            export interface UpdateUserPayload {
+                userId: string;
+            }
+        "#;
+
+        let ts_client = r#"
+            export async function updateUser(payload: UpdateUserPayload) {
+                return fetch("/api/users", { method: "POST" });
+            }
+        "#;
+
+        let mut index = SymbolIndex::new();
+        index
+            .index_any_source_str("crates/server/src/routes/users.rs", rust_code)
+            .unwrap();
+        index
+            .index_any_source_str("frontend/src/types/user.ts", ts_types)
+            .unwrap();
+        index
+            .index_any_source_str("frontend/src/api/userClient.ts", ts_client)
+            .unwrap();
+
+        let impact = index
+            .get_cross_boundary_impact("UpdateUserPayload")
+            .expect("impact must be found");
+        assert_eq!(impact.symbol, "UpdateUserPayload");
+        assert!(
+            impact
+                .rust_definition
+                .as_ref()
+                .unwrap()
+                .contains("crates/server/src/routes/users.rs")
+        );
+        assert!(
+            impact
+                .ts_interface
+                .as_ref()
+                .unwrap()
+                .contains("frontend/src/types/user.ts")
+        );
+        assert!(!impact.api_call_sites.is_empty());
+        assert!(impact.api_call_sites[0].contains("userClient.ts"));
+        assert!(impact.api_call_sites[0].contains("updateUser"));
     }
 }

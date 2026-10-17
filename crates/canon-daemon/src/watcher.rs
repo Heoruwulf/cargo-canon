@@ -20,7 +20,12 @@ pub fn start_watcher(
         if let Ok(event) = res {
             if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                 for path in event.paths {
-                    if path.extension().is_some_and(|ext| ext == "rs") {
+                    if path.extension().is_some_and(|ext| {
+                        matches!(
+                            ext.to_str().unwrap_or(""),
+                            "rs" | "ts" | "tsx" | "js" | "jsx"
+                        )
+                    }) {
                         let _ = tx.blocking_send(path);
                     }
                 }
@@ -46,7 +51,7 @@ pub fn start_watcher(
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         let path_str = path.to_string_lossy().to_string();
                         let mut guard = index.write().await;
-                        let _ = guard.index_source_str(&path_str, &content);
+                        let _ = guard.index_any_source_str(&path_str, &content);
                     }
                 }
             }

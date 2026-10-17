@@ -11,11 +11,15 @@ pub mod bundle;
 pub mod error;
 pub mod indexer;
 pub mod skeleton;
+pub mod ts_skeleton;
 
 pub use bundle::SliceBundle;
 pub use error::SliceError;
-pub use indexer::{CallEdge, ContractInfo, SymbolDef, SymbolIndex};
+pub use indexer::{
+    CallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, SymbolDef, SymbolIndex,
+};
 pub use skeleton::{SkeletonStripper, extract_file_skeleton, extract_skeleton, strip_file_ast};
+pub use ts_skeleton::{extract_ts_file_skeleton, extract_ts_skeleton};
 
 use canon_core::model::SliceMode;
 use std::path::Path;
@@ -29,7 +33,17 @@ pub fn slice_target(
     let raw_source = std::fs::read_to_string(target_path).map_err(SliceError::Io)?;
     let raw_len = raw_source.len().max(1);
 
-    let skeleton = extract_skeleton(&raw_source)?;
+    let ext = target_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let is_ts = matches!(ext, "ts" | "tsx" | "js" | "jsx");
+    let skeleton = if is_ts {
+        let is_jsx = matches!(ext, "tsx" | "jsx");
+        extract_ts_skeleton(&raw_source, is_jsx)?
+    } else {
+        extract_skeleton(&raw_source)?
+    };
     let skeleton_len = skeleton.len();
 
     let reduction_pct = if raw_len > skeleton_len {
@@ -46,6 +60,7 @@ pub fn slice_target(
     let mut contracts = Vec::new();
     let mut callers = Vec::new();
     let mut callees = Vec::new();
+    let mut cross_boundary = None;
 
     if let Some(idx) = index {
         if matches!(mode, SliceMode::Contracts | SliceMode::Bundle) {
@@ -55,6 +70,29 @@ pub fn slice_target(
             callers = idx.get_callers(target_name, 2);
             callees = idx.get_callees(target_name, 2);
         }
+        let sym_stem = target_name
+            .trim_end_matches(".rs")
+            .trim_end_matches(".tsx")
+            .trim_end_matches(".ts")
+            .trim_end_matches(".jsx")
+            .trim_end_matches(".js");
+        cross_boundary = idx
+            .get_cross_boundary_impact(sym_stem)
+            .or_else(|| idx.get_cross_boundary_impact(target_name))
+            .or_else(|| {
+                let file_str = target_path.to_string_lossy();
+                for (sym_name, defs) in &idx.symbols_map {
+                    if defs
+                        .iter()
+                        .any(|d| d.file == file_str || target_path.ends_with(&d.file))
+                    {
+                        if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+                            return Some(cb);
+                        }
+                    }
+                }
+                None
+            });
     }
 
     Ok(SliceBundle {
@@ -64,6 +102,7 @@ pub fn slice_target(
         callers,
         callees,
         token_reduction_pct: reduction_pct,
+        cross_boundary,
     })
 }
 
@@ -99,5 +138,63 @@ mod tests {
         assert!(bundle.skeleton.contains("pub fn run (& self)"));
         assert!(!bundle.skeleton.contains("Heavy iteration"));
         assert!(bundle.token_reduction_pct > 30.0);
+    }
+
+    #[test]
+    fn test_slice_target_bundle_tsx() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("Component.tsx");
+        std::fs::write(
+            &file_path,
+            r#"
+            export interface Props { title: string; }
+            export function Component(props: Props) {
+                return <div>{props.title}</div>;
+            }
+            "#,
+        )
+        .unwrap();
+
+        let bundle = slice_target(&file_path, SliceMode::Bundle, None).unwrap();
+        assert!(bundle.skeleton.contains("export interface Props"));
+        assert!(
+            bundle
+                .skeleton
+                .contains("export function Component(props: Props): JSX.Element;")
+        );
+        let md = bundle.format_markdown();
+        assert!(md.contains("```typescript"));
+        assert!(md.contains("Token Reduction:"));
+    }
+
+    #[test]
+    fn test_slice_target_bundle_with_cross_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs_path = dir.path().join("users.rs");
+        let ts_path = dir.path().join("user.ts");
+
+        std::fs::write(&rs_path, "pub struct UserPayload { pub id: u64, }").unwrap();
+        std::fs::write(&ts_path, "export interface UserPayload { id: number; }").unwrap();
+
+        let mut index = SymbolIndex::new();
+        index
+            .index_any_source_str(
+                &rs_path.to_string_lossy(),
+                "pub struct UserPayload { pub id: u64, }",
+            )
+            .unwrap();
+        index
+            .index_any_source_str(
+                &ts_path.to_string_lossy(),
+                "export interface UserPayload { id: number; }",
+            )
+            .unwrap();
+
+        let bundle = slice_target(&rs_path, SliceMode::Bundle, Some(&index)).unwrap();
+        assert!(bundle.cross_boundary.is_some());
+        let md = bundle.format_markdown();
+        assert!(md.contains("## Cross-Boundary Impact"));
+        assert!(md.contains("Rust Backend Definition:"));
+        assert!(md.contains("TypeScript Consumer Interface:"));
     }
 }
