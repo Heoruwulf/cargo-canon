@@ -1,0 +1,51 @@
+# Canon Configuration Template (.canon.toml)
+# Place this file in your repository root to configure cargo-canon.
+
+[general]
+# Codebase scale hint: "small", "medium", or "massive"
+# Adjusts internal buffer pools, worker threads, and memory allocations.
+codebase_scale = "massive"
+
+# Default output format: "markdown", "json", or "text"
+default_format = "markdown"
+
+[slice]
+# Maximum call-graph depth for caller/callee exploration (default: 2)
+max_call_depth = 2
+
+# Whether to strip comments during skeleton unparsing
+strip_comments = false
+
+# Whether to include private/internal types in context exports
+include_private_types = true
+
+[simulate]
+# Default number of pseudo-random simulation passes to run
+default_seeds = 5000
+
+# Execution timeout per simulation pass in seconds
+timeout_seconds = 30
+
+# Panic capture mode: "capture_backtrace", "silent", or "abort"
+panic_hook = "capture_backtrace"
+
+[verify]
+# Default loop unwinding depth bound for bounded model checking
+default_unwind = 4
+
+# SAT/SMT solver engine ("kissat", "cadical", or "z3")
+solver = "kissat"
+
+[diff_fuzz]
+# Default number of differential fuzzing cycles
+default_iterations = 50000
+
+# Directory path for seed corpus storage
+corpus_dir = "tests/fuzz/corpus"
+
+[daemon]
+# Unix domain socket path for high-throughput agent IPC
+socket_path = "/tmp/canon.sock"
+
+# Enable background incremental file watching via notify
+enable_file_watcher = true

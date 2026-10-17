@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json.schemastore.org/partial-claude-code-config.json",
+  "hooks": {
+    "post_read": "cargo canon daemon --hook-post-read --file $FILE_PATH"
+  }
+}

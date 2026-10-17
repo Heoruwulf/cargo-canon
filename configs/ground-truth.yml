@@ -1,0 +1,36 @@
+name: Ground-Truth Verification
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  verify:
+    name: Verification Oracles & Ground-Truth
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install cargo-canon
+        run: cargo install cargo-canon
+
+      - name: Run Sans-I/O State Machine Transition Fuzzer & Matrix
+        run: cargo canon state-machine --matrix --fuzz-transitions --transitions 500000
+
+      - name: Run Deterministic Simulation Testing (DST)
+        run: cargo canon simulate --seeds 5000 --ai-prompt-on-fail
+
+      - name: Run Differential Fuzzing
+        run: cargo canon diff-fuzz --iterations 50000
+
+      - name: Run Bounded Model Checking
+        run: cargo canon verify --unwind 4
