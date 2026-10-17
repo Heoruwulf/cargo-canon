@@ -1,0 +1,25 @@
+[general]
+codebase_scale = "massive"
+default_format = "markdown"
+
+[slice]
+max_call_depth = 2
+strip_comments = false
+include_private_types = true
+
+[simulate]
+default_seeds = 5000
+timeout_seconds = 30
+panic_hook = "capture_backtrace"
+
+[verify]
+default_unwind = 4
+solver = "kissat"
+
+[diff_fuzz]
+default_iterations = 50000
+corpus_dir = "tests/fuzz/corpus"
+
+[daemon]
+socket_path = "/tmp/canon.sock"
+enable_file_watcher = true

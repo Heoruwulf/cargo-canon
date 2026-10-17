@@ -1,0 +1,38 @@
+//! Error primitives for daemon sidecar service.
+
+use std::path::PathBuf;
+use thiserror::Error;
+
+/// Errors produced during daemon IPC communication or file watching.
+#[derive(Error, Debug)]
+pub enum DaemonError {
+    /// Socket binding or connection error.
+    #[error("IPC socket error on '{path}': {source}")]
+    Socket {
+        /// Socket path.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Protocol framing or deserialization error.
+    #[error("protocol framing failure: {0}")]
+    Protocol(String),
+
+    /// File watching error.
+    #[error("file watcher failure: {0}")]
+    Watcher(String),
+
+    /// Slicing error during hook execution.
+    #[error("slicing error: {0}")]
+    Slice(#[from] canon_slice::SliceError),
+
+    /// Core error.
+    #[error("core error: {0}")]
+    Core(#[from] canon_core::CoreError),
+
+    /// Standard I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}

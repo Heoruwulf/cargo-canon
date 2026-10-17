@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/canon-core",
+    "crates/canon-state",
+    "crates/canon-slice",
+    "crates/canon-harness",
+    "crates/canon-daemon",
+    "crates/cargo-canon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0 OR MIT"
+authors = ["cargo-canon contributors"]
+
+[workspace.dependencies]
+canon-core = { path = "crates/canon-core" }
+canon-state = { path = "crates/canon-state" }
+canon-slice = { path = "crates/canon-slice" }
+canon-harness = { path = "crates/canon-harness" }
+canon-daemon = { path = "crates/canon-daemon" }
+
+syn = { version = "2.0", features = ["full", "visit", "visit-mut", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7" }
+colored = "3.0"
+anstream = "0.6"
+proptest = "1.6"
+notify = "8.0"
+tempfile = "3.17"
+bytes = "1.10"
+parking_lot = "0.12"
+rand = "0.8"
+walkdir = "2.5"
+regex = "1.11"
