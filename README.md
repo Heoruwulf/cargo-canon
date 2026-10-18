@@ -389,8 +389,11 @@ Configure an advisory post-read hook:
 }
 ```
 
+For a step-by-step guide on integrating `cargo-canon` with your Rust and TypeScript project to improve Claude, see [`docs/instructions.md`](docs/instructions.md).
+
 Pre-packaged configuration templates and starter kits are provided in the [`configs/`](configs/) folder:
 
+- [`docs/instructions.md`](docs/instructions.md): Step-by-step setup guide for your codebase & Claude Code onboarding.
 - [`configs/.canon.toml`](configs/.canon.toml): Full repository configuration template.
 - [`configs/claude-config.json`](configs/claude-config.json): Claude Code hook setup.
 - [`configs/ground-truth.yml`](configs/ground-truth.yml): GitHub Actions CI verification workflow.
