@@ -32,7 +32,7 @@ Guidance for AI coding agents working in this repository. This is a Rust **2024*
     - Strictly `#![no_std]` compatible; pure synchronous execution, caller-provided deterministic time, isolated from external side effects.
     - Exhaustive transition matrix fuzzer capable of >1,000,000 state transitions/sec for Rust state machines, pure TypeScript reducers (`--ts-reducer`), and pure Go state machines (`--lang go` / `--go-state-machine`).
   - `crates/canon-daemon`: agent sidecar and background indexing daemon:
-    - High-throughput IPC / Unix domain socket server (`/tmp/groundtruth.sock` or `/tmp/canon.sock`) for sub-millisecond agent tool responses.
+    - High-throughput IPC / Unix domain socket server (`/tmp/canon-<hash>.sock` dynamically isolated per worktree/repo) for sub-millisecond agent tool responses.
     - Incremental file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.go` to update the local symbol index in < 20ms on file mutations.
     - Non-destructive tool hook handlers (`hook post-read`).
 - **NON-DESTRUCTIVE ADVISORY CONTEXT INJECTION (CRITICAL INVARIANT)**:
@@ -285,7 +285,7 @@ cargo doc --package tracing --no-deps --open      # view structured diagnostic i
   - Utilize `miette` or `anstream` to format terminal error diagnostics with clear source code snippets, colored underlines, and specific error codes.
 - **Daemon Architecture & IPC**:
   - Deliver background indexing and sub-millisecond agent tool hook execution via `crates/canon-daemon`.
-  - Conduct IPC over Unix domain sockets (`/tmp/canon.sock`) or named pipes using length-prefixed JSON or bincode framing.
+  - Conduct IPC over Unix domain sockets (`/tmp/canon-<hash>.sock` per workspace) or named pipes using length-prefixed JSON or bincode framing.
   - Configure `notify::RecommendedWatcher` with debouncing (e.g., 50ms) to consolidate rapid multi-file IDE save events before triggering AST re-indexing.
 - **Graceful Shutdown**:
   - Monitor termination signals via `tokio::signal::ctrl_c()` and Unix `tokio::signal::unix::signal(SignalKind::terminate())`.

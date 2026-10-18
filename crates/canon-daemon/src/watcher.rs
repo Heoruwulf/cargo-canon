@@ -14,6 +14,8 @@ pub fn start_watcher(
     index: Arc<RwLock<SymbolIndex>>,
     token: CancellationToken,
 ) -> Result<(), DaemonError> {
+    let canonical_root = std::fs::canonicalize(&watch_dir).unwrap_or(watch_dir);
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(100);
 
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
@@ -35,7 +37,7 @@ pub fn start_watcher(
     .map_err(|e| DaemonError::Watcher(e.to_string()))?;
 
     watcher
-        .watch(Path::new(&watch_dir), RecursiveMode::Recursive)
+        .watch(Path::new(&canonical_root), RecursiveMode::Recursive)
         .map_err(|e| DaemonError::Watcher(e.to_string()))?;
 
     tokio::spawn(async move {
@@ -49,7 +51,8 @@ pub fn start_watcher(
                 }
                 Some(path) = rx.recv() => {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        let path_str = path.to_string_lossy().to_string();
+                        let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
+                        let path_str = canonical_path.to_string_lossy().to_string();
                         let mut guard = index.write().await;
                         let _ = guard.index_any_source_str(&path_str, &content);
                     }

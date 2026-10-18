@@ -16,6 +16,10 @@ pub enum DaemonError {
         source: std::io::Error,
     },
 
+    /// Daemon socket is already bound and actively serving.
+    #[error("daemon socket '{0}' is already bound and actively serving")]
+    SocketAlreadyBound(PathBuf),
+
     /// Protocol framing or deserialization error.
     #[error("protocol framing failure: {0}")]
     Protocol(String),

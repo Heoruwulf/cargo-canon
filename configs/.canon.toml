@@ -44,8 +44,8 @@ default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
 
 [daemon]
-# Unix domain socket path for high-throughput agent IPC
-socket_path = "/tmp/canon.sock"
+# Unix domain socket path override (optional; auto-derived per workspace/worktree if omitted)
+# socket_path = "/tmp/canon.sock"
 
 # Enable background incremental file watching via notify
 enable_file_watcher = true

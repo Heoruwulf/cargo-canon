@@ -80,4 +80,57 @@ mod tests {
 
         let _ = server_handle.await;
     }
+
+    #[tokio::test]
+    async fn test_daemon_socket_already_bound() {
+        let tmp = NamedTempFile::new().unwrap();
+        let socket_path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let index1 = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token1 = CancellationToken::new();
+
+        let s_path = socket_path.clone();
+        let s_token1 = token1.clone();
+        let server1 = tokio::spawn(async move {
+            let _ = run_server(&s_path, index1, s_token1).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let index2 = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token2 = CancellationToken::new();
+        let res = run_server(&socket_path, index2, token2).await;
+        assert!(matches!(res, Err(DaemonError::SocketAlreadyBound(_))));
+
+        let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
+        let _ = server1.await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_stale_socket_self_healing() {
+        let tmp = NamedTempFile::new().unwrap();
+        let socket_path = tmp.path().to_path_buf();
+        std::fs::write(&socket_path, b"stale dead socket").unwrap();
+        assert!(socket_path.exists());
+
+        let index = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token = CancellationToken::new();
+
+        let s_path = socket_path.clone();
+        let s_token = token.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_server(&s_path, index, s_token).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let response = send_daemon_request(&socket_path, DaemonRequest::Ping)
+            .await
+            .unwrap();
+        assert!(matches!(response, DaemonResponse::Pong));
+
+        let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
+        let _ = server.await;
+    }
 }

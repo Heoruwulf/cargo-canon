@@ -9,7 +9,11 @@ use canon_core::config::CanonConfig;
 use canon_core::diagnostics::{error, info_banner, success};
 use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
-use canon_daemon::{execute_post_read_hook, run_server, start_watcher};
+use canon_core::workspace::{resolve_active_socket, resolve_workspace_root};
+use canon_daemon::{
+    DaemonRequest, DaemonResponse, execute_post_read_hook, run_server, send_daemon_request,
+    start_watcher,
+};
 use canon_harness::{
     DiffFuzzOptions, InvariantOptions, SimulateOptions, VerifyOptions, run_diff_fuzz,
     run_invariants, run_simulation, run_verify,
@@ -690,20 +694,49 @@ async fn handle_daemon(
     args: DaemonArgs,
     cfg: &CanonConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_str = args
-        .socket
-        .unwrap_or_else(|| cfg.daemon.socket_path.clone());
-    let socket_path = PathBuf::from(socket_str);
+    let current_dir = std::env::current_dir()?;
+    let socket_override = args.socket.as_deref().or(cfg.daemon.socket_path.as_deref());
 
     if args.hook_post_read {
-        if let Some(file) = args.file {
-            let advisory = execute_post_read_hook(&file, None)?;
-            println!("{}", advisory);
-        } else {
+        let Some(file) = args.file else {
             error("Daemon", "--file is required when running post-read hook");
+            return Ok(());
+        };
+
+        let file_root = file.parent().unwrap_or(&current_dir);
+        let hook_socket = resolve_active_socket(socket_override, file_root);
+
+        let mut advisory: Option<String> = None;
+        if hook_socket.exists() {
+            if let Ok(resp) = send_daemon_request(
+                &hook_socket,
+                DaemonRequest::PostReadHook { file: file.clone() },
+            )
+            .await
+            {
+                match resp {
+                    DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                        advisory = Some(advisory_block);
+                    }
+                    DaemonResponse::Error { message } => {
+                        tracing::warn!("Daemon hook returned error: {}", message);
+                    }
+                    _ => {}
+                }
+            }
         }
+
+        let output = match advisory {
+            Some(adv) => adv,
+            None => execute_post_read_hook(&file, None)?,
+        };
+
+        println!("{}", output);
         return Ok(());
     }
+
+    let root = resolve_workspace_root(&current_dir);
+    let socket_path = resolve_active_socket(socket_override, &root);
 
     info_banner(
         "Daemon",
@@ -712,11 +745,13 @@ async fn handle_daemon(
             socket_path.display()
         ),
     );
-    let index = Arc::new(RwLock::new(SymbolIndex::new()));
+    let mut initial_index = SymbolIndex::new();
+    let _ = initial_index.index_directory(&root);
+    let index = Arc::new(RwLock::new(initial_index));
     let token = CancellationToken::new();
 
     if cfg.daemon.enable_file_watcher {
-        let _ = start_watcher(PathBuf::from("."), Arc::clone(&index), token.clone());
+        let _ = start_watcher(root.clone(), Arc::clone(&index), token.clone());
     }
 
     let tok_ctrl_c = token.clone();

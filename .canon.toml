@@ -21,7 +21,6 @@ default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
 
 [daemon]
-socket_path = "/tmp/canon.sock"
 enable_file_watcher = true
 
 [go]

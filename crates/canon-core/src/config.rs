@@ -188,19 +188,15 @@ impl Default for DiffFuzzConfig {
 /// Background daemon configuration options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Unix domain socket path for agent IPC.
-    #[serde(default = "default_socket_path")]
-    pub socket_path: String,
+    /// Unix domain socket path override (None = auto-derived per workspace/worktree).
+    #[serde(default)]
+    pub socket_path: Option<String>,
     /// Whether background filesystem watching is enabled.
     #[serde(default = "default_true")]
     pub enable_file_watcher: bool,
     /// Paths to monitor for source code modifications.
     #[serde(default = "default_watch_paths")]
     pub watch_paths: Vec<String>,
-}
-
-fn default_socket_path() -> String {
-    "/tmp/canon.sock".to_string()
 }
 
 fn default_watch_paths() -> Vec<String> {
@@ -210,7 +206,7 @@ fn default_watch_paths() -> Vec<String> {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            socket_path: default_socket_path(),
+            socket_path: None,
             enable_file_watcher: true,
             watch_paths: default_watch_paths(),
         }
@@ -481,7 +477,27 @@ mod tests {
         assert_eq!(cfg.simulate.default_seeds, 5000);
         assert_eq!(cfg.verify.default_unwind, 4);
         assert_eq!(cfg.diff_fuzz.default_iterations, 50000);
-        assert_eq!(cfg.daemon.socket_path, "/tmp/canon.sock");
+        assert_eq!(cfg.daemon.socket_path, None);
+    }
+
+    #[test]
+    fn test_daemon_config_socket_override() {
+        use std::io::Write;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[daemon]
+socket_path = "/tmp/custom-test.sock"
+"#
+        )
+        .unwrap();
+
+        let cfg = CanonConfig::load(file.path()).unwrap();
+        assert_eq!(
+            cfg.daemon.socket_path,
+            Some("/tmp/custom-test.sock".to_string())
+        );
     }
 
     #[test]

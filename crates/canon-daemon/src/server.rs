@@ -6,8 +6,10 @@ use crate::protocol::{DaemonRequest, DaemonResponse, read_message, write_message
 use canon_slice::{SymbolIndex, slice_target};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 /// RAII Socket cleaner to remove socket file on drop.
@@ -28,6 +30,25 @@ impl Drop for SocketGuard {
     }
 }
 
+/// Probes whether an active daemon is responsive on the given socket path.
+async fn probe_active_socket(socket_path: &Path) -> bool {
+    let connect_fut = UnixStream::connect(socket_path);
+    let Ok(Ok(mut stream)) = timeout(Duration::from_millis(50), connect_fut).await else {
+        return false;
+    };
+
+    let ping_fut = async {
+        write_message(&mut stream, &DaemonRequest::Ping).await?;
+        let resp: DaemonResponse = read_message(&mut stream).await?;
+        Ok::<_, DaemonError>(resp)
+    };
+
+    matches!(
+        timeout(Duration::from_millis(50), ping_fut).await,
+        Ok(Ok(DaemonResponse::Pong))
+    )
+}
+
 /// Runs the IPC daemon server loop until shutdown token is cancelled.
 pub async fn run_server(
     socket_path: &Path,
@@ -35,6 +56,9 @@ pub async fn run_server(
     token: CancellationToken,
 ) -> Result<(), DaemonError> {
     if socket_path.exists() {
+        if probe_active_socket(socket_path).await {
+            return Err(DaemonError::SocketAlreadyBound(socket_path.to_path_buf()));
+        }
         let _ = std::fs::remove_file(socket_path);
     }
 

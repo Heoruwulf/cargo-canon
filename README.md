@@ -281,7 +281,7 @@ cargo canon state-machine --lang go --transitions 500000
 ### Background Daemon & Agent Hooks
 
 ```sh
-# Start background IPC daemon on /tmp/canon.sock
+# Start background IPC daemon (auto-derives /tmp/canon-<hash>.sock per workspace/worktree)
 cargo canon daemon --start
 
 # Advisory post-read hook on Rust source file
@@ -324,7 +324,7 @@ default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
 
 [daemon]
-socket_path = "/tmp/canon.sock"
+# socket_path = "/tmp/canon.sock"  # Optional override; auto-derived per workspace/worktree if omitted
 enable_file_watcher = true
 watch_paths = ["crates", "frontend/src", "backend"]
 
