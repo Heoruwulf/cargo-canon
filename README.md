@@ -284,7 +284,16 @@ cargo canon state-machine --lang go --transitions 500000
 # Start background IPC daemon (auto-derives /tmp/canon-<hash>.sock per workspace/worktree)
 cargo canon daemon --start
 
-# Advisory post-read hook on Rust source file
+# Probe running daemon liveness and report round-trip latency
+cargo canon daemon --ping
+
+# Query running daemon status, index metrics, and cache statistics (supports --json)
+cargo canon daemon --status
+
+# Gracefully terminate the running background daemon
+cargo canon daemon --stop
+
+# Advisory post-read hook on Rust source file (emits provenance header)
 cargo canon daemon --hook-post-read --file src/engine.rs
 
 # Advisory post-read hook on TypeScript/TSX source file

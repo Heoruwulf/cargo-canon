@@ -88,6 +88,21 @@ pub struct CrossBoundaryImpact {
     pub api_call_sites: Vec<String>,
 }
 
+/// Metric summary of the in-memory symbol graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolIndexMetrics {
+    /// Number of distinct source files containing declared symbols.
+    pub distinct_files_count: usize,
+    /// Total number of symbols declared in index.
+    pub total_symbols_count: usize,
+    /// Total number of caller -> callee edges indexed.
+    pub total_call_edges_count: usize,
+    /// Total number of trait/interface contract implementations recorded.
+    pub total_contracts_count: usize,
+    /// Total number of HTTP routes and client bindings recorded.
+    pub total_routes_count: usize,
+}
+
 /// In-memory semantic index across a codebase.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SymbolIndex {
@@ -108,6 +123,28 @@ impl SymbolIndex {
     /// Creates an empty symbol index.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Computes summary metrics of the current semantic graph in O(N).
+    pub fn metrics(&self) -> SymbolIndexMetrics {
+        let mut files = HashSet::new();
+        let mut total_symbols = 0;
+        for defs in self.symbols_map.values() {
+            total_symbols += defs.len();
+            for def in defs {
+                files.insert(&def.file);
+            }
+        }
+        let total_call_edges: usize = self.callers_map.values().map(|v| v.len()).sum();
+        let total_contracts: usize = self.contracts_map.values().map(|v| v.len()).sum();
+
+        SymbolIndexMetrics {
+            distinct_files_count: files.len(),
+            total_symbols_count: total_symbols,
+            total_call_edges_count: total_call_edges,
+            total_contracts_count: total_contracts,
+            total_routes_count: self.routes.len(),
+        }
     }
 
     /// Indexes all source files (.rs, .ts, .tsx, .js, .jsx) located under root path.
@@ -895,5 +932,44 @@ mod tests {
         assert!(!impact.api_call_sites.is_empty());
         assert!(impact.api_call_sites[0].contains("userClient.ts"));
         assert!(impact.api_call_sites[0].contains("updateUser"));
+    }
+
+    #[test]
+    fn test_metrics_empty() {
+        let index = SymbolIndex::new();
+        let m = index.metrics();
+        assert_eq!(m.distinct_files_count, 0);
+        assert_eq!(m.total_symbols_count, 0);
+        assert_eq!(m.total_call_edges_count, 0);
+        assert_eq!(m.total_contracts_count, 0);
+        assert_eq!(m.total_routes_count, 0);
+    }
+
+    #[test]
+    fn test_metrics_populated() {
+        let mut index = SymbolIndex::new();
+        let rust_code = r#"
+            pub struct Engine {
+                pub id: u64,
+            }
+            pub trait Runner {
+                fn run(&self);
+            }
+            impl Runner for Engine {
+                fn run(&self) {}
+            }
+            pub fn start_all() {
+                let e = Engine { id: 1 };
+                e.run();
+            }
+        "#;
+        index
+            .index_any_source_str("src/engine.rs", rust_code)
+            .unwrap();
+        let m = index.metrics();
+        assert_eq!(m.distinct_files_count, 1);
+        assert!(m.total_symbols_count >= 3);
+        assert!(m.total_contracts_count >= 1);
+        assert!(m.total_call_edges_count >= 1);
     }
 }

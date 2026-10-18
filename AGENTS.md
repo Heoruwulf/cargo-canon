@@ -89,6 +89,9 @@ cargo canon state-machine --fuzz-transitions                       # fuzz pure S
 cargo canon state-machine --ts-reducer <PATH> --fuzz-transitions   # fuzz pure TypeScript reducer transitions
 cargo canon state-machine --lang go --transitions 500000           # fuzz pure Sans-I/O Go state machine transitions
 cargo canon daemon --start                                         # start background indexing daemon
+cargo canon daemon --ping                                          # probe running daemon liveness and latency
+cargo canon daemon --status                                        # query running daemon status, index metrics, and cache statistics
+cargo canon daemon --stop                                          # gracefully stop running background daemon
 cargo canon daemon --hook-post-read --file <PATH>                  # advisory post-read tool hook (.rs / .ts / .tsx / .go)
 ```
 
@@ -309,14 +312,14 @@ In codebases >1M LOC, coding agents cannot maintain global architecture in-conte
       └───────┬────────────┬─────────────┬─────────────┬────────────┬───────┘
               │            │             │             │            │
               ▼            ▼             ▼             ▼            ▼
-        ┌──────────┐ ┌──────────┐  ┌──────────┐  ┌──────────┐ ┌──────────┐
-        │  Slice   │ │   DST    │  │Diff-Fuzz │  │  Verify  │ │State-Mach│
-        │ (AST/SCIP│ │ (madsim) │  │ (bolero) │  │  (kani)  │ │ (Sans-IO)│
-        └────┬─────┘ └────┬─────┘  └────┬─────┘  └────┬─────┘ └────┬─────┘
-             │            │             │             │            │
-             ▼            ▼             ▼             ▼            ▼
-      [Fast Skeleton] [Seed Loop]   [Dual Run]   [SMT Model]  [State Space]
-      [Call Graph   ] [Replay Log]  [Shrinker]   [Counterex]  [Transition ]
+        ┌───────────┐ ┌──────────┐  ┌──────────┐  ┌──────────┐ ┌──────────┐
+        │  Slice    │ │   DST    │  │Diff-Fuzz │  │  Verify  │ │State-Mach│
+        │ (AST/SCIP)│ │ (madsim) │  │ (bolero) │  │  (kani)  │ │ (Sans-IO)│
+        └────┬──────┘ └────┬─────┘  └────┬─────┘  └────┬─────┘ └────┬─────┘
+             │             │             │             │            │
+             ▼             ▼             ▼             ▼            ▼
+      [Fast Skeleton]  [Seed Loop]   [Dual Run]   [SMT Model]  [State Space]
+      [Call Graph   ]  [Replay Log]  [Shrinker]   [Counterex]  [Transition ]
 ```
 
 ### Pillar 1: Deterministic Simulation Testing (DST) with `madsim` & Go Concurrency Sweep

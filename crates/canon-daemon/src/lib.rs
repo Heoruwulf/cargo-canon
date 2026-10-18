@@ -15,8 +15,8 @@ pub mod watcher;
 
 pub use error::DaemonError;
 pub use hook::execute_post_read_hook;
-pub use protocol::{DaemonRequest, DaemonResponse, read_message, write_message};
-pub use server::{SocketGuard, run_server};
+pub use protocol::{DaemonRequest, DaemonResponse, DaemonStatusInfo, read_message, write_message};
+pub use server::{ServerOptions, SocketGuard, run_server, run_server_with_options};
 pub use watcher::start_watcher;
 
 use std::path::Path;
@@ -44,6 +44,7 @@ pub async fn send_daemon_request(
 mod tests {
     use super::*;
     use canon_slice::SymbolIndex;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::sync::RwLock;
@@ -78,6 +79,49 @@ mod tests {
             .unwrap();
         assert!(matches!(shutdown_resp, DaemonResponse::ShutdownAck));
 
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_status() {
+        let tmp = NamedTempFile::new().unwrap();
+        let socket_path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut idx = SymbolIndex::new();
+        idx.index_any_source_str("src/main.rs", "pub fn main() {}")
+            .unwrap();
+        let index = Arc::new(RwLock::new(idx));
+        let token = CancellationToken::new();
+
+        let s_path = socket_path.clone();
+        let s_token = token.clone();
+        let server_handle = tokio::spawn(async move {
+            let opts = ServerOptions {
+                socket_path: s_path,
+                workspace_root: PathBuf::from("/test/root"),
+                watcher_active: true,
+            };
+            let _ = run_server_with_options(opts, index, s_token).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let response = send_daemon_request(&socket_path, DaemonRequest::Status)
+            .await
+            .unwrap();
+        match response {
+            DaemonResponse::Status(status) => {
+                assert_eq!(status.pid, std::process::id());
+                assert_eq!(status.workspace_root, PathBuf::from("/test/root"));
+                assert_eq!(status.indexed_files, 1);
+                assert!(status.total_symbols >= 1);
+                assert!(status.watcher_active);
+            }
+            _ => panic!("Expected DaemonResponse::Status"),
+        }
+
+        let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
         let _ = server_handle.await;
     }
 

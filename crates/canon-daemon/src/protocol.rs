@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub enum DaemonRequest {
     /// Heartbeat ping.
     Ping,
+    /// Request runtime statistics and cache metrics.
+    Status,
     /// Advisory post-read tool hook request.
     PostReadHook {
         /// Target file path inspected.
@@ -30,11 +32,38 @@ pub enum DaemonRequest {
     Shutdown,
 }
 
+/// Detailed runtime statistics and index telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonStatusInfo {
+    /// Process ID of the running daemon.
+    pub pid: u32,
+    /// Daemon process uptime in seconds.
+    pub uptime_secs: u64,
+    /// Bound socket path.
+    pub socket_path: PathBuf,
+    /// Monitored workspace root directory.
+    pub workspace_root: PathBuf,
+    /// Number of distinct source files currently indexed in memory.
+    pub indexed_files: usize,
+    /// Total number of symbols declared in index.
+    pub total_symbols: usize,
+    /// Total number of call-graph edges indexed.
+    pub total_call_edges: usize,
+    /// Total number of trait/interface contract implementations recorded.
+    pub total_contracts: usize,
+    /// Total number of HTTP routes and client bindings recorded.
+    pub total_routes: usize,
+    /// Indicates whether the background file watcher is active.
+    pub watcher_active: bool,
+}
+
 /// IPC response sent from daemon back to agent tool or CLI client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonResponse {
     /// Heartbeat response.
     Pong,
+    /// Status telemetry response.
+    Status(DaemonStatusInfo),
     /// Advisory context block returned out-of-band for post-read hooks.
     AdvisoryContext {
         /// Target file.
@@ -99,4 +128,49 @@ where
 
     let msg = serde_json::from_slice(&buf).map_err(|e| DaemonError::Protocol(e.to_string()))?;
     Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_protocol_status_request_framing() {
+        let mut buf = Vec::new();
+        let req = DaemonRequest::Status;
+        write_message(&mut buf, &req).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: DaemonRequest = read_message(&mut cursor).await.unwrap();
+        assert!(matches!(decoded, DaemonRequest::Status));
+    }
+
+    #[tokio::test]
+    async fn test_protocol_status_response_framing() {
+        let mut buf = Vec::new();
+        let status = DaemonStatusInfo {
+            pid: 12345,
+            uptime_secs: 42,
+            socket_path: PathBuf::from("/tmp/canon-test.sock"),
+            workspace_root: PathBuf::from("/home/user/project"),
+            indexed_files: 10,
+            total_symbols: 100,
+            total_call_edges: 50,
+            total_contracts: 5,
+            total_routes: 2,
+            watcher_active: true,
+        };
+        let resp = DaemonResponse::Status(status.clone());
+        write_message(&mut buf, &resp).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: DaemonResponse = read_message(&mut cursor).await.unwrap();
+        match decoded {
+            DaemonResponse::Status(decoded_status) => {
+                assert_eq!(decoded_status, status);
+            }
+            _ => panic!("Expected DaemonResponse::Status"),
+        }
+    }
 }

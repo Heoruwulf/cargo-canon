@@ -15,6 +15,7 @@ pub fn start_watcher(
     token: CancellationToken,
 ) -> Result<(), DaemonError> {
     let canonical_root = std::fs::canonicalize(&watch_dir).unwrap_or(watch_dir);
+    tracing::info!(root = %canonical_root.display(), "Incremental file watcher started");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(100);
 
@@ -50,11 +51,15 @@ pub fn start_watcher(
                     break;
                 }
                 Some(path) = rx.recv() => {
+                    tracing::debug!(path = %path.display(), "Source file changed: updating symbol index");
+                    let start = std::time::Instant::now();
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
+                        let canonical_path = std::fs::canonicalize(&path).unwrap_or(path.clone());
                         let path_str = canonical_path.to_string_lossy().to_string();
                         let mut guard = index.write().await;
                         let _ = guard.index_any_source_str(&path_str, &content);
+                        let elapsed_ms = start.elapsed().as_millis();
+                        tracing::debug!(path = %path.display(), elapsed_ms, "Symbol index updated");
                     }
                 }
             }

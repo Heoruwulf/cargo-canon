@@ -11,8 +11,8 @@ use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
 use canon_core::workspace::{resolve_active_socket, resolve_workspace_root};
 use canon_daemon::{
-    DaemonRequest, DaemonResponse, execute_post_read_hook, run_server, send_daemon_request,
-    start_watcher,
+    DaemonRequest, DaemonResponse, DaemonStatusInfo, ServerOptions, execute_post_read_hook,
+    run_server_with_options, send_daemon_request, start_watcher,
 };
 use canon_harness::{
     DiffFuzzOptions, InvariantOptions, SimulateOptions, VerifyOptions, run_diff_fuzz,
@@ -22,25 +22,96 @@ use canon_slice::{SymbolIndex, slice_target};
 use canon_state::{
     FuzzConfig, StateMachine, StateMachineError, TransitionMatrix, fuzz_transitions,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+fn clap_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Green.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
 /// AI Ground-Truth & Context Slicing Engine
 #[derive(Parser, Debug)]
-#[command(name = "cargo-canon", bin_name = "cargo-canon", version, about)]
+#[command(
+    name = "cargo-canon",
+    bin_name = "cargo-canon",
+    version = env!("CANON_VERSION_STRING"),
+    about = "AI Ground-Truth Verification & Compiler-Aware Context Slicing Engine",
+    long_about = r#"AI Ground-Truth Verification & Compiler-Aware Context Slicing Engine
+
+Transforms AI coding agents into reliable closed-loop engineers across large-scale
+Rust, TypeScript, and Go codebases (>1.2M LOC) through deterministic simulation,
+differential fuzzing, bounded model checking, and out-of-band AST slicing.
+
+CORE SUBCOMMANDS & CAPABILITIES:
+  slice          Context Slicing Engine
+                 Sub-millisecond AST skeleton stripping, caller/callee graphs,
+                 implicit interface satisfaction, and cross-boundary correlation.
+  simulate       Deterministic Simulation Testing (DST)
+                 Seeded discrete-event simulator with fault injection, 100% replay,
+                 and Tier 1 Go concurrency & leak sweeps (TSan + goleak).
+  diff-fuzz      Differential Fuzzing Oracle
+                 Dual-implementation fuzzing and cross-boundary Serde <-> TS <-> Go
+                 contract fuzzing with automated #[test] reproducer export.
+  verify         Formal Verification & Model Checking
+                 Bounded panic-freedom and invariant adherence proofs via Kani.
+  invariants     Metamorphic & Invariant Synthesis
+                 Algebraic property suites (proptest, fast-check, rapid).
+  state-machine  Sans-I/O Pure State Machine Engine
+                 >10,000,000 transitions/sec fuzzer and transition reachability matrix.
+  daemon         Agent Sidecar & Hook Daemon
+                 Persistent background symbol indexing, operational probing (--ping,
+                 --status, --stop), and non-destructive advisory post-read hooks.
+
+QUICK START EXAMPLES:
+  # Extract stripped AST skeleton for prompt injection
+  cargo canon slice src/engine.rs
+
+  # Correlate backend route/model changes with frontend TypeScript fetch calls
+  cargo canon slice src/routes/users.rs --cross-boundary
+
+  # Run 5,000 deterministic simulation passes
+  cargo canon simulate --seeds 5000
+
+  # Replay a specific failing seed deterministically
+  cargo canon simulate --seed 0xDEADBEEF
+
+  # Cross-boundary Serde vs TypeScript contract differential fuzzing
+  cargo canon diff-fuzz --cross-boundary --rust-model UpdatePayload --ts-type UpdatePayload
+
+  # Run Tier 1 Go concurrency & goroutine leak sweep
+  cargo canon simulate --lang go --seeds 100
+
+  # Probe daemon liveness and round-trip latency
+  cargo canon daemon --ping
+
+  # Query running daemon health, symbol count, and watcher metrics
+  cargo canon daemon --status
+
+  # Gracefully stop the background daemon
+  cargo canon daemon --stop
+
+  # Execute non-destructive advisory post-read hook
+  cargo canon daemon --hook-post-read --file src/engine.rs"#,
+    styles = clap_styles()
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
     /// Verbosity level (-v, -vv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
     /// Output JSON formatted logs
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
@@ -74,165 +145,199 @@ pub struct SliceArgs {
     pub target: PathBuf,
 
     /// Slicing extraction mode
-    #[arg(short, long, default_value = "skeleton")]
+    #[arg(
+        short,
+        long,
+        default_value = "skeleton",
+        help_heading = "Slicing Options"
+    )]
     pub mode: SliceMode,
 
     /// Output format
-    #[arg(short, long, default_value = "markdown")]
+    #[arg(
+        short,
+        long,
+        default_value = "markdown",
+        help_heading = "Slicing Options"
+    )]
     pub format: OutputFormat,
 
     /// Call hierarchy search depth
-    #[arg(short, long, default_value_t = 2)]
+    #[arg(short, long, default_value_t = 2, help_heading = "Slicing Options")]
     pub depth: usize,
 
-    /// Query cross-boundary impact between Rust backend and TypeScript frontend
-    #[arg(long)]
+    /// Query cross-boundary impact between Rust/Go backend and TypeScript frontend
+    #[arg(long, help_heading = "Cross-Boundary Analysis")]
     pub cross_boundary: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct SimulateArgs {
     /// Number of random simulation passes
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, default_value_t = 5000, help_heading = "Simulation Options")]
     pub seeds: u64,
 
     /// Replay single specific seed (hex, e.g. 0xDEADBEEF)
-    #[arg(long, value_parser = parse_hex_seed)]
+    #[arg(long, value_parser = parse_hex_seed, help_heading = "Deterministic Replay")]
     pub seed: Option<u64>,
 
     /// Maximum simulated ticks before detecting deadlock
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 10_000, help_heading = "Fault & Bounds")]
     pub max_ticks: u64,
 
     /// Simulated network packet drop rate
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, default_value_t = 0.05, help_heading = "Fault & Bounds")]
     pub fault_rate: f64,
 
     /// Emit actionable agent repair prompt on failure
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, help_heading = "Reporting")]
     pub ai_prompt_on_fail: bool,
 
     /// Target language for simulation runner ("rust" or "go")
-    #[arg(long, default_value = "rust")]
+    #[arg(long, default_value = "rust", help_heading = "Simulation Options")]
     pub lang: String,
 }
 
 #[derive(Args, Debug)]
 pub struct DiffFuzzArgs {
     /// Target interface trait name
-    #[arg(long, default_value = "KvStore")]
+    #[arg(
+        long,
+        default_value = "KvStore",
+        help_heading = "Shadow Trait Configuration"
+    )]
     pub target_trait: String,
 
     /// Name of legacy reference implementation
-    #[arg(long, default_value = "LegacyMap")]
+    #[arg(
+        long,
+        default_value = "LegacyMap",
+        help_heading = "Shadow Trait Configuration"
+    )]
     pub legacy: String,
 
     /// Name of candidate implementation
-    #[arg(long, default_value = "CandidateMap")]
+    #[arg(
+        long,
+        default_value = "CandidateMap",
+        help_heading = "Shadow Trait Configuration"
+    )]
     pub candidate: String,
 
     /// Number of fuzzing cycles to execute
-    #[arg(long, default_value_t = 50_000)]
+    #[arg(long, default_value_t = 50_000, help_heading = "Fuzzing Bounds")]
     pub iterations: u64,
 
     /// Emit standalone Rust #[test] reproducer on discrepancy
-    #[arg(long)]
+    #[arg(long, help_heading = "Reporting")]
     pub export_repro: Option<PathBuf>,
 
     /// Whether to differentially fuzz cross-boundary Serde models against TypeScript contracts
-    #[arg(long)]
+    #[arg(long, help_heading = "Cross-Boundary Contracts")]
     pub cross_boundary: bool,
 
     /// Target Rust model struct name
-    #[arg(long)]
+    #[arg(long, help_heading = "Cross-Boundary Contracts")]
     pub rust_model: Option<String>,
 
     /// Target TypeScript interface or Zod validator name
-    #[arg(long)]
+    #[arg(long, help_heading = "Cross-Boundary Contracts")]
     pub ts_type: Option<String>,
 
     /// Target Go model struct name
-    #[arg(long)]
+    #[arg(long, help_heading = "Cross-Boundary Contracts")]
     pub go_model: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct VerifyArgs {
     /// Filter for specific #[kani::proof] harnesses
-    #[arg(long)]
+    #[arg(long, help_heading = "Verification Options")]
     pub harness: Option<String>,
 
     /// Unwind depth limit
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 4, help_heading = "Verification Options")]
     pub unwind: usize,
 
     /// Parse counterexample outputs into formatted struct initializers
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, help_heading = "Reporting")]
     pub extract_counterexample: bool,
 
     /// Generate starter #[kani::proof] stub for target symbol
-    #[arg(long)]
+    #[arg(long, help_heading = "Scaffolding")]
     pub scaffold: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct InvariantArgs {
     /// Execute metamorphic invariant test suite
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, help_heading = "Execution")]
     pub run: bool,
 
     /// Generate metamorphic property test suite template for symbol
-    #[arg(long)]
+    #[arg(long, help_heading = "Scaffolding")]
     pub scaffold: Option<String>,
 
     /// Target language for metamorphic test suite scaffolding ("rust", "typescript", or "go")
-    #[arg(long, default_value = "rust")]
+    #[arg(long, default_value = "rust", help_heading = "Scaffolding")]
     pub lang: String,
 }
 
 #[derive(Args, Debug)]
 pub struct StateMachineArgs {
     /// Run high-throughput transition fuzzer (>1,000,000 ops/sec)
-    #[arg(long)]
+    #[arg(long, help_heading = "Fuzzing")]
     pub fuzz_transitions: bool,
 
     /// Path to pure TypeScript reducer to fuzz (>1,000,000 transitions/sec)
-    #[arg(long)]
+    #[arg(long, help_heading = "Polyglot Targets")]
     pub ts_reducer: Option<PathBuf>,
 
     /// Path to pure Go state machine / reducer to fuzz (>1,000,000 transitions/sec)
-    #[arg(long)]
+    #[arg(long, help_heading = "Polyglot Targets")]
     pub go_state_machine: Option<PathBuf>,
 
     /// Target language ("rust", "typescript", or "go")
-    #[arg(long)]
+    #[arg(long, help_heading = "Polyglot Targets")]
     pub lang: Option<String>,
 
     /// Dump reachable state transition matrix and dead state report
-    #[arg(long)]
+    #[arg(long, help_heading = "Analysis")]
     pub matrix: bool,
 
     /// Number of transitions to execute in fuzzer
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(long, default_value_t = 100_000, help_heading = "Fuzzing")]
     pub transitions: usize,
 }
 
 #[derive(Args, Debug)]
 pub struct DaemonArgs {
-    /// Start daemon IPC server
-    #[arg(long)]
+    /// Start daemon IPC server in foreground
+    #[arg(long, help_heading = "Daemon Lifecycle")]
     pub start: bool,
 
+    /// Probe running daemon liveness and report round-trip latency
+    #[arg(long, help_heading = "Daemon Lifecycle")]
+    pub ping: bool,
+
+    /// Query running daemon status, index metrics, and cache statistics
+    #[arg(long, help_heading = "Daemon Lifecycle")]
+    pub status: bool,
+
+    /// Gracefully stop the running background daemon
+    #[arg(long, help_heading = "Daemon Lifecycle")]
+    pub stop: bool,
+
     /// Execute advisory post-read tool hook
-    #[arg(long)]
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
     pub hook_post_read: bool,
 
     /// Target file for hook execution
-    #[arg(long)]
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
     pub file: Option<PathBuf>,
 
     /// Socket path override
-    #[arg(long)]
+    #[arg(long, help_heading = "Configuration")]
     pub socket: Option<String>,
 }
 
@@ -263,12 +368,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Verify(args)) => handle_verify(args).await?,
         Some(Commands::Invariants(args)) => handle_invariants(args).await?,
         Some(Commands::StateMachine(args)) => handle_state_machine(args).await?,
-        Some(Commands::Daemon(args)) => handle_daemon(args, &cfg).await?,
+        Some(Commands::Daemon(args)) => handle_daemon(args, &cfg, cli.json).await?,
         None => {
-            info_banner(
-                "Canon",
-                "AI Ground-Truth & Context Slicing Engine. Run with --help for subcommands.",
-            );
+            Cli::command().print_help()?;
+            println!();
         }
     }
 
@@ -693,51 +796,268 @@ fn handle_rust_state_machine(transitions: usize) -> Result<(), Box<dyn std::erro
 async fn handle_daemon(
     args: DaemonArgs,
     cfg: &CanonConfig,
+    json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_dir = std::env::current_dir()?;
     let socket_override = args.socket.as_deref().or(cfg.daemon.socket_path.as_deref());
 
+    if args.ping {
+        let root = resolve_workspace_root(&current_dir);
+        let socket_path = resolve_active_socket(socket_override, &root);
+        return handle_daemon_ping(&socket_path).await;
+    }
+
+    if args.status {
+        let root = resolve_workspace_root(&current_dir);
+        let socket_path = resolve_active_socket(socket_override, &root);
+        return handle_daemon_status(&socket_path, json_output).await;
+    }
+
+    if args.stop {
+        let root = resolve_workspace_root(&current_dir);
+        let socket_path = resolve_active_socket(socket_override, &root);
+        return handle_daemon_stop(&socket_path).await;
+    }
+
     if args.hook_post_read {
-        let Some(file) = args.file else {
-            error("Daemon", "--file is required when running post-read hook");
-            return Ok(());
-        };
-
-        let file_root = file.parent().unwrap_or(&current_dir);
-        let hook_socket = resolve_active_socket(socket_override, file_root);
-
-        let mut advisory: Option<String> = None;
-        if hook_socket.exists() {
-            if let Ok(resp) = send_daemon_request(
-                &hook_socket,
-                DaemonRequest::PostReadHook { file: file.clone() },
-            )
-            .await
-            {
-                match resp {
-                    DaemonResponse::AdvisoryContext { advisory_block, .. } => {
-                        advisory = Some(advisory_block);
-                    }
-                    DaemonResponse::Error { message } => {
-                        tracing::warn!("Daemon hook returned error: {}", message);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let output = match advisory {
-            Some(adv) => adv,
-            None => execute_post_read_hook(&file, None)?,
-        };
-
-        println!("{}", output);
-        return Ok(());
+        return handle_daemon_hook_post_read(args.file, socket_override, &current_dir).await;
     }
 
     let root = resolve_workspace_root(&current_dir);
     let socket_path = resolve_active_socket(socket_override, &root);
+    handle_daemon_start(&socket_path, &root, cfg).await
+}
 
+async fn handle_daemon_ping(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    match send_daemon_request(socket_path, DaemonRequest::Ping).await {
+        Ok(DaemonResponse::Pong) => {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "[Daemon] Daemon is responsive on '{}' (round-trip: {:.2}ms)",
+                socket_path.display(),
+                latency_ms
+            );
+            Ok(())
+        }
+        Ok(resp) => {
+            error(
+                "Daemon",
+                &format!("Unexpected response to ping: {:?}", resp),
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            error(
+                "Daemon",
+                &format!(
+                    "Failed connecting to daemon on '{}': {}",
+                    socket_path.display(),
+                    e
+                ),
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_daemon_status(
+    socket_path: &Path,
+    json_output: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match send_daemon_request(socket_path, DaemonRequest::Status).await {
+        Ok(DaemonResponse::Status(status)) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_daemon_status_table(&status);
+            }
+            Ok(())
+        }
+        Ok(resp) => {
+            error(
+                "Daemon",
+                &format!("Unexpected response to status: {:?}", resp),
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            error(
+                "Daemon",
+                &format!(
+                    "Failed connecting to daemon on '{}': {}",
+                    socket_path.display(),
+                    e
+                ),
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn format_with_commas(n: usize) -> String {
+    let s = n.to_string();
+    let first_len = s.len() % 3;
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    if first_len > 0 {
+        result.push_str(&s[..first_len]);
+    }
+    for (i, chunk) in s.as_bytes()[first_len..].chunks(3).enumerate() {
+        if first_len > 0 || i > 0 {
+            result.push(',');
+        }
+        result.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+    }
+    result
+}
+
+fn format_uptime(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{}h {}m {}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m {}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+fn print_daemon_status_table(status: &DaemonStatusInfo) {
+    println!("Canon Daemon Status: Active");
+    println!("PID:            {}", status.pid);
+    println!("Uptime:         {}", format_uptime(status.uptime_secs));
+    println!("Socket Path:    {}", status.socket_path.display());
+    println!("Workspace Root: {}", status.workspace_root.display());
+    println!(
+        "Indexed Files:  {} files",
+        format_with_commas(status.indexed_files)
+    );
+    println!(
+        "Total Symbols:  {} declarations",
+        format_with_commas(status.total_symbols)
+    );
+    println!(
+        "Call Edges:     {} edges",
+        format_with_commas(status.total_call_edges)
+    );
+    println!(
+        "Contracts:      {} trait implementations",
+        format_with_commas(status.total_contracts)
+    );
+    println!(
+        "Routes:         {} API endpoints",
+        format_with_commas(status.total_routes)
+    );
+    let watcher_str = if status.watcher_active {
+        "Active (.rs, .ts, .tsx, .js, .jsx, .go)"
+    } else {
+        "Inactive"
+    };
+    println!("File Watcher:   {}", watcher_str);
+}
+
+async fn handle_daemon_stop(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match send_daemon_request(socket_path, DaemonRequest::Shutdown).await {
+        Ok(DaemonResponse::ShutdownAck) => {
+            let start = std::time::Instant::now();
+            while socket_path.exists() && start.elapsed() < std::time::Duration::from_millis(500) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            println!(
+                "[Daemon] Daemon on '{}' successfully terminated.",
+                socket_path.display()
+            );
+            Ok(())
+        }
+        Ok(resp) => {
+            error(
+                "Daemon",
+                &format!("Unexpected response to shutdown: {:?}", resp),
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            error(
+                "Daemon",
+                &format!(
+                    "Failed connecting to daemon on '{}': {}",
+                    socket_path.display(),
+                    e
+                ),
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_daemon_hook_post_read(
+    file: Option<PathBuf>,
+    socket_override: Option<&str>,
+    current_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(file) = file else {
+        error("Daemon", "--file is required when running post-read hook");
+        return Ok(());
+    };
+
+    let file_root = file.parent().unwrap_or(current_dir);
+    let hook_socket = resolve_active_socket(socket_override, file_root);
+
+    let mut advisory: Option<String> = None;
+    let mut provenance: Option<String> = None;
+    let start_time = std::time::Instant::now();
+
+    if hook_socket.exists() {
+        if let Ok(resp) = send_daemon_request(
+            &hook_socket,
+            DaemonRequest::PostReadHook { file: file.clone() },
+        )
+        .await
+        {
+            let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+            match resp {
+                DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                    advisory = Some(advisory_block);
+                    provenance = Some(format!(
+                        "<!-- canon-context-provenance: daemon (socket: {}, latency: {:.1}ms) -->",
+                        hook_socket.display(),
+                        latency_ms
+                    ));
+                }
+                DaemonResponse::Error { message } => {
+                    tracing::warn!("Daemon hook returned error: {}", message);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let (output, prov) = match advisory {
+        Some(adv) => (adv, provenance.unwrap_or_default()),
+        None => {
+            tracing::warn!("Daemon offline or unreachable, falling back to in-process slicing");
+            let fallback_prov =
+                "<!-- canon-context-provenance: in-process-fallback (daemon unreachable) -->"
+                    .to_string();
+            let adv = execute_post_read_hook(&file, None)?;
+            (adv, fallback_prov)
+        }
+    };
+
+    if !prov.is_empty() {
+        println!("{}", prov);
+    }
+    println!("{}", output);
+    Ok(())
+}
+
+async fn handle_daemon_start(
+    socket_path: &Path,
+    root: &Path,
+    cfg: &CanonConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     info_banner(
         "Daemon",
         &format!(
@@ -746,12 +1066,13 @@ async fn handle_daemon(
         ),
     );
     let mut initial_index = SymbolIndex::new();
-    let _ = initial_index.index_directory(&root);
+    let _ = initial_index.index_directory(root);
     let index = Arc::new(RwLock::new(initial_index));
     let token = CancellationToken::new();
 
-    if cfg.daemon.enable_file_watcher {
-        let _ = start_watcher(root.clone(), Arc::clone(&index), token.clone());
+    let watcher_active = cfg.daemon.enable_file_watcher;
+    if watcher_active {
+        let _ = start_watcher(root.to_path_buf(), Arc::clone(&index), token.clone());
     }
 
     let tok_ctrl_c = token.clone();
@@ -764,7 +1085,12 @@ async fn handle_daemon(
         tok_ctrl_c.cancel();
     });
 
-    run_server(&socket_path, index, token).await?;
+    let opts = ServerOptions {
+        socket_path: socket_path.to_path_buf(),
+        workspace_root: root.to_path_buf(),
+        watcher_active,
+    };
+    run_server_with_options(opts, index, token).await?;
     success("Daemon", "Daemon exited cleanly.");
     Ok(())
 }
