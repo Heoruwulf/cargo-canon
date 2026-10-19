@@ -73,6 +73,9 @@ pub struct SliceConfig {
     /// Whether to include private/internal types in context exports.
     #[serde(default = "default_true")]
     pub include_private_types: bool,
+    /// Custom directory names to ignore during file discovery.
+    #[serde(default)]
+    pub custom_ignored_dirs: Vec<String>,
 }
 
 fn default_max_call_depth() -> usize {
@@ -89,6 +92,7 @@ impl Default for SliceConfig {
             max_call_depth: default_max_call_depth(),
             strip_comments: false,
             include_private_types: true,
+            custom_ignored_dirs: Vec::new(),
         }
     }
 }

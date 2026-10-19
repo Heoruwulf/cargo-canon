@@ -2,6 +2,7 @@
 
 use crate::error::SliceError;
 use quote::ToTokens;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -147,33 +148,126 @@ impl SymbolIndex {
         }
     }
 
-    /// Indexes all source files (.rs, .ts, .tsx, .js, .jsx) located under root path.
-    pub fn index_directory(&mut self, root: &Path) -> Result<usize, SliceError> {
-        let mut indexed_count = 0;
-        for entry in WalkDir::new(root)
+    /// Merges another SymbolIndex into this one in-place.
+    pub fn merge(&mut self, other: SymbolIndex) {
+        for (k, v) in other.callers_map {
+            self.callers_map.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.callees_map {
+            self.callees_map.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.contracts_map {
+            self.contracts_map.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.symbols_map {
+            self.symbols_map.entry(k).or_default().extend(v);
+        }
+        self.routes.extend(other.routes);
+    }
+
+    /// Discovers candidate source files filtering ignored directories.
+    pub fn collect_source_files(&self, root: &Path) -> Vec<PathBuf> {
+        WalkDir::new(root)
             .into_iter()
-            .filter_entry(|e| !is_ignored(e.path()))
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if entry.file_type().is_file() {
-                let ext = entry
-                    .path()
+            .filter_entry(|e| !is_ignored_path(e.path()))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                e.path()
                     .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "go") {
-                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        let path_str = entry.path().to_string_lossy().to_string();
-                        let _ = self.index_any_source_str(&path_str, &content);
-                        indexed_count += 1;
-                    }
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "go"))
+            })
+            .map(|e| e.into_path())
+            .collect()
+    }
+
+    /// Discovers and indexes all valid source files (.rs, .ts, .tsx, .js, .jsx, .go)
+    /// under root in parallel using Rayon worker threads.
+    pub fn index_directory(&mut self, root: &Path) -> Result<usize, SliceError> {
+        let start = std::time::Instant::now();
+        let files = self.collect_source_files(root);
+        let discovery_ms = start.elapsed().as_millis();
+        let total_files = files.len();
+        if total_files == 0 {
+            tracing::info!(root = %root.display(), "No source files discovered for indexing");
+            return Ok(0);
+        }
+
+        tracing::info!(
+            root = %root.display(),
+            files = total_files,
+            discovery_ms,
+            "Discovered candidate source files; starting parallel AST indexing"
+        );
+
+        let parse_start = std::time::Instant::now();
+        let partial_index = files
+            .par_iter()
+            .fold(SymbolIndex::new, |mut acc, path| {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    let path_str = path.to_string_lossy().to_string();
+                    let _ = acc.index_any_source_str(&path_str, &content);
                 }
+                acc
+            })
+            .reduce(SymbolIndex::new, |mut a, b| {
+                a.merge(b);
+                a
+            });
+        let parse_ms = parse_start.elapsed().as_millis();
+
+        let merge_start = std::time::Instant::now();
+        self.merge(partial_index);
+        let merge_ms = merge_start.elapsed().as_millis();
+
+        let total_elapsed = start.elapsed();
+        let total_ms = total_elapsed.as_millis();
+        let throughput = if total_elapsed.as_secs_f64() > 0.0 {
+            (total_files as f64) / total_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let metrics = self.metrics();
+        tracing::info!(
+            root = %root.display(),
+            files = total_files,
+            symbols = metrics.total_symbols_count,
+            edges = metrics.total_call_edges_count,
+            contracts = metrics.total_contracts_count,
+            routes = metrics.total_routes_count,
+            discovery_ms,
+            parse_ms,
+            merge_ms,
+            total_ms,
+            throughput_fps = format!("{:.0}", throughput),
+            "Initial indexing complete"
+        );
+        Ok(total_files)
+    }
+
+    /// Sequential fallback for single-threaded or deterministic testing.
+    pub fn index_directory_sequential(&mut self, root: &Path) -> Result<usize, SliceError> {
+        let start = std::time::Instant::now();
+        let files = self.collect_source_files(root);
+        let total_files = files.len();
+        for path in &files {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let path_str = path.to_string_lossy().to_string();
+                let _ = self.index_any_source_str(&path_str, &content);
             }
         }
-        Ok(indexed_count)
+        let total_elapsed = start.elapsed();
+        let metrics = self.metrics();
+        tracing::info!(
+            root = %root.display(),
+            files = total_files,
+            symbols = metrics.total_symbols_count,
+            total_ms = total_elapsed.as_millis(),
+            "Sequential indexing complete"
+        );
+        Ok(total_files)
     }
 
     /// Indexes source from any supported language (Rust, TypeScript, TSX, JS, Go).
@@ -621,9 +715,38 @@ impl SymbolIndex {
     }
 }
 
-fn is_ignored(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    s.contains("/target/") || s.contains("/.git/")
+/// Returns true if any path segment corresponds to a known dependency,
+/// build artifact, VCS metadata, or cache directory.
+pub fn is_ignored_path(path: &Path) -> bool {
+    for component in path.components() {
+        if let std::path::Component::Normal(c) = component {
+            if let Some(s) = c.to_str() {
+                if matches!(
+                    s,
+                    "target"
+                        | ".git"
+                        | "node_modules"
+                        | "vendor"
+                        | "dist"
+                        | "build"
+                        | "out"
+                        | ".next"
+                        | ".nuxt"
+                        | ".turbo"
+                        | ".yarn"
+                        | ".pnpm-store"
+                        | ".output"
+                        | ".svelte-kit"
+                        | "coverage"
+                        | ".idea"
+                        | ".vscode"
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn find_line(content: &str, pattern: &str) -> usize {
@@ -971,5 +1094,156 @@ mod tests {
         assert!(m.total_symbols_count >= 3);
         assert!(m.total_contracts_count >= 1);
         assert!(m.total_call_edges_count >= 1);
+    }
+
+    #[test]
+    fn test_is_ignored_path() {
+        // Ignored relative paths
+        assert!(is_ignored_path(Path::new("target/debug/foo.rs")));
+        assert!(is_ignored_path(Path::new("node_modules/pkg/index.js")));
+        assert!(is_ignored_path(Path::new(".git/HEAD")));
+        assert!(is_ignored_path(Path::new("vendor/pkg/foo.go")));
+        assert!(is_ignored_path(Path::new("dist/bundle.js")));
+        assert!(is_ignored_path(Path::new("build/output.js")));
+        assert!(is_ignored_path(Path::new("out/main.js")));
+        assert!(is_ignored_path(Path::new(".next/server.js")));
+        assert!(is_ignored_path(Path::new(".nuxt/index.js")));
+        assert!(is_ignored_path(Path::new(".turbo/cache.bin")));
+        assert!(is_ignored_path(Path::new(".yarn/releases.cjs")));
+        assert!(is_ignored_path(Path::new(".pnpm-store/v3.bin")));
+        assert!(is_ignored_path(Path::new(".output/server/index.mjs")));
+        assert!(is_ignored_path(Path::new(".svelte-kit/generated.js")));
+        assert!(is_ignored_path(Path::new("coverage/lcov.info")));
+        assert!(is_ignored_path(Path::new(".idea/workspace.xml")));
+        assert!(is_ignored_path(Path::new(".vscode/settings.json")));
+
+        // Ignored nested subdirectories and absolute paths
+        assert!(is_ignored_path(Path::new(
+            "/home/user/project/node_modules/foo/index.ts"
+        )));
+        assert!(is_ignored_path(Path::new(
+            "/home/user/project/target/release/lib.rs"
+        )));
+        assert!(is_ignored_path(Path::new("frontend/nested/vendor/dep.go")));
+
+        // Valid paths that should NOT be ignored
+        assert!(!is_ignored_path(Path::new("src/main.rs")));
+        assert!(!is_ignored_path(Path::new(
+            "crates/canon-slice/src/indexer.rs"
+        )));
+        assert!(!is_ignored_path(Path::new(
+            "/var/workspace/app/target_metrics.rs"
+        )));
+        assert!(!is_ignored_path(Path::new("src/validate_target.ts")));
+        assert!(!is_ignored_path(Path::new("src/build_helper.rs")));
+    }
+
+    #[test]
+    fn test_symbol_index_merge() {
+        let mut idx1 = SymbolIndex::new();
+        idx1.index_source_str(
+            "src/a.rs",
+            "pub fn alpha() { beta(); }\npub fn beta() {}\npub struct StructA;",
+        )
+        .unwrap();
+
+        let mut idx2 = SymbolIndex::new();
+        idx2.index_source_str(
+            "src/b.rs",
+            "pub fn gamma() { delta(); }\npub fn delta() {}\npub struct StructB;",
+        )
+        .unwrap();
+
+        let mut merged = idx1.clone();
+        merged.merge(idx2.clone());
+
+        let m1 = idx1.metrics();
+        let m2 = idx2.metrics();
+        let mm = merged.metrics();
+
+        assert_eq!(
+            mm.distinct_files_count,
+            m1.distinct_files_count + m2.distinct_files_count
+        );
+        assert_eq!(
+            mm.total_symbols_count,
+            m1.total_symbols_count + m2.total_symbols_count
+        );
+        assert_eq!(
+            mm.total_call_edges_count,
+            m1.total_call_edges_count + m2.total_call_edges_count
+        );
+        assert!(merged.symbols_map.contains_key("StructA"));
+        assert!(merged.symbols_map.contains_key("StructB"));
+        assert!(!merged.get_callers("beta", 1).is_empty());
+        assert!(!merged.get_callers("delta", 1).is_empty());
+    }
+
+    #[test]
+    fn test_parallel_indexing_equivalence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("lib.rs"),
+            "pub fn compute() { helper(); }\npub fn helper() {}\npub struct Engine;",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("client.ts"),
+            "export interface User { id: string; }\nexport function getUser() { return fetch(\"/api/user\"); }",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("service.go"),
+            "package service\ntype Handler struct {}\nfunc (h Handler) Serve() {}",
+        )
+        .unwrap();
+
+        let nm_dir = root.join("node_modules").join("dummy");
+        std::fs::create_dir_all(&nm_dir).unwrap();
+        std::fs::write(nm_dir.join("index.js"), "module.exports = {};").unwrap();
+
+        let target_dir = root.join("target").join("debug");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("gen.rs"), "pub fn generated() {}").unwrap();
+
+        let mut seq_idx = SymbolIndex::new();
+        let seq_count = seq_idx.index_directory_sequential(root).unwrap();
+
+        let mut par_idx = SymbolIndex::new();
+        let par_count = par_idx.index_directory(root).unwrap();
+
+        assert_eq!(seq_count, 3);
+        assert_eq!(par_count, 3);
+
+        let seq_metrics = seq_idx.metrics();
+        let par_metrics = par_idx.metrics();
+
+        assert_eq!(
+            seq_metrics.distinct_files_count,
+            par_metrics.distinct_files_count
+        );
+        assert_eq!(
+            seq_metrics.total_symbols_count,
+            par_metrics.total_symbols_count
+        );
+        assert_eq!(
+            seq_metrics.total_call_edges_count,
+            par_metrics.total_call_edges_count
+        );
+        assert_eq!(
+            seq_metrics.total_contracts_count,
+            par_metrics.total_contracts_count
+        );
+        assert_eq!(
+            seq_metrics.total_routes_count,
+            par_metrics.total_routes_count
+        );
+
+        assert!(!par_idx.symbols_map.contains_key("generated"));
+        assert!(!seq_idx.symbols_map.contains_key("generated"));
     }
 }

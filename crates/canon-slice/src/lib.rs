@@ -21,7 +21,7 @@ pub use go_skeleton::{
 };
 pub use indexer::{
     CallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, SymbolDef, SymbolIndex,
-    SymbolIndexMetrics,
+    SymbolIndexMetrics, is_ignored_path,
 };
 pub use skeleton::{SkeletonStripper, extract_file_skeleton, extract_skeleton, strip_file_ast};
 pub use ts_skeleton::{extract_ts_file_skeleton, extract_ts_skeleton};

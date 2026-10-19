@@ -1101,8 +1101,33 @@ async fn handle_daemon_start(
             socket_path.display()
         ),
     );
+    let index_start = std::time::Instant::now();
+    info_banner(
+        "Index",
+        &format!("Starting initial indexing for '{}'...", root.display()),
+    );
     let mut initial_index = SymbolIndex::new();
-    let _ = initial_index.index_directory(root);
+    let indexed = initial_index.index_directory(root).unwrap_or(0);
+    let elapsed = index_start.elapsed();
+    let metrics = initial_index.metrics();
+    let throughput = if elapsed.as_secs_f64() > 0.0 {
+        (indexed as f64) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    info_banner(
+        "Index",
+        &format!(
+            "Initial indexing complete: {} files ({} symbols, {} call edges, {} contracts, {} routes) in {:.2?} ({:.0} files/sec)",
+            indexed,
+            metrics.total_symbols_count,
+            metrics.total_call_edges_count,
+            metrics.total_contracts_count,
+            metrics.total_routes_count,
+            elapsed,
+            throughput
+        ),
+    );
     let index = Arc::new(RwLock::new(initial_index));
     let token = CancellationToken::new();
 
