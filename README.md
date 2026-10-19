@@ -28,7 +28,7 @@ In large codebases, AI coding assistants suffer from four systemic failure modes
   - Employs an ultra-fast `oxc_parser` pass ([`canon-slice::ts_skeleton`](crates/canon-slice/src/ts_skeleton.rs)) that strips TypeScript and TSX function bodies, React hook internals (`useEffect`, `useState`), and JSX elements down to clean type signatures and exported interface contracts.
   - Employs a zero-copy `tree-sitter-go` pass ([`canon-slice::go_skeleton`](crates/canon-slice/src/go_skeleton.rs)) that strips Go function and method bodies down to type signatures, automatically resolving implicit interface contracts across value $\mathcal{M}(T)$ and pointer $\mathcal{M}(*T)$ receiver method sets.
   - Crawls call hierarchies and discovers all `impl Trait for Target` and Go structural interface contracts across the workspace, and correlates cross-boundary impact between Rust/Go API routes (Gin, Chi, Echo, `net/http`) and TypeScript client fetch calls and interfaces ([`canon-slice::indexer`](crates/canon-slice/src/indexer.rs)).
-  - Achieves **>60%–85% token reduction**, giving the model 100% of the type and contract context with a fraction of the token consumption.
+  - Achieves **>60%–85% token reduction**, giving the model 100% of the type and contract context with a fraction of the token consumption (see [`docs/overview.md`](docs/overview.md) for illustrated code examples, multi-turn budgets, and empirical telemetry).
 
 ### 2. Tool Hook Desynchronization & Broken Patch Tools
 
@@ -440,10 +440,13 @@ Configure an advisory post-read hook:
 }
 ```
 
+For an illustrated architectural overview of how `cargo-canon` eliminates context bloat and token exhaustion with Claude and Antigravity (AGY), see [`docs/overview.md`](docs/overview.md).
+
 For a step-by-step guide on integrating `cargo-canon` with your Rust and TypeScript project to improve Claude, see [`docs/instructions.md`](docs/instructions.md).
 
 Pre-packaged configuration templates and starter kits are provided in the [`configs/`](configs/) folder:
 
+- [`docs/overview.md`](docs/overview.md): Illustrated architectural guide to token savings, AST slicing, and context bloat reduction for Claude and Antigravity.
 - [`docs/instructions.md`](docs/instructions.md): Step-by-step setup guide for your codebase & Claude Code onboarding.
 - [`configs/.canon.toml`](configs/.canon.toml): Full repository configuration template.
 - [`configs/claude-config.json`](configs/claude-config.json): Claude Code hook setup.
