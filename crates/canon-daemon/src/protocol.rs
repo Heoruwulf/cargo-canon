@@ -33,7 +33,7 @@ pub enum DaemonRequest {
 }
 
 /// Detailed runtime statistics and index telemetry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonStatusInfo {
     /// Process ID of the running daemon.
     pub pid: u32,
@@ -55,6 +55,26 @@ pub struct DaemonStatusInfo {
     pub total_routes: usize,
     /// Indicates whether the background file watcher is active.
     pub watcher_active: bool,
+
+    // --- Context Bloat Reduction Telemetry ---
+    /// Total number of advisory tool hook requests served since daemon startup.
+    #[serde(default)]
+    pub hooks_served: u64,
+    /// Total raw source bytes processed prior to slicing.
+    #[serde(default)]
+    pub raw_bytes_served: u64,
+    /// Total advisory context bytes emitted (skeletons + contracts).
+    #[serde(default)]
+    pub delivered_bytes_served: u64,
+    /// Cumulative raw bytes saved (raw - delivered, clamped >= 0).
+    #[serde(default)]
+    pub bytes_saved: u64,
+    /// Overall context reduction percentage across all served requests.
+    #[serde(default)]
+    pub token_reduction_pct: f64,
+    /// Estimated LLM tokens saved across all requests (~4 bytes per token).
+    #[serde(default)]
+    pub est_tokens_saved: u64,
 }
 
 /// IPC response sent from daemon back to agent tool or CLI client.
@@ -160,6 +180,12 @@ mod tests {
             total_contracts: 5,
             total_routes: 2,
             watcher_active: true,
+            hooks_served: 4,
+            raw_bytes_served: 10000,
+            delivered_bytes_served: 2000,
+            bytes_saved: 8000,
+            token_reduction_pct: 80.0,
+            est_tokens_saved: 2000,
         };
         let resp = DaemonResponse::Status(status.clone());
         write_message(&mut buf, &resp).await.unwrap();
@@ -172,5 +198,30 @@ mod tests {
             }
             _ => panic!("Expected DaemonResponse::Status"),
         }
+    }
+
+    #[test]
+    fn test_protocol_status_backward_compatibility() {
+        let legacy_json = r#"{
+            "pid": 12345,
+            "uptime_secs": 42,
+            "socket_path": "/tmp/canon-test.sock",
+            "workspace_root": "/home/user/project",
+            "indexed_files": 10,
+            "total_symbols": 100,
+            "total_call_edges": 50,
+            "total_contracts": 5,
+            "total_routes": 2,
+            "watcher_active": true
+        }"#;
+
+        let decoded: DaemonStatusInfo = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(decoded.pid, 12345);
+        assert_eq!(decoded.hooks_served, 0);
+        assert_eq!(decoded.raw_bytes_served, 0);
+        assert_eq!(decoded.delivered_bytes_served, 0);
+        assert_eq!(decoded.bytes_saved, 0);
+        assert_eq!(decoded.token_reduction_pct, 0.0);
+        assert_eq!(decoded.est_tokens_saved, 0);
     }
 }

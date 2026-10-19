@@ -924,6 +924,22 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn print_daemon_status_table(status: &DaemonStatusInfo) {
     println!("Canon Daemon Status: Active");
     println!("PID:            {}", status.pid);
@@ -956,6 +972,26 @@ fn print_daemon_status_table(status: &DaemonStatusInfo) {
         "Inactive"
     };
     println!("File Watcher:   {}", watcher_str);
+
+    // --- Context Bloat Section ---
+    println!(
+        "Hooks Served:   {} requests",
+        format_with_commas(status.hooks_served as usize)
+    );
+    if status.hooks_served > 0 {
+        println!(
+            "Context Bloat:  {} raw -> {} delivered ({:.1}% reduction)",
+            format_bytes(status.raw_bytes_served),
+            format_bytes(status.delivered_bytes_served),
+            status.token_reduction_pct
+        );
+        println!(
+            "Tokens Saved:   ~{} tokens (est. 4B/token)",
+            format_with_commas(status.est_tokens_saved as usize)
+        );
+    } else {
+        println!("Context Bloat:  0 B (no requests served yet)");
+    }
 }
 
 async fn handle_daemon_stop(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1093,4 +1129,25 @@ async fn handle_daemon_start(
     run_server_with_options(opts, index, token).await?;
     success("Daemon", "Daemon exited cleanly.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn test_format_uptime() {
+        assert_eq!(format_uptime(30), "30s");
+        assert_eq!(format_uptime(90), "1m 30s");
+        assert_eq!(format_uptime(3665), "1h 1m 5s");
+    }
 }

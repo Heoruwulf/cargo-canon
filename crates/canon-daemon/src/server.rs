@@ -8,11 +8,55 @@ use crate::protocol::{
 use canon_slice::{SymbolIndex, slice_target};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+/// Lock-free context bloat reduction telemetry counters.
+#[derive(Debug, Default)]
+pub struct ServerTelemetry {
+    pub hooks_served: AtomicU64,
+    pub raw_bytes_served: AtomicU64,
+    pub delivered_bytes_served: AtomicU64,
+    pub bytes_saved: AtomicU64,
+}
+
+impl ServerTelemetry {
+    /// Records reduction metrics for a single request and returns the per-request reduction percentage.
+    pub fn record_reduction(&self, raw_bytes: u64, delivered_bytes: u64) -> f64 {
+        self.hooks_served.fetch_add(1, Ordering::Relaxed);
+        self.raw_bytes_served
+            .fetch_add(raw_bytes, Ordering::Relaxed);
+        self.delivered_bytes_served
+            .fetch_add(delivered_bytes, Ordering::Relaxed);
+        let saved = raw_bytes.saturating_sub(delivered_bytes);
+        self.bytes_saved.fetch_add(saved, Ordering::Relaxed);
+        if raw_bytes > 0 {
+            (saved as f64 / raw_bytes as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Returns a snapshot of cumulative telemetry:
+    /// (hooks_served, raw_bytes, delivered_bytes, bytes_saved, reduction_pct, est_tokens_saved).
+    pub fn snapshot(&self) -> (u64, u64, u64, u64, f64, u64) {
+        let hooks = self.hooks_served.load(Ordering::Relaxed);
+        let raw = self.raw_bytes_served.load(Ordering::Relaxed);
+        let delivered = self.delivered_bytes_served.load(Ordering::Relaxed);
+        let saved = self.bytes_saved.load(Ordering::Relaxed);
+        let pct = if raw > 0 {
+            (saved as f64 / raw as f64) * 100.0
+        } else {
+            0.0
+        };
+        let est_tokens = saved / 4;
+        (hooks, raw, delivered, saved, pct, est_tokens)
+    }
+}
 
 /// Configuration options for launching the daemon server.
 #[derive(Debug, Clone)]
@@ -31,6 +75,7 @@ struct ServerState {
     start_time: std::time::Instant,
     index: Arc<RwLock<SymbolIndex>>,
     token: CancellationToken,
+    telemetry: Arc<ServerTelemetry>,
 }
 
 /// RAII Socket cleaner to remove socket file on drop.
@@ -99,6 +144,7 @@ pub async fn run_server_with_options(
         start_time,
         index,
         token: token.clone(),
+        telemetry: Arc::new(ServerTelemetry::default()),
     });
 
     loop {
@@ -141,6 +187,68 @@ pub async fn run_server(
     run_server_with_options(opts, index, token).await
 }
 
+async fn handle_post_read_request(
+    file: &Path,
+    req_start: std::time::Instant,
+    state: &ServerState,
+) -> DaemonResponse {
+    let guard = state.index.read().await;
+    match execute_post_read_hook(file, Some(&guard)) {
+        Ok(advisory_block) => {
+            let elapsed_us = req_start.elapsed().as_micros();
+            let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            let delivered_len = advisory_block.len() as u64;
+            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            tracing::debug!(
+                file = %file.display(),
+                raw_bytes = raw_len,
+                delivered_bytes = delivered_len,
+                reduction_pct = format_args!("{:.1}%", pct),
+                elapsed_us,
+                "Served post-read hook"
+            );
+            DaemonResponse::AdvisoryContext {
+                file: file.display().to_string(),
+                advisory_block,
+            }
+        }
+        Err(e) => DaemonResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+async fn handle_slice_request(
+    file: &Path,
+    mode: canon_core::model::SliceMode,
+    format: canon_core::output::OutputFormat,
+    state: &ServerState,
+) -> DaemonResponse {
+    let req_start = std::time::Instant::now();
+    let guard = state.index.read().await;
+    match slice_target(file, mode, Some(&guard)) {
+        Ok(bundle) => {
+            let elapsed_us = req_start.elapsed().as_micros();
+            let content = bundle.format_with(format).unwrap_or_default();
+            let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            let delivered_len = content.len() as u64;
+            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            tracing::debug!(
+                file = %file.display(),
+                raw_bytes = raw_len,
+                delivered_bytes = delivered_len,
+                reduction_pct = format_args!("{:.1}%", pct),
+                elapsed_us,
+                "Served slice request"
+            );
+            DaemonResponse::SliceResult { content }
+        }
+        Err(e) => DaemonResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
 async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Result<(), DaemonError> {
     loop {
         let req: DaemonRequest = match read_message(&mut stream).await {
@@ -164,6 +272,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                     let guard = state.index.read().await;
                     guard.metrics()
                 };
+                let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
                 let status_info = DaemonStatusInfo {
                     pid: std::process::id(),
                     uptime_secs: state.start_time.elapsed().as_secs(),
@@ -175,46 +284,34 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                     total_contracts: metrics.total_contracts_count,
                     total_routes: metrics.total_routes_count,
                     watcher_active: state.options.watcher_active,
+                    hooks_served: hooks,
+                    raw_bytes_served: raw,
+                    delivered_bytes_served: delivered,
+                    bytes_saved: saved,
+                    token_reduction_pct: pct,
+                    est_tokens_saved: est_tokens,
                 };
                 write_message(&mut stream, &DaemonResponse::Status(status_info)).await?;
             }
             DaemonRequest::PostReadHook { file } => {
-                let guard = state.index.read().await;
-                match execute_post_read_hook(&file, Some(&guard)) {
-                    Ok(advisory_block) => {
-                        let elapsed_us = req_start.elapsed().as_micros();
-                        tracing::debug!(file = %file.display(), elapsed_us, "Served post-read hook");
-                        let resp = DaemonResponse::AdvisoryContext {
-                            file: file.display().to_string(),
-                            advisory_block,
-                        };
-                        write_message(&mut stream, &resp).await?;
-                    }
-                    Err(e) => {
-                        let resp = DaemonResponse::Error {
-                            message: e.to_string(),
-                        };
-                        write_message(&mut stream, &resp).await?;
-                    }
-                }
+                let resp = handle_post_read_request(&file, req_start, &state).await;
+                write_message(&mut stream, &resp).await?;
             }
             DaemonRequest::Slice { file, mode, format } => {
-                let guard = state.index.read().await;
-                match slice_target(&file, mode, Some(&guard)) {
-                    Ok(bundle) => {
-                        let content = bundle.format_with(format).unwrap_or_default();
-                        let resp = DaemonResponse::SliceResult { content };
-                        write_message(&mut stream, &resp).await?;
-                    }
-                    Err(e) => {
-                        let resp = DaemonResponse::Error {
-                            message: e.to_string(),
-                        };
-                        write_message(&mut stream, &resp).await?;
-                    }
-                }
+                let resp = handle_slice_request(&file, mode, format, &state).await;
+                write_message(&mut stream, &resp).await?;
             }
             DaemonRequest::Shutdown => {
+                let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+                tracing::info!(
+                    hooks_served = hooks,
+                    raw_bytes = raw,
+                    delivered_bytes = delivered,
+                    bytes_saved = saved,
+                    reduction_pct = format_args!("{:.1}%", pct),
+                    est_tokens_saved = est_tokens,
+                    "Daemon stopping: cumulative context bloat reduction summary"
+                );
                 write_message(&mut stream, &DaemonResponse::ShutdownAck).await?;
                 state.token.cancel();
                 break;
@@ -222,4 +319,55 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_telemetry_reduction_and_bounds() {
+        let telemetry = ServerTelemetry::default();
+        let pct = telemetry.record_reduction(1000, 200);
+        assert!((pct - 80.0).abs() < 0.001);
+
+        // Edge case: delivered > raw (saturating_sub prevents underflow)
+        let pct2 = telemetry.record_reduction(50, 100);
+        assert_eq!(pct2, 0.0);
+
+        let (hooks, raw, delivered, saved, cumulative_pct, tokens) = telemetry.snapshot();
+        assert_eq!(hooks, 2);
+        assert_eq!(raw, 1050);
+        assert_eq!(delivered, 300);
+        assert_eq!(saved, 800);
+        assert!((cumulative_pct - (800.0 / 1050.0 * 100.0)).abs() < 0.001);
+        assert_eq!(tokens, 200);
+    }
+
+    #[tokio::test]
+    async fn test_server_telemetry_concurrent_updates() {
+        let telemetry = Arc::new(ServerTelemetry::default());
+        let mut handles = Vec::new();
+
+        for _ in 0..16 {
+            let t = Arc::clone(&telemetry);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    t.record_reduction(100, 20);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let (hooks, raw, delivered, saved, pct, tokens) = telemetry.snapshot();
+        assert_eq!(hooks, 1600);
+        assert_eq!(raw, 160_000);
+        assert_eq!(delivered, 32_000);
+        assert_eq!(saved, 128_000);
+        assert!((pct - 80.0).abs() < 0.001);
+        assert_eq!(tokens, 32_000);
+    }
 }

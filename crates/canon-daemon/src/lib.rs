@@ -16,7 +16,9 @@ pub mod watcher;
 pub use error::DaemonError;
 pub use hook::execute_post_read_hook;
 pub use protocol::{DaemonRequest, DaemonResponse, DaemonStatusInfo, read_message, write_message};
-pub use server::{ServerOptions, SocketGuard, run_server, run_server_with_options};
+pub use server::{
+    ServerOptions, ServerTelemetry, SocketGuard, run_server, run_server_with_options,
+};
 pub use watcher::start_watcher;
 
 use std::path::Path;

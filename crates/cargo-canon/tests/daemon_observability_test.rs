@@ -19,15 +19,47 @@ async fn test_daemon_observability_lifecycle() {
     let test_file = src_dir.join("lib.rs");
     let test_content = br#"pub struct Service {
     pub name: String,
+    pub retries: u32,
+    pub timeout_ms: u64,
 }
 
 pub trait Runner {
     fn run(&self) -> bool;
+    fn validate(&self) -> Result<(), String>;
+    fn execute_batch(&self, items: &[String]) -> usize;
 }
 
 impl Runner for Service {
     fn run(&self) -> bool {
-        !self.name.is_empty()
+        let is_valid = !self.name.is_empty();
+        if is_valid {
+            println!("Service {} running with timeout {}", self.name, self.timeout_ms);
+            true
+        } else {
+            eprintln!("Invalid service name configuration");
+            false
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.retries > 10 {
+            return Err("Too many retries configured for service worker".to_string());
+        }
+        if self.timeout_ms < 100 {
+            return Err("Timeout configured is too low for reliable execution".to_string());
+        }
+        Ok(())
+    }
+
+    fn execute_batch(&self, items: &[String]) -> usize {
+        let mut count = 0;
+        for item in items {
+            if !item.is_empty() {
+                count += 1;
+                println!("Processing batch item {} on service {}", item, self.name);
+            }
+        }
+        count
     }
 }
 "#;
@@ -71,7 +103,7 @@ impl Runner for Service {
     assert!(ping_str.contains("[Daemon] Daemon is responsive on"));
     assert!(ping_str.contains("round-trip:"));
 
-    // 2. Query status via --status (human table)
+    // 2. Query initial status via --status (human table)
     let status_out = Command::new(canon_bin)
         .args([
             "daemon",
@@ -90,8 +122,10 @@ impl Runner for Service {
     assert!(status_str.contains("Uptime:"));
     assert!(status_str.contains("Indexed Files:  1 files"));
     assert!(status_str.contains("Total Symbols:"));
+    assert!(status_str.contains("Hooks Served:   0 requests"));
+    assert!(status_str.contains("Context Bloat:  0 B (no requests served yet)"));
 
-    // 3. Query status via --status --json
+    // 3. Query initial status via --status --json: verify 0 hooks served initially
     let status_json_out = Command::new(canon_bin)
         .args([
             "daemon",
@@ -111,6 +145,10 @@ impl Runner for Service {
     assert_eq!(status_info.indexed_files, 1);
     assert!(status_info.total_symbols >= 2);
     assert_eq!(status_info.pid, std::process::id());
+    assert_eq!(status_info.hooks_served, 0);
+    assert_eq!(status_info.bytes_saved, 0);
+    assert_eq!(status_info.token_reduction_pct, 0.0);
+    assert_eq!(status_info.est_tokens_saved, 0);
 
     // 4. Hook post-read with live daemon (provenance: daemon)
     let hook_daemon_out = Command::new(canon_bin)
@@ -135,7 +173,50 @@ impl Runner for Service {
     );
     assert!(hook_daemon_str.contains("# Canon Context Slice:"));
 
-    // 5. Graceful shutdown via --stop
+    // 5. Query status post-hook via --status --json: verify telemetry incremented
+    let status_post_json_out = Command::new(canon_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("failed to execute canon daemon --status --json post-hook");
+    assert!(status_post_json_out.status.success());
+    let post_json_str = String::from_utf8_lossy(&status_post_json_out.stdout);
+    let post_status_info: DaemonStatusInfo =
+        serde_json::from_str(&post_json_str).expect("post-hook status must be valid JSON");
+    assert_eq!(post_status_info.hooks_served, 1);
+    assert!(post_status_info.raw_bytes_served > 0);
+    assert!(post_status_info.delivered_bytes_served > 0);
+    assert!(post_status_info.bytes_saved > 0);
+    assert!(post_status_info.token_reduction_pct > 0.0);
+    assert!(post_status_info.est_tokens_saved > 0);
+
+    // 6. Query status post-hook via human table: verify formatted bloat lines
+    let status_post_table_out = Command::new(canon_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("failed to execute canon daemon --status post-hook");
+    assert!(status_post_table_out.status.success());
+    let post_table_str = String::from_utf8_lossy(&status_post_table_out.stdout);
+    assert!(post_table_str.contains("Hooks Served:   1 requests"));
+    assert!(post_table_str.contains("Context Bloat:"));
+    assert!(post_table_str.contains("Tokens Saved:"));
+    assert!(post_table_str.contains("reduction)"));
+
+    // 7. Graceful shutdown via --stop
     let stop_out = Command::new(canon_bin)
         .args([
             "daemon",
