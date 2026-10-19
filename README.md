@@ -287,10 +287,13 @@ cargo canon daemon --start
 # Probe running daemon liveness and report round-trip latency
 cargo canon daemon --ping
 
-# Query running daemon status, index metrics, and cache statistics (supports --json)
+# Query running daemon status, index metrics, and context bloat reduction
 cargo canon daemon --status
 
-# Gracefully terminate the running background daemon
+# Export machine-readable status with full bloat telemetry in JSON
+cargo canon daemon --status --json
+
+# Gracefully terminate the running background daemon (logs cumulative session savings)
 cargo canon daemon --stop
 
 # Advisory post-read hook on Rust source file (emits provenance header)
@@ -301,6 +304,54 @@ cargo canon daemon --hook-post-read --file frontend/src/App.tsx
 
 # Advisory post-read hook on Go source file
 cargo canon daemon --hook-post-read --file backend/pkg/service/user.go
+```
+
+#### Context Bloat Reduction Telemetry
+
+The daemon server instruments all post-read hook and slice requests with lock-free atomic counters (`AtomicU64`, `Ordering::Relaxed`), providing ground-truth operational visibility into context savings without adding request latency:
+
+- **Source of Truth:** Exact raw bytes processed vs. delivered advisory context bytes.
+- **Tokens Saved:** Conservative estimate derived from empirical code ratios ($\approx 4\text{ bytes/token}$).
+- **Non-Negative Clamping:** Prevents negative bloat anomalies on small files with headers.
+
+Sample human-readable status table (`cargo canon daemon --status`):
+
+```text
+Canon Daemon Status: Active
+PID:            48210
+Uptime:         12m 45s
+Socket Path:    /tmp/canon-a1b2c3d4e5f6.sock
+Workspace Root: /home/user/project
+Indexed Files:  142 files
+Total Symbols:  3,810 declarations
+Call Edges:     1,124 edges
+Contracts:      456 trait implementations
+Routes:         48 API endpoints
+File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
+Hooks Served:   35 requests
+Context Bloat:  1.24 MB raw -> 142.6 KB delivered (88.5% reduction)
+Tokens Saved:   ~275,340 tokens (est. 4B/token)
+```
+
+#### Structured Logging & `RUST_LOG` Support
+
+All crates utilize `tracing` with standard `EnvFilter` support. `cargo-canon` enforces a strict dual-tier logging discipline to keep logs clean during high-frequency agent tool loops:
+
+- **`tracing::debug!`**: Per-request structured telemetry (`raw_bytes`, `delivered_bytes`, `reduction_pct`, `elapsed_us`).
+- **`tracing::info!`**: Daemon lifecycle milestones (server start, socket bind, file watcher active) and session shutdown summaries reporting cumulative context saved.
+
+```sh
+# Default info-level logging
+cargo canon daemon --start
+
+# Stream per-request bloat metrics in real-time
+RUST_LOG=canon_daemon=debug cargo canon daemon --start
+
+# Enable debug logging via CLI verbosity flag (-v = debug, -vv = trace)
+cargo canon daemon --start -v
+
+# Emit structured JSON log streams for CI, sidecars, or log aggregators
+RUST_LOG=debug cargo canon daemon --start --json
 ```
 
 ---
