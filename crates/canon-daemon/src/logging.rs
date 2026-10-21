@@ -224,6 +224,11 @@ impl DaemonLogManager {
         let filename = derive_workspace_log_filename(root);
         let log_path = self.workspaces_dir.join(filename);
 
+        let cfg = canon_core::config::CanonConfig::discover_for_workspace(root);
+        if !cfg.daemon.workspace_logging {
+            return Ok(WorkspaceLogger::noop(log_path));
+        }
+
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(1024);
         spawn_writer_task(log_path.clone(), rx);
 
@@ -254,7 +259,7 @@ pub mod tests {
         let dir = tempdir().unwrap();
         let manager = DaemonLogManager::init(dir.path()).expect("init should succeed");
 
-        assert!(manager.main_log_path().exists() || true);
+        assert!(manager.main_log_path().exists());
         assert!(
             manager
                 .main_log_path()
@@ -310,5 +315,22 @@ pub mod tests {
         let filename = derive_workspace_log_filename(p);
         assert!(filename.starts_with("my-app-"));
         assert!(filename.ends_with(".log"));
+    }
+
+    #[tokio::test]
+    async fn test_workspace_logging_disabled_respects_config() {
+        let log_dir = tempdir().unwrap();
+        let ws_dir = tempdir().unwrap();
+        std::fs::write(
+            ws_dir.path().join(".canon.toml"),
+            "[daemon]\nworkspace_logging = false\n",
+        )
+        .unwrap();
+
+        let manager = DaemonLogManager::init(log_dir.path()).unwrap();
+        let ws_logger = manager.create_workspace_logger(ws_dir.path()).unwrap();
+        ws_logger.log("Should not be written to disk");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!ws_logger.log_path().exists());
     }
 }

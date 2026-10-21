@@ -991,6 +991,17 @@ fn format_time_ago(secs: u64) -> String {
     }
 }
 
+fn truncate_tail(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count > max_chars {
+        let keep = max_chars.saturating_sub(3);
+        let tail: String = s.chars().skip(count - keep).collect();
+        format!("...{}", tail)
+    } else {
+        s.to_string()
+    }
+}
+
 fn print_daemon_status_table(status: &DaemonStatusInfo) {
     println!("Canon Daemon Status: Active");
     println!("PID:            {}", status.pid);
@@ -1040,22 +1051,13 @@ fn print_daemon_status_table(status: &DaemonStatusInfo) {
         println!("  {}", "-".repeat(112));
         for ws in &status.workspaces {
             let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
-            let root_str = ws.root.display().to_string();
-            let root_trunc = if root_str.len() > 32 {
-                format!("...{}", &root_str[root_str.len() - 29..])
-            } else {
-                root_str
-            };
+            let root_trunc = truncate_tail(&ws.root.display().to_string(), 32);
             let log_str = ws
                 .log_path
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or("");
-            let log_trunc = if log_str.len() > 32 {
-                format!("...{}", &log_str[log_str.len() - 29..])
-            } else {
-                log_str.to_string()
-            };
+            let log_trunc = truncate_tail(log_str, 32);
             let accessed_str = format_time_ago(ws.last_accessed_secs_ago);
             println!(
                 "  {:<32} {:<6} {:>8} {:>10} {:>8.1} MB  {:<32} {:>8}",
@@ -1286,5 +1288,13 @@ mod tests {
         assert_eq!(format_time_ago(5), "5s ago");
         assert_eq!(format_time_ago(120), "2m ago");
         assert_eq!(format_time_ago(7200), "2h ago");
+    }
+
+    #[test]
+    fn test_truncate_tail_utf8_safety() {
+        let path = "/home/user/проекты/очень_длинное_имя_репозитория/src";
+        let truncated = truncate_tail(path, 32);
+        assert_eq!(truncated.chars().count(), 32);
+        assert!(truncated.starts_with("..."));
     }
 }
