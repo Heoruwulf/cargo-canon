@@ -110,6 +110,9 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
     // 8. Query daemon A -> must see AlphaService, NOT BetaService
     let req_main = DaemonRequest::PostReadHook {
         file: alpha_file.clone(),
+        start_line: None,
+        end_line: None,
+        raw_read_bytes: None,
     };
     let resp_main = send_daemon_request(&socket_main, req_main).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_main {
@@ -128,6 +131,9 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
     // 9. Query daemon B -> must see BetaService, NOT AlphaService
     let req_wt = DaemonRequest::PostReadHook {
         file: beta_file.clone(),
+        start_line: None,
+        end_line: None,
+        raw_read_bytes: None,
     };
     let resp_wt = send_daemon_request(&socket_wt, req_wt).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt {
@@ -165,6 +171,9 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
         &socket_wt,
         DaemonRequest::PostReadHook {
             file: beta_file.clone(),
+            start_line: None,
+            end_line: None,
+            raw_read_bytes: None,
         },
     )
     .await

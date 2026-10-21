@@ -38,21 +38,21 @@ impl ServerTelemetry {
         let saved = raw_bytes.saturating_sub(delivered_bytes);
         self.bytes_saved.fetch_add(saved, Ordering::Relaxed);
         if raw_bytes > 0 {
-            (saved as f64 / raw_bytes as f64) * 100.0
+            ((raw_bytes as f64 - delivered_bytes as f64) / raw_bytes as f64) * 100.0
         } else {
             0.0
         }
     }
 
-    /// Returns a snapshot of cumulative telemetry:
+    /// Returns a snapshot of cumulative telemetry computed directly from `raw` vs `delivered`:
     /// (hooks_served, raw_bytes, delivered_bytes, bytes_saved, reduction_pct, est_tokens_saved).
     pub fn snapshot(&self) -> (u64, u64, u64, u64, f64, u64) {
         let hooks = self.hooks_served.load(Ordering::Relaxed);
         let raw = self.raw_bytes_served.load(Ordering::Relaxed);
         let delivered = self.delivered_bytes_served.load(Ordering::Relaxed);
-        let saved = self.bytes_saved.load(Ordering::Relaxed);
+        let saved = raw.saturating_sub(delivered);
         let pct = if raw > 0 {
-            (saved as f64 / raw as f64) * 100.0
+            ((raw as f64 - delivered as f64) / raw as f64) * 100.0
         } else {
             0.0
         };
@@ -277,11 +277,19 @@ pub async fn run_server(
     run_server_with_options(opts, index, token).await
 }
 
+struct PostReadParams<'a> {
+    file: &'a Path,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    raw_read_bytes: Option<u64>,
+}
+
 async fn handle_post_read_request(
-    file: &Path,
+    params: PostReadParams<'_>,
     req_start: std::time::Instant,
     state: &ServerState,
 ) -> DaemonResponse {
+    let file = params.file;
     let entry = match state.registry.get_or_init(file).await {
         Ok(e) => {
             if let Some(ref watcher) = state.watcher_manager {
@@ -305,7 +313,9 @@ async fn handle_post_read_request(
         }
     };
 
-    let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let raw_len = params
+        .raw_read_bytes
+        .unwrap_or_else(|| std::fs::metadata(file).map(|m| m.len()).unwrap_or(0));
     let advisory_res = if let Some(ref ws) = entry {
         if let Some(ref base) = ws.base_index {
             let base_guard = base.read().await;
@@ -321,12 +331,31 @@ async fn handle_post_read_request(
     };
 
     match advisory_res {
-        Ok(advisory_block) => {
+        Ok(mut advisory_block) => {
             let elapsed_us = req_start.elapsed().as_micros();
-            let delivered_len = advisory_block.len() as u64;
+            let candidate_len = advisory_block.len() as u64;
+            // Skip injecting full-file advisory context when a bounded read is smaller than the skeleton.
+            let (delivered_len, skipped) =
+                if params.raw_read_bytes.is_some() && raw_len > 0 && candidate_len >= raw_len {
+                    advisory_block.clear();
+                    (raw_len, true)
+                } else {
+                    (candidate_len, false)
+                };
             let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            let range_str = match (params.start_line, params.end_line) {
+                (Some(s), Some(e)) => format!(" (lines {}..{})", s, e),
+                (Some(s), None) => format!(" (lines {}..)", s),
+                (None, Some(e)) => format!(" (lines ..{})", e),
+                (None, None) => String::new(),
+            };
+            let action = if skipped {
+                "PostReadHook skipped (micro-read < skeleton)"
+            } else {
+                "PostReadHook served"
+            };
             let log_msg = format!(
-                "PostReadHook served: '{}' | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                "{action}: '{}'{range_str} | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
                 file.display(),
                 raw_len,
                 delivered_len,
@@ -520,8 +549,19 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 };
                 write_message(&mut stream, &DaemonResponse::Status(status_info)).await?;
             }
-            DaemonRequest::PostReadHook { file } => {
-                let resp = handle_post_read_request(&file, req_start, &state).await;
+            DaemonRequest::PostReadHook {
+                file,
+                start_line,
+                end_line,
+                raw_read_bytes,
+            } => {
+                let params = PostReadParams {
+                    file: &file,
+                    start_line,
+                    end_line,
+                    raw_read_bytes,
+                };
+                let resp = handle_post_read_request(params, req_start, &state).await;
                 write_message(&mut stream, &resp).await?;
             }
             DaemonRequest::Slice { file, mode, format } => {
@@ -553,17 +593,17 @@ mod tests {
         let pct = telemetry.record_reduction(1000, 200);
         assert!((pct - 80.0).abs() < 0.001);
 
-        // Edge case: delivered > raw (saturating_sub prevents underflow)
+        // Edge case: delivered > raw reflects negative reduction and deducts from net savings
         let pct2 = telemetry.record_reduction(50, 100);
-        assert_eq!(pct2, 0.0);
+        assert!((pct2 - (-100.0)).abs() < 0.001);
 
         let (hooks, raw, delivered, saved, cumulative_pct, tokens) = telemetry.snapshot();
         assert_eq!(hooks, 2);
         assert_eq!(raw, 1050);
         assert_eq!(delivered, 300);
-        assert_eq!(saved, 800);
-        assert!((cumulative_pct - (800.0 / 1050.0 * 100.0)).abs() < 0.001);
-        assert_eq!(tokens, 200);
+        assert_eq!(saved, 750);
+        assert!((cumulative_pct - (750.0 / 1050.0 * 100.0)).abs() < 0.001);
+        assert_eq!(tokens, 187);
     }
 
     #[tokio::test]

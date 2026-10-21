@@ -225,6 +225,9 @@ mod tests {
             &socket_path,
             DaemonRequest::PostReadHook {
                 file: test_file.clone(),
+                start_line: Some(1),
+                end_line: Some(10),
+                raw_read_bytes: Some(4200),
             },
         )
         .await
@@ -254,6 +257,7 @@ mod tests {
                 assert!(status.workspaces[0].memory_mb > 0.0);
                 assert!(status.workspaces[0].log_path.exists());
                 assert_eq!(status.hooks_served, 1);
+                assert_eq!(status.raw_bytes_served, 4200);
             }
             _ => panic!("Expected DaemonResponse::Status"),
         }

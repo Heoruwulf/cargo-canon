@@ -18,6 +18,15 @@ pub enum DaemonRequest {
     PostReadHook {
         /// Target file path inspected.
         file: PathBuf,
+        /// Optional 1-indexed start line requested by the agent.
+        #[serde(default)]
+        start_line: Option<usize>,
+        /// Optional 1-indexed inclusive end line requested by the agent.
+        #[serde(default)]
+        end_line: Option<usize>,
+        /// Optional actual byte count read by the agent (after line range & vendor limits).
+        #[serde(default)]
+        raw_read_bytes: Option<u64>,
     },
     /// Request AST slice for file.
     Slice {
@@ -281,5 +290,42 @@ mod tests {
         assert_eq!(decoded.bytes_saved, 0);
         assert_eq!(decoded.token_reduction_pct, 0.0);
         assert_eq!(decoded.est_tokens_saved, 0);
+    }
+
+    #[test]
+    fn test_protocol_post_read_hook_backward_compatibility_and_fields() {
+        let legacy_json = r#"{"PostReadHook":{"file":"/tmp/test.rs"}}"#;
+        let decoded: DaemonRequest = serde_json::from_str(legacy_json).unwrap();
+        match decoded {
+            DaemonRequest::PostReadHook {
+                file,
+                start_line,
+                end_line,
+                raw_read_bytes,
+            } => {
+                assert_eq!(file, PathBuf::from("/tmp/test.rs"));
+                assert_eq!(start_line, None);
+                assert_eq!(end_line, None);
+                assert_eq!(raw_read_bytes, None);
+            }
+            _ => panic!("Expected PostReadHook"),
+        }
+
+        let spanned_json = r#"{"PostReadHook":{"file":"/tmp/test.rs","start_line":10,"end_line":40,"raw_read_bytes":850}}"#;
+        let decoded_spanned: DaemonRequest = serde_json::from_str(spanned_json).unwrap();
+        match decoded_spanned {
+            DaemonRequest::PostReadHook {
+                file,
+                start_line,
+                end_line,
+                raw_read_bytes,
+            } => {
+                assert_eq!(file, PathBuf::from("/tmp/test.rs"));
+                assert_eq!(start_line, Some(10));
+                assert_eq!(end_line, Some(40));
+                assert_eq!(raw_read_bytes, Some(850));
+            }
+            _ => panic!("Expected PostReadHook"),
+        }
     }
 }

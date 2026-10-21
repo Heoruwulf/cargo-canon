@@ -9,6 +9,7 @@ use canon_core::config::CanonConfig;
 use canon_core::diagnostics::{error, info_banner, success};
 use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
+use canon_core::span::{AgentVendor, ReadSpan, parse_hook_stdin};
 use canon_core::workspace::{
     resolve_active_socket, resolve_connected_socket, resolve_global_socket, resolve_workspace_root,
 };
@@ -312,7 +313,7 @@ pub struct StateMachineArgs {
     pub transitions: usize,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct DaemonArgs {
     /// Start daemon IPC server in foreground
     #[arg(long, help_heading = "Daemon Lifecycle")]
@@ -341,6 +342,26 @@ pub struct DaemonArgs {
     /// Target file for hook execution
     #[arg(long, help_heading = "Advisory Tool Hooks")]
     pub file: Option<PathBuf>,
+
+    /// 1-indexed inclusive start line for post-read hook (AGY StartLine)
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
+    pub start_line: Option<usize>,
+
+    /// 1-indexed inclusive end line for post-read hook (AGY EndLine)
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
+    pub end_line: Option<usize>,
+
+    /// 1-indexed starting line offset for post-read hook (Claude offset)
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
+    pub offset: Option<usize>,
+
+    /// Maximum number of lines read for post-read hook (Claude limit)
+    #[arg(long, help_heading = "Advisory Tool Hooks")]
+    pub limit: Option<usize>,
+
+    /// Agent vendor for default read window bounds (claude, agy, generic)
+    #[arg(long, value_enum, help_heading = "Advisory Tool Hooks")]
+    pub vendor: Option<AgentVendor>,
 
     /// Socket path override
     #[arg(long, help_heading = "Configuration")]
@@ -850,7 +871,7 @@ async fn handle_daemon(
     }
 
     if args.hook_post_read {
-        return handle_daemon_hook_post_read(args.file, socket_override, &current_dir).await;
+        return handle_daemon_hook_post_read(&args, socket_override, &current_dir).await;
     }
 
     let is_isolated = args.isolated || !cfg.daemon.system_daemon;
@@ -1128,15 +1149,102 @@ async fn handle_daemon_stop(socket_path: &Path) -> Result<(), Box<dyn std::error
     }
 }
 
+/// Resolves the target file path and merged [`ReadSpan`] from optional `stdin` JSON and CLI flags.
+#[must_use]
+pub fn resolve_hook_input(
+    args: &DaemonArgs,
+    stdin_raw: Option<&str>,
+) -> Option<(PathBuf, ReadSpan)> {
+    let parsed = stdin_raw.and_then(parse_hook_stdin);
+    let cli_span = ReadSpan {
+        start_line: args.start_line,
+        end_line: args.end_line,
+        offset: args.offset,
+        limit: args.limit,
+        byte_offset: None,
+        vendor: args.vendor,
+    };
+    let base_span = parsed.as_ref().map(|p| p.span.clone()).unwrap_or_default();
+    let merged_span = base_span.with_overrides(&cli_span);
+    let file = args
+        .file
+        .clone()
+        .or_else(|| parsed.and_then(|p| p.file_path))?;
+    Some((file, merged_span))
+}
+
+/// Computes effective `(start_line, end_line, raw_read_bytes)` for a post-read hook invocation.
+#[must_use]
+pub fn compute_hook_read_metrics(
+    file: &Path,
+    span: &ReadSpan,
+) -> (Option<usize>, Option<usize>, Option<u64>) {
+    if !span.is_specified() {
+        return (None, None, None);
+    }
+    let Ok(content) = std::fs::read_to_string(file) else {
+        return (span.start_line.or(span.offset), span.end_line, None);
+    };
+    let total_lines = content.split_inclusive('\n').count();
+    let (start, end) = span.effective_range(total_lines);
+    let raw_bytes = span.calculate_read_bytes(&content);
+    (
+        (start > 0).then_some(start),
+        (end > 0).then_some(end),
+        Some(raw_bytes),
+    )
+}
+
+fn read_json_from_reader<R: std::io::Read>(reader: R) -> Option<String> {
+    use std::io::Read;
+    let mut limited = reader.take(256 * 1024);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match limited.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    String::from_utf8(buf).ok().filter(|s| !s.trim().is_empty())
+}
+
+async fn read_piped_stdin(has_cli_file: bool) -> Option<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Detached OS thread so an idle inherited pipe never blocks Tokio runtime shutdown.
+    std::thread::spawn(move || {
+        let _ = tx.send(read_json_from_reader(std::io::stdin().lock()));
+    });
+    let timeout_ms = if has_cli_file { 10 } else { 50 };
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+}
+
 async fn handle_daemon_hook_post_read(
-    file: Option<PathBuf>,
+    args: &DaemonArgs,
     socket_override: Option<&str>,
     current_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(file) = file else {
+    let stdin_payload = read_piped_stdin(args.file.is_some()).await;
+    let Some((file, span)) = resolve_hook_input(args, stdin_payload.as_deref()) else {
         error("Daemon", "--file is required when running post-read hook");
         return Ok(());
     };
+    let (start_line, end_line, raw_read_bytes) = compute_hook_read_metrics(&file, &span);
 
     let target_dir = if let Some(parent) = file.parent() {
         if parent.as_os_str().is_empty() {
@@ -1156,7 +1264,12 @@ async fn handle_daemon_hook_post_read(
     if let Some(ref hook_socket) = connected_socket {
         if let Ok(resp) = send_daemon_request(
             hook_socket,
-            DaemonRequest::PostReadHook { file: file.clone() },
+            DaemonRequest::PostReadHook {
+                file: file.clone(),
+                start_line,
+                end_line,
+                raw_read_bytes,
+            },
         )
         .await
         {
@@ -1190,10 +1303,12 @@ async fn handle_daemon_hook_post_read(
         }
     };
 
-    if !prov.is_empty() {
-        println!("{}", prov);
+    if !output.is_empty() {
+        if !prov.is_empty() {
+            println!("{}", prov);
+        }
+        println!("{}", output);
     }
-    println!("{}", output);
     Ok(())
 }
 
@@ -1296,5 +1411,77 @@ mod tests {
         let truncated = truncate_tail(path, 32);
         assert_eq!(truncated.chars().count(), 32);
         assert!(truncated.starts_with("..."));
+    }
+
+    #[test]
+    fn test_resolve_hook_input_merges_stdin_and_cli() {
+        let stdin_json = r#"{
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": "/workspace/src/lib.rs",
+                "offset": 100,
+                "limit": 30
+            }
+        }"#;
+        let args = DaemonArgs {
+            hook_post_read: true,
+            limit: Some(50),
+            ..Default::default()
+        };
+        let (file, span) =
+            resolve_hook_input(&args, Some(stdin_json)).expect("should resolve hook input");
+        assert_eq!(file, PathBuf::from("/workspace/src/lib.rs"));
+        assert_eq!(span.vendor, Some(AgentVendor::Claude));
+        assert_eq!(span.offset, Some(100));
+        assert_eq!(span.limit, Some(50));
+    }
+
+    #[test]
+    fn test_daemon_cli_parses_hook_span_flags() {
+        let cli = Cli::try_parse_from([
+            "cargo-canon",
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            "src/lib.rs",
+            "--start-line",
+            "10",
+            "--end-line",
+            "40",
+            "--vendor",
+            "agy",
+        ])
+        .expect("should parse CLI flags");
+
+        let Some(Commands::Daemon(d)) = cli.command else {
+            panic!("expected Daemon command");
+        };
+        assert!(d.hook_post_read);
+        assert_eq!(d.start_line, Some(10));
+        assert_eq!(d.end_line, Some(40));
+        assert_eq!(d.vendor, Some(AgentVendor::Agy));
+    }
+
+    #[test]
+    fn test_read_json_from_reader_stops_without_eof() {
+        struct NonClosingPipe {
+            delivered: bool,
+        }
+        impl std::io::Read for NonClosingPipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    !self.delivered,
+                    "reader should stop once JSON is complete without waiting for EOF"
+                );
+                self.delivered = true;
+                let payload = br#"{"tool_name":"Read","tool_input":{"file_path":"src/lib.rs"}}"#;
+                buf[..payload.len()].copy_from_slice(payload);
+                Ok(payload.len())
+            }
+        }
+
+        let out = read_json_from_reader(NonClosingPipe { delivered: false })
+            .expect("should return JSON payload without waiting for EOF");
+        assert!(out.contains("src/lib.rs"));
     }
 }

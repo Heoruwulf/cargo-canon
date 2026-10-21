@@ -51,14 +51,53 @@ def send_ipc_message(sock, payload_dict):
     return json.loads(b"".join(chunks))
 
 
-def worker_loop(sock_path, files, mode, duration_secs, max_requests, stats):
+def compute_line_offsets(path):
+    try:
+        with open(path, "rb") as f:
+            lines = f.read().splitlines(keepends=True)
+    except OSError:
+        return [0]
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def build_post_read_hook(target_file, offsets, rng, req_count):
+    abs_path = os.path.abspath(target_file)
+    total_lines = len(offsets) - 1
+    # Periodically omit line ranges to exercise daemon/vendor default handling
+    if total_lines <= 0 or req_count % 5 == 0:
+        return {"PostReadHook": {"file": abs_path}}
+
+    start_line = rng.randint(1, total_lines)
+    if req_count % 2 == 1:
+        # Micro-read window (up to 80 lines)
+        end_line = min(total_lines, start_line + rng.randint(0, 79))
+    else:
+        # Arbitrary valid span up to end of file
+        end_line = rng.randint(start_line, total_lines)
+
+    raw_read_bytes = offsets[end_line] - offsets[start_line - 1]
+    return {
+        "PostReadHook": {
+            "file": abs_path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "raw_read_bytes": raw_read_bytes,
+        }
+    }
+
+
+def worker_loop(sock_path, files, file_offsets, mode, duration_secs, max_requests, stats, seed=42):
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(sock_path)
-    except Exception as e:
+    except Exception:
         stats["errors"] += 1
         return
 
+    rng = random.Random(seed)
     start_time = time.monotonic()
     req_count = 0
     file_idx = 0
@@ -72,9 +111,10 @@ def worker_loop(sock_path, files, mode, duration_secs, max_requests, stats):
 
         target_file = files[file_idx % num_files] if num_files > 0 else ""
         file_idx += 1
+        offsets = file_offsets.get(target_file, [0])
 
         if mode == "hook":
-            req = {"PostReadHook": {"file": os.path.abspath(target_file)}}
+            req = build_post_read_hook(target_file, offsets, rng, req_count)
         elif mode == "slice":
             req = {
                 "Slice": {
@@ -86,7 +126,7 @@ def worker_loop(sock_path, files, mode, duration_secs, max_requests, stats):
         elif mode == "mixed":
             op = req_count % 3
             if op == 0:
-                req = {"PostReadHook": {"file": os.path.abspath(target_file)}}
+                req = build_post_read_hook(target_file, offsets, rng, req_count)
             elif op == 1:
                 req = {
                     "Slice": {
@@ -193,6 +233,7 @@ def main():
     # Shuffle to interleave requests across different repositories and directories
     random.seed(42)
     random.shuffle(files)
+    file_offsets = {f: compute_line_offsets(f) for f in files}
 
     print(f"=== Canon Daemon Multi-Tenant Load Test ===")
     print(f"Socket:        {sock_path}")
@@ -212,7 +253,16 @@ def main():
     for i in range(args.threads):
         t = threading.Thread(
             target=worker_loop,
-            args=(sock_path, files, args.mode, args.duration, args.requests, worker_stats[i]),
+            args=(
+                sock_path,
+                files,
+                file_offsets,
+                args.mode,
+                args.duration,
+                args.requests,
+                worker_stats[i],
+                42 + i,
+            ),
         )
         threads.append(t)
         t.start()
