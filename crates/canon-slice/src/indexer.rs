@@ -71,6 +71,35 @@ pub struct RouteBinding {
     pub line: usize,
     /// Whether this is a backend definition (true) or frontend client call site (false).
     pub is_backend: bool,
+    /// Pre-computed lowercased route path for zero-allocation cross-boundary queries.
+    #[serde(default)]
+    pub route_path_lower: String,
+    /// Pre-computed lowercased handler name.
+    #[serde(default)]
+    pub handler_lower: String,
+}
+
+impl RouteBinding {
+    /// Constructs a new RouteBinding with pre-normalized lowercase lookup keys.
+    pub fn new(
+        route_path: String,
+        handler_or_caller: String,
+        file: String,
+        line: usize,
+        is_backend: bool,
+    ) -> Self {
+        let route_path_lower = route_path.to_lowercase();
+        let handler_lower = handler_or_caller.to_lowercase();
+        Self {
+            route_path,
+            handler_or_caller,
+            file,
+            line,
+            is_backend,
+            route_path_lower,
+            handler_lower,
+        }
+    }
 }
 
 /// Cross-boundary correlation between Rust backend, Go backend, and TypeScript frontend contracts.
@@ -115,6 +144,9 @@ pub struct SymbolIndex {
     pub contracts_map: HashMap<String, Vec<ContractInfo>>,
     /// Declared symbols indexed by name.
     pub symbols_map: HashMap<String, Vec<SymbolDef>>,
+    /// Inverted index mapping file paths to declared symbol names.
+    #[serde(default)]
+    pub file_to_symbols: HashMap<String, Vec<String>>,
     /// Recorded API routes and client fetch calls.
     #[serde(default)]
     pub routes: Vec<RouteBinding>,
@@ -124,6 +156,17 @@ impl SymbolIndex {
     /// Creates an empty symbol index.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn record_symbol(&mut self, sym: SymbolDef) {
+        self.file_to_symbols
+            .entry(sym.file.clone())
+            .or_default()
+            .push(sym.name.clone());
+        self.symbols_map
+            .entry(sym.name.clone())
+            .or_default()
+            .push(sym);
     }
 
     /// Computes summary metrics of the current semantic graph in O(N).
@@ -184,9 +227,20 @@ impl SymbolIndex {
                 bytes += d.name.len() + d.kind.len() + d.file.len() + d.language.len();
             }
         }
+        for (file, syms) in &self.file_to_symbols {
+            bytes += file.len() + 32;
+            bytes += syms.capacity() * std::mem::size_of::<String>();
+            for s in syms {
+                bytes += s.len();
+            }
+        }
         bytes += self.routes.capacity() * std::mem::size_of::<RouteBinding>();
         for r in &self.routes {
-            bytes += r.route_path.len() + r.handler_or_caller.len() + r.file.len();
+            bytes += r.route_path.len()
+                + r.handler_or_caller.len()
+                + r.file.len()
+                + r.route_path_lower.len()
+                + r.handler_lower.len();
         }
 
         bytes as f64 / (1024.0 * 1024.0)
@@ -233,6 +287,9 @@ impl SymbolIndex {
         }
         for (k, v) in other.symbols_map {
             self.symbols_map.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.file_to_symbols {
+            self.file_to_symbols.entry(k).or_default().extend(v);
         }
         self.routes.extend(other.routes);
     }
@@ -413,10 +470,7 @@ impl SymbolIndex {
     ) -> Result<(), SliceError> {
         let data = crate::go_skeleton::index_go_ast(file_path, content)?;
         for sym in data.symbols {
-            self.symbols_map
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym);
+            self.record_symbol(sym);
         }
         for contract in data.contracts {
             self.contracts_map
@@ -460,10 +514,7 @@ impl SymbolIndex {
         }
 
         for sym in visitor.symbols {
-            self.symbols_map
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym);
+            self.record_symbol(sym);
         }
 
         for route in visitor.routes {
@@ -502,59 +553,47 @@ impl SymbolIndex {
                 oxc_ast::ast::Statement::TSInterfaceDeclaration(decl) => {
                     let name = decl.id.name.to_string();
                     let line = get_line(decl.span.start);
-                    self.symbols_map
-                        .entry(name.clone())
-                        .or_default()
-                        .push(SymbolDef {
-                            name,
-                            kind: "interface".to_string(),
-                            file: file_path.to_string(),
-                            line,
-                            language: "typescript".to_string(),
-                        });
+                    self.record_symbol(SymbolDef {
+                        name,
+                        kind: "interface".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
                 }
                 oxc_ast::ast::Statement::TSTypeAliasDeclaration(decl) => {
                     let name = decl.id.name.to_string();
                     let line = get_line(decl.span.start);
-                    self.symbols_map
-                        .entry(name.clone())
-                        .or_default()
-                        .push(SymbolDef {
-                            name,
-                            kind: "type".to_string(),
-                            file: file_path.to_string(),
-                            line,
-                            language: "typescript".to_string(),
-                        });
+                    self.record_symbol(SymbolDef {
+                        name,
+                        kind: "type".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
                 }
                 oxc_ast::ast::Statement::TSEnumDeclaration(decl) => {
                     let name = decl.id.name.to_string();
                     let line = get_line(decl.span.start);
-                    self.symbols_map
-                        .entry(name.clone())
-                        .or_default()
-                        .push(SymbolDef {
-                            name,
-                            kind: "enum".to_string(),
-                            file: file_path.to_string(),
-                            line,
-                            language: "typescript".to_string(),
-                        });
+                    self.record_symbol(SymbolDef {
+                        name,
+                        kind: "enum".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
                 }
                 oxc_ast::ast::Statement::FunctionDeclaration(func) => {
                     if let Some(ref id) = func.id {
                         let name = id.name.to_string();
                         let line = get_line(func.span.start);
-                        self.symbols_map
-                            .entry(name.clone())
-                            .or_default()
-                            .push(SymbolDef {
-                                name,
-                                kind: "fn".to_string(),
-                                file: file_path.to_string(),
-                                line,
-                                language: "typescript".to_string(),
-                            });
+                        self.record_symbol(SymbolDef {
+                            name,
+                            kind: "fn".to_string(),
+                            file: file_path.to_string(),
+                            line,
+                            language: "typescript".to_string(),
+                        });
                     }
                 }
                 _ => {}
@@ -575,59 +614,47 @@ impl SymbolIndex {
             oxc_ast::ast::Declaration::TSInterfaceDeclaration(d) => {
                 let name = d.id.name.to_string();
                 let line = get_line(d.span.start);
-                self.symbols_map
-                    .entry(name.clone())
-                    .or_default()
-                    .push(SymbolDef {
-                        name,
-                        kind: "interface".to_string(),
-                        file: file_path.to_string(),
-                        line,
-                        language: "typescript".to_string(),
-                    });
+                self.record_symbol(SymbolDef {
+                    name,
+                    kind: "interface".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                    language: "typescript".to_string(),
+                });
             }
             oxc_ast::ast::Declaration::TSTypeAliasDeclaration(d) => {
                 let name = d.id.name.to_string();
                 let line = get_line(d.span.start);
-                self.symbols_map
-                    .entry(name.clone())
-                    .or_default()
-                    .push(SymbolDef {
-                        name,
-                        kind: "type".to_string(),
-                        file: file_path.to_string(),
-                        line,
-                        language: "typescript".to_string(),
-                    });
+                self.record_symbol(SymbolDef {
+                    name,
+                    kind: "type".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                    language: "typescript".to_string(),
+                });
             }
             oxc_ast::ast::Declaration::TSEnumDeclaration(d) => {
                 let name = d.id.name.to_string();
                 let line = get_line(d.span.start);
-                self.symbols_map
-                    .entry(name.clone())
-                    .or_default()
-                    .push(SymbolDef {
-                        name,
-                        kind: "enum".to_string(),
-                        file: file_path.to_string(),
-                        line,
-                        language: "typescript".to_string(),
-                    });
+                self.record_symbol(SymbolDef {
+                    name,
+                    kind: "enum".to_string(),
+                    file: file_path.to_string(),
+                    line,
+                    language: "typescript".to_string(),
+                });
             }
             oxc_ast::ast::Declaration::FunctionDeclaration(func) => {
                 if let Some(ref id) = func.id {
                     let name = id.name.to_string();
                     let line = get_line(func.span.start);
-                    self.symbols_map
-                        .entry(name.clone())
-                        .or_default()
-                        .push(SymbolDef {
-                            name,
-                            kind: "fn".to_string(),
-                            file: file_path.to_string(),
-                            line,
-                            language: "typescript".to_string(),
-                        });
+                    self.record_symbol(SymbolDef {
+                        name,
+                        kind: "fn".to_string(),
+                        file: file_path.to_string(),
+                        line,
+                        language: "typescript".to_string(),
+                    });
                 }
             }
             _ => {}
@@ -646,13 +673,13 @@ impl SymbolIndex {
                 let route = cap.get(1).map(|c| c.as_str()).unwrap_or("");
                 let line = get_line(m.start() as u32);
                 let caller = find_enclosing_fn(content, m.start());
-                self.routes.push(RouteBinding {
-                    route_path: route.to_string(),
-                    handler_or_caller: caller,
-                    file: file_path.to_string(),
+                self.routes.push(RouteBinding::new(
+                    route.to_string(),
+                    caller,
+                    file_path.to_string(),
                     line,
-                    is_backend: false,
-                });
+                    false,
+                ));
             }
         }
     }
@@ -699,15 +726,13 @@ impl SymbolIndex {
         let trimmed_lower = sym_trimmed.to_lowercase();
 
         for r in &self.routes {
-            let r_lower = r.route_path.to_lowercase();
-            let handler_lower = r.handler_or_caller.to_lowercase();
-            let matched = r_lower.contains(&sym_lower)
-                || handler_lower.contains(&sym_lower)
-                || handler_lower.contains(&trimmed_lower)
-                || (!trimmed_lower.is_empty() && r_lower.contains(&trimmed_lower))
+            let matched = r.route_path_lower.contains(&sym_lower)
+                || r.handler_lower.contains(&sym_lower)
+                || r.handler_lower.contains(&trimmed_lower)
+                || (!trimmed_lower.is_empty() && r.route_path_lower.contains(&trimmed_lower))
                 || (trimmed_lower.len() >= 4
-                    && (r_lower.contains(&trimmed_lower[..4])
-                        || handler_lower.contains(&trimmed_lower[..4])));
+                    && (r.route_path_lower.contains(&trimmed_lower[..4])
+                        || r.handler_lower.contains(&trimmed_lower[..4])));
             if matched {
                 if r.is_backend && r.file.ends_with(".go") {
                     call_sites.push(format!(
@@ -1028,26 +1053,26 @@ impl<'a> Visit<'_> for IndexVisitor<'a> {
         for attr in &node.attrs {
             let attr_str = attr.to_token_stream().to_string();
             if attr_str.contains("tauri :: command") || attr_str.contains("tauri::command") {
-                self.routes.push(RouteBinding {
-                    route_path: name.clone(),
-                    handler_or_caller: name.clone(),
-                    file: self.file_path.to_string(),
+                self.routes.push(RouteBinding::new(
+                    name.clone(),
+                    name.clone(),
+                    self.file_path.to_string(),
                     line,
-                    is_backend: true,
-                });
+                    true,
+                ));
             } else if attr_str.contains("get")
                 || attr_str.contains("post")
                 || attr_str.contains("put")
                 || attr_str.contains("delete")
             {
                 let route_path = extract_string_literal(&attr_str).unwrap_or_else(|| name.clone());
-                self.routes.push(RouteBinding {
+                self.routes.push(RouteBinding::new(
                     route_path,
-                    handler_or_caller: name.clone(),
-                    file: self.file_path.to_string(),
+                    name.clone(),
+                    self.file_path.to_string(),
                     line,
-                    is_backend: true,
-                });
+                    true,
+                ));
             }
         }
 
@@ -1553,5 +1578,12 @@ mod tests {
                 .get_callers_with_fallback(Some(&base_idx), "overlay_handler", 1)
                 .is_empty()
         );
+
+        // Verify file_to_symbols mapping
+        let file_key = file_path.to_string_lossy().to_string();
+        assert!(overlay_idx.file_to_symbols.contains_key(&file_key));
+        let syms = &overlay_idx.file_to_symbols[&file_key];
+        assert!(syms.contains(&"NewStruct".to_string()));
+        assert!(syms.contains(&"ServiceConfig".to_string()));
     }
 }

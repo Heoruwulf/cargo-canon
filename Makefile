@@ -1,4 +1,4 @@
-.PHONY: help all check build build-debug test sim sim-replay diff-fuzz verify miri bench bench-compare qa fmt fmt-check clippy deny machete audit loc clean
+.PHONY: help all check build build-debug build-profile test sim sim-replay diff-fuzz verify miri bench bench-compare qa fmt fmt-check clippy deny machete audit loc clean
 
 SEED ?= 0xDEADBEEF
 ITERATIONS ?= 50000
@@ -10,6 +10,7 @@ help:
 	@echo "  check         - fast workspace compile check"
 	@echo "  build         - optimized release binaries"
 	@echo "  build-debug   - unoptimized debug binaries"
+	@echo "  build-profile - optimized release binaries with frame pointers for profiling"
 	@echo "  test          - unit & integration tests"
 	@echo "  sim           - deterministic simulation passes (5000 seeds)"
 	@echo "  sim-replay    - replay a single simulation seed (e.g. make sim-replay SEED=0xDEADBEEF)"
@@ -36,6 +37,9 @@ check:
 
 build:
 	cargo build --release --workspace
+
+build-profile:
+	RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --workspace
 
 build-debug:
 	cargo build --workspace

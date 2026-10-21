@@ -151,13 +151,19 @@ fn resolve_cross_boundary(
         .or_else(|| idx.get_cross_boundary_impact(target_name))
         .or_else(|| {
             let file_str = target_path.to_string_lossy();
-            for (sym_name, defs) in &idx.symbols_map {
-                if defs
-                    .iter()
-                    .any(|d| d.file == file_str || target_path.ends_with(&d.file))
-                {
+            if let Some(sym_names) = idx.file_to_symbols.get(file_str.as_ref()) {
+                for sym_name in sym_names {
                     if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
                         return Some(cb);
+                    }
+                }
+            }
+            for (indexed_file, sym_names) in &idx.file_to_symbols {
+                if file_str.ends_with(indexed_file) || indexed_file.ends_with(file_str.as_ref()) {
+                    for sym_name in sym_names {
+                        if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+                            return Some(cb);
+                        }
                     }
                 }
             }

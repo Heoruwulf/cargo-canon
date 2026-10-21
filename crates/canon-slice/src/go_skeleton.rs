@@ -404,13 +404,13 @@ fn extract_go_routes(file_path: &str, content: &str) -> Vec<RouteBinding> {
             let handler = handler_match.as_str().to_string();
             let line = get_line_number(content, m.start());
 
-            routes.push(RouteBinding {
+            routes.push(RouteBinding::new(
                 route_path,
-                handler_or_caller: handler,
-                file: file_path.to_string(),
+                handler,
+                file_path.to_string(),
                 line,
-                is_backend: true,
-            });
+                true,
+            ));
         }
     }
     routes
