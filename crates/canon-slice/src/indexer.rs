@@ -148,6 +148,78 @@ impl SymbolIndex {
         }
     }
 
+    /// Estimates in-memory heap consumption of the symbol tables, call edges,
+    /// contracts, and route indices in Megabytes.
+    pub fn estimate_memory_mb(&self) -> f64 {
+        let mut bytes = std::mem::size_of::<Self>();
+
+        for (caller, edges) in &self.callers_map {
+            bytes += caller.len() + 32;
+            bytes += edges.capacity() * std::mem::size_of::<CallEdge>();
+            for edge in edges {
+                bytes += edge.caller.len() + edge.callee.len() + edge.file.len();
+            }
+        }
+        for (callee, edges) in &self.callees_map {
+            bytes += callee.len() + 32;
+            bytes += edges.capacity() * std::mem::size_of::<CallEdge>();
+            for edge in edges {
+                bytes += edge.caller.len() + edge.callee.len() + edge.file.len();
+            }
+        }
+        for (target, contracts) in &self.contracts_map {
+            bytes += target.len() + 32;
+            bytes += contracts.capacity() * std::mem::size_of::<ContractInfo>();
+            for c in contracts {
+                bytes += c.trait_name.len() + c.target_type.len() + c.file.len();
+                for m in &c.methods {
+                    bytes += m.len() + std::mem::size_of::<String>();
+                }
+            }
+        }
+        for (name, defs) in &self.symbols_map {
+            bytes += name.len() + 32;
+            bytes += defs.capacity() * std::mem::size_of::<SymbolDef>();
+            for d in defs {
+                bytes += d.name.len() + d.kind.len() + d.file.len() + d.language.len();
+            }
+        }
+        bytes += self.routes.capacity() * std::mem::size_of::<RouteBinding>();
+        for r in &self.routes {
+            bytes += r.route_path.len() + r.handler_or_caller.len() + r.file.len();
+        }
+
+        bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Creates an overlay index containing only symbols from the specified modified files.
+    pub fn create_overlay(&self, modified_files: &[PathBuf]) -> SymbolIndex {
+        if modified_files.len() <= 1 {
+            let mut overlay = SymbolIndex::new();
+            for path in modified_files {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    let path_str = path.to_string_lossy().to_string();
+                    let _ = overlay.index_any_source_str(&path_str, &content);
+                }
+            }
+            overlay
+        } else {
+            modified_files
+                .par_iter()
+                .fold(SymbolIndex::new, |mut acc, path| {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        let path_str = path.to_string_lossy().to_string();
+                        let _ = acc.index_any_source_str(&path_str, &content);
+                    }
+                    acc
+                })
+                .reduce(SymbolIndex::new, |mut a, b| {
+                    a.merge(b);
+                    a
+                })
+        }
+    }
+
     /// Merges another SymbolIndex into this one in-place.
     pub fn merge(&mut self, other: SymbolIndex) {
         for (k, v) in other.callers_map {
@@ -165,11 +237,55 @@ impl SymbolIndex {
         self.routes.extend(other.routes);
     }
 
-    /// Discovers candidate source files filtering ignored directories.
+    /// Discovers candidate source files filtering ignored directories and nested worktrees.
     pub fn collect_source_files(&self, root: &Path) -> Vec<PathBuf> {
+        let cfg = canon_core::config::CanonConfig::discover_for_workspace(root);
+        let mut ignored = cfg.slice.custom_ignored_dirs;
+        ignored.extend(cfg.daemon.ignored_dirs);
+        self.collect_source_files_with_options(root, &ignored, cfg.daemon.worktrees_dir.as_deref())
+    }
+
+    /// Discovers candidate source files with explicit ignored directories and worktrees directory.
+    pub fn collect_source_files_with_options(
+        &self,
+        root: &Path,
+        ignored_dirs: &[String],
+        worktrees_dir: Option<&str>,
+    ) -> Vec<PathBuf> {
         WalkDir::new(root)
             .into_iter()
-            .filter_entry(|e| !is_ignored_path(e.path()))
+            .filter_entry(|e| {
+                let p = e.path();
+                if e.depth() == 0 || p == root {
+                    return true;
+                }
+                if is_ignored_path(p) {
+                    return false;
+                }
+                if e.file_type().is_dir() {
+                    // Prune nested worktree directories (d != root containing a .git file or directory)
+                    if p.join(".git").exists() {
+                        return false;
+                    }
+                    if let Ok(rel) = p.strip_prefix(root) {
+                        if ignored_dirs.iter().any(|d| {
+                            p.file_name().and_then(|n| n.to_str()) == Some(d)
+                                || rel == Path::new(d)
+                                || rel.starts_with(d)
+                        }) {
+                            return false;
+                        }
+                    }
+                    if let Some(wt) = worktrees_dir {
+                        if let Ok(rel) = p.strip_prefix(root) {
+                            if rel == Path::new(wt) || rel.starts_with(wt) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            })
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .filter(|e| {
@@ -713,6 +829,81 @@ impl SymbolIndex {
         implementors.dedup();
         implementors
     }
+
+    /// Retrieves upstream callers of a symbol, falling back to base index if absent in self.
+    pub fn get_callers_with_fallback(
+        &self,
+        base: Option<&SymbolIndex>,
+        symbol: &str,
+        depth: usize,
+    ) -> Vec<CallEdge> {
+        let callers = self.get_callers(symbol, depth);
+        if !callers.is_empty() {
+            callers
+        } else if let Some(base_idx) = base {
+            base_idx.get_callers(symbol, depth)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Retrieves downstream callees called by a symbol, falling back to base index if absent in self.
+    pub fn get_callees_with_fallback(
+        &self,
+        base: Option<&SymbolIndex>,
+        symbol: &str,
+        depth: usize,
+    ) -> Vec<CallEdge> {
+        let callees = self.get_callees(symbol, depth);
+        if !callees.is_empty() {
+            callees
+        } else if let Some(base_idx) = base {
+            base_idx.get_callees(symbol, depth)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Retrieves trait contracts associated with a target type, falling back to base index if absent in self.
+    pub fn get_contracts_with_fallback(
+        &self,
+        base: Option<&SymbolIndex>,
+        target_type: &str,
+    ) -> Vec<ContractInfo> {
+        let contracts = self.get_contracts(target_type);
+        if !contracts.is_empty() {
+            contracts
+        } else if let Some(base_idx) = base {
+            base_idx.get_contracts(target_type)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Computes cross-boundary impact correlating Rust/Go backend with TypeScript frontend,
+    /// falling back to base index if absent in self.
+    pub fn get_cross_boundary_impact_with_fallback(
+        &self,
+        base: Option<&SymbolIndex>,
+        symbol: &str,
+    ) -> Option<CrossBoundaryImpact> {
+        self.get_cross_boundary_impact(symbol)
+            .or_else(|| base.and_then(|b| b.get_cross_boundary_impact(symbol)))
+    }
+
+    /// Looks up symbol definitions, falling back to base index if absent in self.
+    pub fn get_symbol_fallback<'a>(
+        &'a self,
+        base: Option<&'a SymbolIndex>,
+        symbol: &str,
+    ) -> Option<&'a [SymbolDef]> {
+        if let Some(defs) = self.symbols_map.get(symbol) {
+            if !defs.is_empty() {
+                return Some(defs.as_slice());
+            }
+        }
+        base.and_then(|b| b.symbols_map.get(symbol).map(|v| v.as_slice()))
+    }
 }
 
 /// Returns true if any path segment corresponds to a known dependency,
@@ -740,6 +931,7 @@ pub fn is_ignored_path(path: &Path) -> bool {
                         | "coverage"
                         | ".idea"
                         | ".vscode"
+                        | ".worktrees"
                 ) {
                     return true;
                 }
@@ -1116,6 +1308,7 @@ mod tests {
         assert!(is_ignored_path(Path::new("coverage/lcov.info")));
         assert!(is_ignored_path(Path::new(".idea/workspace.xml")));
         assert!(is_ignored_path(Path::new(".vscode/settings.json")));
+        assert!(is_ignored_path(Path::new(".worktrees/feat1/src/lib.rs")));
 
         // Ignored nested subdirectories and absolute paths
         assert!(is_ignored_path(Path::new(
@@ -1245,5 +1438,120 @@ mod tests {
 
         assert!(!par_idx.symbols_map.contains_key("generated"));
         assert!(!seq_idx.symbols_map.contains_key("generated"));
+    }
+
+    #[test]
+    fn test_estimate_memory_mb() {
+        let empty_idx = SymbolIndex::new();
+        assert!(empty_idx.estimate_memory_mb() > 0.0);
+
+        let mut populated_idx = SymbolIndex::new();
+        let rust_code = r#"
+            pub struct Engine { pub id: u64 }
+            pub trait Runner { fn run(&self); }
+            impl Runner for Engine { fn run(&self) {} }
+            pub fn start() { let e = Engine { id: 1 }; e.run(); }
+        "#;
+        populated_idx
+            .index_any_source_str("src/engine.rs", rust_code)
+            .unwrap();
+
+        assert!(populated_idx.estimate_memory_mb() > empty_idx.estimate_memory_mb());
+    }
+
+    #[test]
+    fn test_nested_worktree_auto_pruning() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("main.rs"), "pub fn main() {}").unwrap();
+
+        // Subdirectory representing a nested worktree with a .git file
+        let wt_dir = root.join("worktree_a");
+        std::fs::create_dir_all(wt_dir.join("src")).unwrap();
+        std::fs::write(wt_dir.join(".git"), "gitdir: /path/to/commondir").unwrap();
+        std::fs::write(wt_dir.join("src").join("sub.rs"), "pub fn sub() {}").unwrap();
+
+        // Subdirectory matching worktrees_dir
+        let custom_wt = root.join(".claude").join("worktrees").join("feat1");
+        std::fs::create_dir_all(custom_wt.join("src")).unwrap();
+        std::fs::write(custom_wt.join(".git"), "gitdir: /another/path").unwrap();
+        std::fs::write(custom_wt.join("src").join("feature.rs"), "pub fn feat() {}").unwrap();
+
+        // Custom ignored directory
+        let ign_dir = root.join("ignored_folder").join("src");
+        std::fs::create_dir_all(&ign_dir).unwrap();
+        std::fs::write(ign_dir.join("ign.rs"), "pub fn ign() {}").unwrap();
+
+        let idx = SymbolIndex::new();
+        let files = idx.collect_source_files_with_options(
+            root,
+            &["ignored_folder".to_string()],
+            Some(".claude/worktrees"),
+        );
+
+        // Only main.rs must be collected
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], src_dir.join("main.rs"));
+
+        // Default collect_source_files also prunes nested .git directories/files
+        let default_files = idx.collect_source_files(root);
+        assert!(!default_files.iter().any(|p| p.ends_with("sub.rs")));
+        assert!(!default_files.iter().any(|p| p.ends_with("feature.rs")));
+    }
+
+    #[test]
+    fn test_create_overlay_and_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("service.rs");
+
+        std::fs::write(
+            &file_path,
+            "pub fn handle() { base_handler(); }\npub struct ServiceConfig { pub port: u16, }",
+        )
+        .unwrap();
+
+        let mut base_idx = SymbolIndex::new();
+        base_idx
+            .index_source_str(
+                &file_path.to_string_lossy(),
+                &std::fs::read_to_string(&file_path).unwrap(),
+            )
+            .unwrap();
+
+        // Modify file on disk with new symbol definition and callers
+        std::fs::write(
+            &file_path,
+            "pub fn handle() { overlay_handler(); }\npub struct ServiceConfig { pub port: u32, }\npub struct NewStruct;",
+        )
+        .unwrap();
+
+        let overlay_idx = base_idx.create_overlay(std::slice::from_ref(&file_path));
+
+        // Overlay index overrides base symbols
+        let defs = overlay_idx
+            .get_symbol_fallback(Some(&base_idx), "ServiceConfig")
+            .expect("ServiceConfig must be found");
+        assert_eq!(defs.len(), 1);
+
+        // Overlay has NewStruct which base does not
+        assert!(overlay_idx.symbols_map.contains_key("NewStruct"));
+        assert!(!base_idx.symbols_map.contains_key("NewStruct"));
+
+        // Non-existent symbol returns None
+        assert!(
+            overlay_idx
+                .get_symbol_fallback(Some(&base_idx), "NonExistent")
+                .is_none()
+        );
+
+        // Callers lookup with fallback
+        assert!(
+            !overlay_idx
+                .get_callers_with_fallback(Some(&base_idx), "overlay_handler", 1)
+                .is_empty()
+        );
     }
 }

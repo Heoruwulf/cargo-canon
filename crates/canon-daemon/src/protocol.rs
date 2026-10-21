@@ -32,6 +32,27 @@ pub enum DaemonRequest {
     Shutdown,
 }
 
+/// Summary telemetry for a single registered workspace in the multi-tenant daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceSummary {
+    /// Canonical workspace root directory.
+    pub root: PathBuf,
+    /// Indicates whether this workspace is a Git worktree.
+    pub is_worktree: bool,
+    /// Parent repository root if this workspace is a worktree.
+    pub parent_repo: Option<PathBuf>,
+    /// Number of distinct source files indexed.
+    pub indexed_files: usize,
+    /// Total number of symbols declared in index.
+    pub total_symbols: usize,
+    /// Estimated in-memory index size in Megabytes.
+    pub memory_mb: f64,
+    /// Absolute path to this workspace's dedicated log file.
+    pub log_path: PathBuf,
+    /// Seconds elapsed since last activity or query.
+    pub last_accessed_secs_ago: u64,
+}
+
 /// Detailed runtime statistics and index telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonStatusInfo {
@@ -41,19 +62,39 @@ pub struct DaemonStatusInfo {
     pub uptime_secs: u64,
     /// Bound socket path.
     pub socket_path: PathBuf,
-    /// Monitored workspace root directory.
+    /// Absolute path to the active timestamped daemon log file.
+    #[serde(default)]
+    pub main_log_path: PathBuf,
+    /// Total process resident memory consumption in Megabytes.
+    #[serde(default)]
+    pub memory_rss_mb: f64,
+    /// Number of active registered workspaces.
+    #[serde(default)]
+    pub active_workspaces_count: usize,
+    /// Summary breakdown of each registered workspace.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceSummary>,
+
+    /// Monitored workspace root directory (legacy/fallback).
+    #[serde(default)]
     pub workspace_root: PathBuf,
     /// Number of distinct source files currently indexed in memory.
+    #[serde(default)]
     pub indexed_files: usize,
     /// Total number of symbols declared in index.
+    #[serde(default)]
     pub total_symbols: usize,
     /// Total number of call-graph edges indexed.
+    #[serde(default)]
     pub total_call_edges: usize,
     /// Total number of trait/interface contract implementations recorded.
+    #[serde(default)]
     pub total_contracts: usize,
     /// Total number of HTTP routes and client bindings recorded.
+    #[serde(default)]
     pub total_routes: usize,
     /// Indicates whether the background file watcher is active.
+    #[serde(default)]
     pub watcher_active: bool,
 
     // --- Context Bloat Reduction Telemetry ---
@@ -173,6 +214,19 @@ mod tests {
             pid: 12345,
             uptime_secs: 42,
             socket_path: PathBuf::from("/tmp/canon-test.sock"),
+            main_log_path: PathBuf::from("/tmp/logs/daemon-20261020-120000.log"),
+            memory_rss_mb: 48.5,
+            active_workspaces_count: 1,
+            workspaces: vec![WorkspaceSummary {
+                root: PathBuf::from("/home/user/project"),
+                is_worktree: false,
+                parent_repo: None,
+                indexed_files: 10,
+                total_symbols: 100,
+                memory_mb: 12.3,
+                log_path: PathBuf::from("/tmp/logs/workspaces/project-abc123.log"),
+                last_accessed_secs_ago: 5,
+            }],
             workspace_root: PathBuf::from("/home/user/project"),
             indexed_files: 10,
             total_symbols: 100,
@@ -217,6 +271,10 @@ mod tests {
 
         let decoded: DaemonStatusInfo = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(decoded.pid, 12345);
+        assert_eq!(decoded.main_log_path, PathBuf::new());
+        assert_eq!(decoded.memory_rss_mb, 0.0);
+        assert_eq!(decoded.active_workspaces_count, 0);
+        assert!(decoded.workspaces.is_empty());
         assert_eq!(decoded.hooks_served, 0);
         assert_eq!(decoded.raw_bytes_served, 0);
         assert_eq!(decoded.delivered_bytes_served, 0);

@@ -9,17 +9,23 @@
 
 pub mod error;
 pub mod hook;
+pub mod logging;
 pub mod protocol;
+pub mod registry;
 pub mod server;
 pub mod watcher;
 
 pub use error::DaemonError;
-pub use hook::execute_post_read_hook;
-pub use protocol::{DaemonRequest, DaemonResponse, DaemonStatusInfo, read_message, write_message};
+pub use hook::{execute_post_read_hook, execute_post_read_hook_with_overlay};
+pub use logging::{DaemonLogManager, WorkspaceLogger};
+pub use protocol::{
+    DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
+};
+pub use registry::{WorkspaceEntry, WorkspaceRegistry};
 pub use server::{
     ServerOptions, ServerTelemetry, SocketGuard, run_server, run_server_with_options,
 };
-pub use watcher::start_watcher;
+pub use watcher::{DynamicWatcherManager, start_watcher};
 
 use std::path::Path;
 use tokio::net::UnixStream;
@@ -103,6 +109,8 @@ mod tests {
                 socket_path: s_path,
                 workspace_root: PathBuf::from("/test/root"),
                 watcher_active: true,
+                log_dir: None,
+                idle_ttl_secs: 7200,
             };
             let _ = run_server_with_options(opts, index, s_token).await;
         });
@@ -178,5 +186,79 @@ mod tests {
 
         let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_tenant_server_lazy_indexing_and_status() {
+        let sock_tmp = NamedTempFile::new().unwrap();
+        let socket_path = sock_tmp.path().to_path_buf();
+        drop(sock_tmp);
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo_dir.path().join(".git")).unwrap();
+        let src_dir = repo_dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let test_file = src_dir.join("lib.rs");
+        std::fs::write(&test_file, "pub struct Engine; pub fn start() {}").unwrap();
+
+        let index = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token = CancellationToken::new();
+
+        let s_path = socket_path.clone();
+        let s_token = token.clone();
+        let log_path = log_dir.path().to_path_buf();
+        let server_handle = tokio::spawn(async move {
+            let opts = ServerOptions {
+                socket_path: s_path,
+                workspace_root: PathBuf::new(),
+                watcher_active: true,
+                log_dir: Some(log_path),
+                idle_ttl_secs: 7200,
+            };
+            let _ = run_server_with_options(opts, index, s_token).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let hook_resp = send_daemon_request(
+            &socket_path,
+            DaemonRequest::PostReadHook {
+                file: test_file.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match hook_resp {
+            DaemonResponse::AdvisoryContext { advisory_block, .. } => {
+                assert!(advisory_block.contains("pub struct Engine"));
+            }
+            _ => panic!("Expected AdvisoryContext response"),
+        }
+
+        let status_resp = send_daemon_request(&socket_path, DaemonRequest::Status)
+            .await
+            .unwrap();
+
+        match status_resp {
+            DaemonResponse::Status(status) => {
+                assert_eq!(status.pid, std::process::id());
+                assert!(status.memory_rss_mb >= 0.0);
+                assert_eq!(status.active_workspaces_count, 1);
+                assert_eq!(status.workspaces.len(), 1);
+                assert_eq!(
+                    status.workspaces[0].root,
+                    std::fs::canonicalize(repo_dir.path()).unwrap()
+                );
+                assert!(status.workspaces[0].memory_mb > 0.0);
+                assert!(status.workspaces[0].log_path.exists());
+                assert_eq!(status.hooks_served, 1);
+            }
+            _ => panic!("Expected DaemonResponse::Status"),
+        }
+
+        let _ = send_daemon_request(&socket_path, DaemonRequest::Shutdown).await;
+        let _ = server_handle.await;
     }
 }

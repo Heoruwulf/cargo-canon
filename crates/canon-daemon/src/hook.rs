@@ -2,7 +2,7 @@
 
 use crate::error::DaemonError;
 use canon_core::model::SliceMode;
-use canon_slice::{SymbolIndex, slice_target};
+use canon_slice::{SymbolIndex, slice_target_with_overlay};
 use std::path::Path;
 
 /// Executes non-destructive post-read advisory context injection.
@@ -12,6 +12,19 @@ use std::path::Path;
 pub fn execute_post_read_hook(
     file_path: &Path,
     index: Option<&SymbolIndex>,
+) -> Result<String, DaemonError> {
+    execute_post_read_hook_with_overlay(file_path, index, None)
+}
+
+/// Executes non-destructive post-read advisory context injection, querying an optional overlay
+/// index before falling through to the base index.
+///
+/// CRITICAL INVARIANT: The target file on disk is guaranteed strictly byte-identical
+/// before and after this function executes. Injected context is emitted strictly out-of-band.
+pub fn execute_post_read_hook_with_overlay(
+    file_path: &Path,
+    base_index: Option<&SymbolIndex>,
+    overlay_index: Option<&SymbolIndex>,
 ) -> Result<String, DaemonError> {
     if !file_path.is_file() {
         return Err(DaemonError::Watcher(format!(
@@ -23,8 +36,9 @@ pub fn execute_post_read_hook(
     // Read original bytes to ensure byte-identity invariant
     let original_bytes = std::fs::read(file_path).map_err(DaemonError::Io)?;
 
-    // Slice out-of-band
-    let bundle = slice_target(file_path, SliceMode::Bundle, index)?;
+    // Slice out-of-band with optional overlay
+    let bundle =
+        slice_target_with_overlay(file_path, SliceMode::Bundle, base_index, overlay_index)?;
     let advisory_block = bundle.format_markdown();
 
     // Verify invariant: file bytes on disk remain completely unmodified

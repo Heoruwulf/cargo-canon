@@ -9,10 +9,12 @@ use canon_core::config::CanonConfig;
 use canon_core::diagnostics::{error, info_banner, success};
 use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
-use canon_core::workspace::{resolve_active_socket, resolve_workspace_root};
+use canon_core::workspace::{
+    resolve_active_socket, resolve_connected_socket, resolve_global_socket, resolve_workspace_root,
+};
 use canon_daemon::{
     DaemonRequest, DaemonResponse, DaemonStatusInfo, ServerOptions, execute_post_read_hook,
-    run_server_with_options, send_daemon_request, start_watcher,
+    run_server_with_options, send_daemon_request,
 };
 use canon_harness::{
     DiffFuzzOptions, InvariantOptions, SimulateOptions, VerifyOptions, run_diff_fuzz,
@@ -315,6 +317,10 @@ pub struct DaemonArgs {
     /// Start daemon IPC server in foreground
     #[arg(long, help_heading = "Daemon Lifecycle")]
     pub start: bool,
+
+    /// Run as legacy isolated per-workspace daemon instead of system-wide daemon
+    #[arg(long, help_heading = "Daemon Lifecycle")]
+    pub isolated: bool,
 
     /// Probe running daemon liveness and report round-trip latency
     #[arg(long, help_heading = "Daemon Lifecycle")]
@@ -802,20 +808,44 @@ async fn handle_daemon(
     let socket_override = args.socket.as_deref().or(cfg.daemon.socket_path.as_deref());
 
     if args.ping {
-        let root = resolve_workspace_root(&current_dir);
-        let socket_path = resolve_active_socket(socket_override, &root);
+        let socket_path = if args.isolated {
+            let root = resolve_workspace_root(&current_dir);
+            resolve_active_socket(socket_override, &root)
+        } else {
+            resolve_connected_socket(socket_override, &current_dir).unwrap_or_else(|| {
+                socket_override
+                    .map(PathBuf::from)
+                    .unwrap_or_else(resolve_global_socket)
+            })
+        };
         return handle_daemon_ping(&socket_path).await;
     }
 
     if args.status {
-        let root = resolve_workspace_root(&current_dir);
-        let socket_path = resolve_active_socket(socket_override, &root);
+        let socket_path = if args.isolated {
+            let root = resolve_workspace_root(&current_dir);
+            resolve_active_socket(socket_override, &root)
+        } else {
+            resolve_connected_socket(socket_override, &current_dir).unwrap_or_else(|| {
+                socket_override
+                    .map(PathBuf::from)
+                    .unwrap_or_else(resolve_global_socket)
+            })
+        };
         return handle_daemon_status(&socket_path, json_output).await;
     }
 
     if args.stop {
-        let root = resolve_workspace_root(&current_dir);
-        let socket_path = resolve_active_socket(socket_override, &root);
+        let socket_path = if args.isolated {
+            let root = resolve_workspace_root(&current_dir);
+            resolve_active_socket(socket_override, &root)
+        } else {
+            resolve_connected_socket(socket_override, &current_dir).unwrap_or_else(|| {
+                socket_override
+                    .map(PathBuf::from)
+                    .unwrap_or_else(resolve_global_socket)
+            })
+        };
         return handle_daemon_stop(&socket_path).await;
     }
 
@@ -823,8 +853,19 @@ async fn handle_daemon(
         return handle_daemon_hook_post_read(args.file, socket_override, &current_dir).await;
     }
 
-    let root = resolve_workspace_root(&current_dir);
-    let socket_path = resolve_active_socket(socket_override, &root);
+    let is_isolated = args.isolated || !cfg.daemon.system_daemon;
+    let (socket_path, root) = if is_isolated {
+        let root = resolve_workspace_root(&current_dir);
+        let socket_path = resolve_active_socket(socket_override, &root);
+        (socket_path, root)
+    } else {
+        let socket_path = socket_override
+            .map(PathBuf::from)
+            .unwrap_or_else(resolve_global_socket);
+        let root = resolve_workspace_root(&current_dir);
+        (socket_path, root)
+    };
+
     handle_daemon_start(&socket_path, &root, cfg).await
 }
 
@@ -940,12 +981,29 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_time_ago(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
 fn print_daemon_status_table(status: &DaemonStatusInfo) {
     println!("Canon Daemon Status: Active");
     println!("PID:            {}", status.pid);
     println!("Uptime:         {}", format_uptime(status.uptime_secs));
     println!("Socket Path:    {}", status.socket_path.display());
-    println!("Workspace Root: {}", status.workspace_root.display());
+    if !status.main_log_path.as_os_str().is_empty() {
+        println!("Main Daemon Log: {}", status.main_log_path.display());
+    }
+    println!("Memory RSS:     {:.1} MB", status.memory_rss_mb);
+    println!("Active Workspaces: {}", status.active_workspaces_count);
+    if !status.workspace_root.as_os_str().is_empty() {
+        println!("Workspace Root: {}", status.workspace_root.display());
+    }
     println!(
         "Indexed Files:  {} files",
         format_with_commas(status.indexed_files)
@@ -972,6 +1030,46 @@ fn print_daemon_status_table(status: &DaemonStatusInfo) {
         "Inactive"
     };
     println!("File Watcher:   {}", watcher_str);
+
+    if !status.workspaces.is_empty() {
+        println!("\nActive Workspace Registry:");
+        println!(
+            "  {:<32} {:<6} {:>8} {:>10} {:>10}  {:<32} {:>8}",
+            "WORKSPACE", "TYPE", "FILES", "SYMBOLS", "MEMORY", "LOG FILE", "ACCESSED"
+        );
+        println!("  {}", "-".repeat(112));
+        for ws in &status.workspaces {
+            let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
+            let root_str = ws.root.display().to_string();
+            let root_trunc = if root_str.len() > 32 {
+                format!("...{}", &root_str[root_str.len() - 29..])
+            } else {
+                root_str
+            };
+            let log_str = ws
+                .log_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("");
+            let log_trunc = if log_str.len() > 32 {
+                format!("...{}", &log_str[log_str.len() - 29..])
+            } else {
+                log_str.to_string()
+            };
+            let accessed_str = format_time_ago(ws.last_accessed_secs_ago);
+            println!(
+                "  {:<32} {:<6} {:>8} {:>10} {:>8.1} MB  {:<32} {:>8}",
+                root_trunc,
+                ws_type,
+                format_with_commas(ws.indexed_files),
+                format_with_commas(ws.total_symbols),
+                ws.memory_mb,
+                log_trunc,
+                accessed_str
+            );
+        }
+        println!();
+    }
 
     // --- Context Bloat Section ---
     println!(
@@ -1038,16 +1136,24 @@ async fn handle_daemon_hook_post_read(
         return Ok(());
     };
 
-    let file_root = file.parent().unwrap_or(current_dir);
-    let hook_socket = resolve_active_socket(socket_override, file_root);
+    let target_dir = if let Some(parent) = file.parent() {
+        if parent.as_os_str().is_empty() {
+            current_dir
+        } else {
+            parent
+        }
+    } else {
+        current_dir
+    };
+    let connected_socket = resolve_connected_socket(socket_override, target_dir);
 
     let mut advisory: Option<String> = None;
     let mut provenance: Option<String> = None;
     let start_time = std::time::Instant::now();
 
-    if hook_socket.exists() {
+    if let Some(ref hook_socket) = connected_socket {
         if let Ok(resp) = send_daemon_request(
-            &hook_socket,
+            hook_socket,
             DaemonRequest::PostReadHook { file: file.clone() },
         )
         .await
@@ -1132,9 +1238,6 @@ async fn handle_daemon_start(
     let token = CancellationToken::new();
 
     let watcher_active = cfg.daemon.enable_file_watcher;
-    if watcher_active {
-        let _ = start_watcher(root.to_path_buf(), Arc::clone(&index), token.clone());
-    }
 
     let tok_ctrl_c = token.clone();
     tokio::spawn(async move {
@@ -1150,6 +1253,8 @@ async fn handle_daemon_start(
         socket_path: socket_path.to_path_buf(),
         workspace_root: root.to_path_buf(),
         watcher_active,
+        log_dir: cfg.daemon.log_dir.as_ref().map(PathBuf::from),
+        idle_ttl_secs: cfg.daemon.idle_ttl_secs,
     };
     run_server_with_options(opts, index, token).await?;
     success("Daemon", "Daemon exited cleanly.");
@@ -1174,5 +1279,12 @@ mod tests {
         assert_eq!(format_uptime(30), "30s");
         assert_eq!(format_uptime(90), "1m 30s");
         assert_eq!(format_uptime(3665), "1h 1m 5s");
+    }
+
+    #[test]
+    fn test_format_time_ago() {
+        assert_eq!(format_time_ago(5), "5s ago");
+        assert_eq!(format_time_ago(120), "2m ago");
+        assert_eq!(format_time_ago(7200), "2h ago");
     }
 }

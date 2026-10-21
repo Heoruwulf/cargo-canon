@@ -1,11 +1,14 @@
 //! Unix domain socket IPC server.
 
 use crate::error::DaemonError;
-use crate::hook::execute_post_read_hook;
+use crate::hook::{execute_post_read_hook, execute_post_read_hook_with_overlay};
+use crate::logging::DaemonLogManager;
 use crate::protocol::{
-    DaemonRequest, DaemonResponse, DaemonStatusInfo, read_message, write_message,
+    DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
 };
-use canon_slice::{SymbolIndex, slice_target};
+use crate::registry::{WorkspaceEntry, WorkspaceRegistry};
+use crate::watcher::DynamicWatcherManager;
+use canon_slice::{SymbolIndex, slice_target, slice_target_with_overlay};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,19 +64,38 @@ impl ServerTelemetry {
 /// Configuration options for launching the daemon server.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
-    /// Bound socket path.
+    /// Bound socket path (if empty, defaults to the global system socket path).
     pub socket_path: PathBuf,
     /// Monitored workspace root directory.
     pub workspace_root: PathBuf,
     /// Indicates whether the background file watcher is active.
     pub watcher_active: bool,
+    /// Directory for file logging (default: system state dir).
+    pub log_dir: Option<PathBuf>,
+    /// Inactivity threshold in seconds before unindexing an idle workspace (default: 7200).
+    pub idle_ttl_secs: u64,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            socket_path: PathBuf::new(),
+            workspace_root: PathBuf::new(),
+            watcher_active: false,
+            log_dir: None,
+            idle_ttl_secs: 7200,
+        }
+    }
 }
 
 /// Internal shared state for connection handlers.
 struct ServerState {
     options: Arc<ServerOptions>,
     start_time: std::time::Instant,
-    index: Arc<RwLock<SymbolIndex>>,
+    legacy_index: Arc<RwLock<SymbolIndex>>,
+    registry: Arc<WorkspaceRegistry>,
+    log_manager: Arc<DaemonLogManager>,
+    watcher_manager: Option<Arc<DynamicWatcherManager>>,
     token: CancellationToken,
     telemetry: Arc<ServerTelemetry>,
 }
@@ -117,11 +139,18 @@ async fn probe_active_socket(socket_path: &Path) -> bool {
 
 /// Runs the IPC daemon server with explicit options until shutdown token is cancelled.
 pub async fn run_server_with_options(
-    options: ServerOptions,
+    mut options: ServerOptions,
     index: Arc<RwLock<SymbolIndex>>,
     token: CancellationToken,
 ) -> Result<(), DaemonError> {
+    if options.socket_path.as_os_str().is_empty() {
+        options.socket_path = canon_core::workspace::resolve_global_socket();
+    }
     let socket_path = &options.socket_path;
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     if socket_path.exists() {
         if probe_active_socket(socket_path).await {
             return Err(DaemonError::SocketAlreadyBound(socket_path.clone()));
@@ -139,18 +168,77 @@ pub async fn run_server_with_options(
     let pid = std::process::id();
     tracing::info!(socket = %socket_path.display(), pid, "Starting canon daemon IPC server");
 
+    let log_dir = options
+        .log_dir
+        .clone()
+        .unwrap_or_else(canon_core::logging::resolve_default_log_dir);
+    let log_manager = Arc::new(DaemonLogManager::init(&log_dir)?);
+    log_manager.log_daemon(&format!(
+        "Canon daemon IPC server started: pid={}, socket='{}'",
+        pid,
+        socket_path.display()
+    ));
+
+    let registry = Arc::new(WorkspaceRegistry::new(Arc::clone(&log_manager)));
+
+    let watcher_manager = if options.watcher_active {
+        let mgr = Arc::new(DynamicWatcherManager::new(token.clone())?);
+        Some(mgr)
+    } else {
+        None
+    };
+
+    let raw_root = &options.workspace_root;
+    if !raw_root.as_os_str().is_empty() {
+        let canonical_root = std::fs::canonicalize(raw_root).unwrap_or_else(|_| raw_root.clone());
+        if let Ok(ws_logger) = log_manager.create_workspace_logger(&canonical_root) {
+            let ws_entry = Arc::new(WorkspaceEntry::new(
+                canonical_root.clone(),
+                false,
+                None,
+                Arc::clone(&index),
+                None,
+                Arc::new(ws_logger),
+            ));
+            registry.register(ws_entry.clone()).await;
+            if let Some(ref w) = watcher_manager {
+                let _ = w.watch_workspace(
+                    canonical_root,
+                    Arc::clone(&index),
+                    Arc::clone(&ws_entry.logger),
+                );
+            }
+        }
+    }
+
     let state = Arc::new(ServerState {
         options: Arc::new(options),
         start_time,
-        index,
+        legacy_index: index,
+        registry: Arc::clone(&registry),
+        log_manager,
+        watcher_manager,
         token: token.clone(),
         telemetry: Arc::new(ServerTelemetry::default()),
     });
+
+    let mut prune_interval = tokio::time::interval(Duration::from_secs(60));
+    prune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    prune_interval.tick().await;
 
     loop {
         tokio::select! {
             _ = token.cancelled() => {
                 break;
+            }
+            _ = prune_interval.tick() => {
+                let idle_ttl = Duration::from_secs(state.options.idle_ttl_secs);
+                let pruned = state.registry.prune_idle_workspaces(idle_ttl).await;
+                if let Some(ref watcher) = state.watcher_manager {
+                    for p in &pruned {
+                        let _ = watcher.unwatch_workspace(p);
+                    }
+                }
             }
             res = listener.accept() => {
                 match res {
@@ -183,6 +271,8 @@ pub async fn run_server(
         socket_path: socket_path.to_path_buf(),
         workspace_root: root,
         watcher_active: false,
+        log_dir: None,
+        idle_ttl_secs: 7200,
     };
     run_server_with_options(opts, index, token).await
 }
@@ -192,29 +282,76 @@ async fn handle_post_read_request(
     req_start: std::time::Instant,
     state: &ServerState,
 ) -> DaemonResponse {
-    let guard = state.index.read().await;
-    match execute_post_read_hook(file, Some(&guard)) {
-        Ok(advisory_block) => {
-            let elapsed_us = req_start.elapsed().as_micros();
-            let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-            let delivered_len = advisory_block.len() as u64;
-            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+    let entry = match state.registry.get_or_init(file).await {
+        Ok(e) => {
+            if let Some(ref watcher) = state.watcher_manager {
+                if !watcher.is_watching(&e.root) {
+                    let _ = watcher.watch_workspace(
+                        e.root.clone(),
+                        Arc::clone(&e.index),
+                        Arc::clone(&e.logger),
+                    );
+                }
+            }
+            Some(e)
+        }
+        Err(e) => {
             tracing::debug!(
                 file = %file.display(),
-                raw_bytes = raw_len,
-                delivered_bytes = delivered_len,
-                reduction_pct = format_args!("{:.1}%", pct),
-                elapsed_us,
-                "Served post-read hook"
+                error = %e,
+                "Workspace could not be auto-initialized; falling back to default index"
             );
+            None
+        }
+    };
+
+    let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let advisory_res = if let Some(ref ws) = entry {
+        if let Some(ref base) = ws.base_index {
+            let base_guard = base.read().await;
+            let ov_guard = ws.index.read().await;
+            execute_post_read_hook_with_overlay(file, Some(&*base_guard), Some(&*ov_guard))
+        } else {
+            let guard = ws.index.read().await;
+            execute_post_read_hook_with_overlay(file, Some(&*guard), None)
+        }
+    } else {
+        let guard = state.legacy_index.read().await;
+        execute_post_read_hook(file, Some(&*guard))
+    };
+
+    match advisory_res {
+        Ok(advisory_block) => {
+            let elapsed_us = req_start.elapsed().as_micros();
+            let delivered_len = advisory_block.len() as u64;
+            let pct = state.telemetry.record_reduction(raw_len, delivered_len);
+            let log_msg = format!(
+                "PostReadHook served: '{}' | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                file.display(),
+                raw_len,
+                delivered_len,
+                pct,
+                elapsed_us as f64 / 1000.0,
+            );
+            state.log_manager.log_daemon(&log_msg);
+            if let Some(ref ws) = entry {
+                ws.logger.log(&log_msg);
+            }
             DaemonResponse::AdvisoryContext {
                 file: file.display().to_string(),
                 advisory_block,
             }
         }
-        Err(e) => DaemonResponse::Error {
-            message: e.to_string(),
-        },
+        Err(e) => {
+            let err_msg = format!("PostReadHook failed for '{}': {}", file.display(), e);
+            state.log_manager.log_daemon(&err_msg);
+            if let Some(ref ws) = entry {
+                ws.logger.log(&err_msg);
+            }
+            DaemonResponse::Error {
+                message: e.to_string(),
+            }
+        }
     }
 }
 
@@ -225,27 +362,75 @@ async fn handle_slice_request(
     state: &ServerState,
 ) -> DaemonResponse {
     let req_start = std::time::Instant::now();
-    let guard = state.index.read().await;
-    match slice_target(file, mode, Some(&guard)) {
+    let entry = match state.registry.get_or_init(file).await {
+        Ok(e) => {
+            if let Some(ref watcher) = state.watcher_manager {
+                if !watcher.is_watching(&e.root) {
+                    let _ = watcher.watch_workspace(
+                        e.root.clone(),
+                        Arc::clone(&e.index),
+                        Arc::clone(&e.logger),
+                    );
+                }
+            }
+            Some(e)
+        }
+        Err(e) => {
+            tracing::debug!(
+                file = %file.display(),
+                error = %e,
+                "Workspace could not be auto-initialized; falling back to default index"
+            );
+            None
+        }
+    };
+
+    let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let slice_res = if let Some(ref ws) = entry {
+        if let Some(ref base) = ws.base_index {
+            let base_guard = base.read().await;
+            let ov_guard = ws.index.read().await;
+            slice_target_with_overlay(file, mode, Some(&*base_guard), Some(&*ov_guard))
+        } else {
+            let guard = ws.index.read().await;
+            slice_target_with_overlay(file, mode, Some(&*guard), None)
+        }
+    } else {
+        let guard = state.legacy_index.read().await;
+        slice_target(file, mode, Some(&*guard))
+    };
+
+    match slice_res {
         Ok(bundle) => {
             let elapsed_us = req_start.elapsed().as_micros();
             let content = bundle.format_with(format).unwrap_or_default();
-            let raw_len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
             let delivered_len = content.len() as u64;
             let pct = state.telemetry.record_reduction(raw_len, delivered_len);
-            tracing::debug!(
-                file = %file.display(),
-                raw_bytes = raw_len,
-                delivered_bytes = delivered_len,
-                reduction_pct = format_args!("{:.1}%", pct),
-                elapsed_us,
-                "Served slice request"
+            let log_msg = format!(
+                "Slice served: '{}' (mode: {:?}) | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                file.display(),
+                mode,
+                raw_len,
+                delivered_len,
+                pct,
+                elapsed_us as f64 / 1000.0,
             );
+            state.log_manager.log_daemon(&log_msg);
+            if let Some(ref ws) = entry {
+                ws.logger.log(&log_msg);
+            }
             DaemonResponse::SliceResult { content }
         }
-        Err(e) => DaemonResponse::Error {
-            message: e.to_string(),
-        },
+        Err(e) => {
+            let err_msg = format!("Slice failed for '{}': {}", file.display(), e);
+            state.log_manager.log_daemon(&err_msg);
+            if let Some(ref ws) = entry {
+                ws.logger.log(&err_msg);
+            }
+            DaemonResponse::Error {
+                message: e.to_string(),
+            }
+        }
     }
 }
 
@@ -268,21 +453,63 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 write_message(&mut stream, &DaemonResponse::Pong).await?;
             }
             DaemonRequest::Status => {
-                let metrics = {
-                    let guard = state.index.read().await;
-                    guard.metrics()
-                };
+                let memory_rss = canon_core::logging::get_process_rss_mb();
+                let entries = state.registry.entries().await;
+                let mut ws_summaries = Vec::with_capacity(entries.len());
+                let mut agg_files = 0;
+                let mut agg_symbols = 0;
+                let mut agg_call_edges = 0;
+                let mut agg_contracts = 0;
+                let mut agg_routes = 0;
+
+                for entry in &entries {
+                    let (metrics, mem_mb) = {
+                        let guard = entry.index.read().await;
+                        (guard.metrics(), guard.estimate_memory_mb())
+                    };
+                    agg_files += metrics.distinct_files_count;
+                    agg_symbols += metrics.total_symbols_count;
+                    agg_call_edges += metrics.total_call_edges_count;
+                    agg_contracts += metrics.total_contracts_count;
+                    agg_routes += metrics.total_routes_count;
+
+                    ws_summaries.push(WorkspaceSummary {
+                        root: entry.root.clone(),
+                        is_worktree: entry.is_worktree,
+                        parent_repo: entry.parent_repo.clone(),
+                        indexed_files: metrics.distinct_files_count,
+                        total_symbols: metrics.total_symbols_count,
+                        memory_mb: mem_mb,
+                        log_path: entry.logger.log_path().to_path_buf(),
+                        last_accessed_secs_ago: entry.last_accessed_secs_ago(),
+                    });
+                }
+
+                if entries.is_empty() {
+                    let guard = state.legacy_index.read().await;
+                    let m = guard.metrics();
+                    agg_files = m.distinct_files_count;
+                    agg_symbols = m.total_symbols_count;
+                    agg_call_edges = m.total_call_edges_count;
+                    agg_contracts = m.total_contracts_count;
+                    agg_routes = m.total_routes_count;
+                }
+
                 let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
                 let status_info = DaemonStatusInfo {
                     pid: std::process::id(),
                     uptime_secs: state.start_time.elapsed().as_secs(),
                     socket_path: state.options.socket_path.clone(),
                     workspace_root: state.options.workspace_root.clone(),
-                    indexed_files: metrics.distinct_files_count,
-                    total_symbols: metrics.total_symbols_count,
-                    total_call_edges: metrics.total_call_edges_count,
-                    total_contracts: metrics.total_contracts_count,
-                    total_routes: metrics.total_routes_count,
+                    main_log_path: state.log_manager.main_log_path().to_path_buf(),
+                    memory_rss_mb: memory_rss,
+                    active_workspaces_count: entries.len(),
+                    workspaces: ws_summaries,
+                    indexed_files: agg_files,
+                    total_symbols: agg_symbols,
+                    total_call_edges: agg_call_edges,
+                    total_contracts: agg_contracts,
+                    total_routes: agg_routes,
                     watcher_active: state.options.watcher_active,
                     hooks_served: hooks,
                     raw_bytes_served: raw,
@@ -303,15 +530,10 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
             }
             DaemonRequest::Shutdown => {
                 let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
-                tracing::info!(
-                    hooks_served = hooks,
-                    raw_bytes = raw,
-                    delivered_bytes = delivered,
-                    bytes_saved = saved,
-                    reduction_pct = format_args!("{:.1}%", pct),
-                    est_tokens_saved = est_tokens,
-                    "Daemon stopping: cumulative context bloat reduction summary"
-                );
+                state.log_manager.log_daemon(&format!(
+                    "Daemon stopping: hooks_served={}, raw_bytes={}, delivered_bytes={}, bytes_saved={} ({:.1}%), est_tokens_saved={}",
+                    hooks, raw, delivered, saved, pct, est_tokens
+                ));
                 write_message(&mut stream, &DaemonResponse::ShutdownAck).await?;
                 state.token.cancel();
                 break;

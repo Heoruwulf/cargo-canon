@@ -79,6 +79,8 @@ impl Runner for Service {
             socket_path: s_path,
             workspace_root: s_root,
             watcher_active: false,
+            log_dir: None,
+            idle_ttl_secs: 7200,
         };
         let _ = run_server_with_options(opts, index, s_token).await;
     });
