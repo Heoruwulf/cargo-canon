@@ -32,8 +32,10 @@ Guidance for AI coding agents working in this repository. This is a Rust **2024*
     - Strictly `#![no_std]` compatible; pure synchronous execution, caller-provided deterministic time, isolated from external side effects.
     - Exhaustive transition matrix fuzzer capable of >1,000,000 state transitions/sec for Rust state machines, pure TypeScript reducers (`--ts-reducer`), and pure Go state machines (`--lang go` / `--go-state-machine`).
   - `crates/canon-daemon`: agent sidecar and background indexing daemon:
-    - High-throughput IPC / Unix domain socket server (`/tmp/canon-<hash>.sock` dynamically isolated per worktree/repo) for sub-millisecond agent tool responses.
-    - Incremental file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.go` to update the local symbol index in < 20ms on file mutations.
+    - High-throughput system-wide multi-tenant IPC server (`$XDG_RUNTIME_DIR/canon/daemon.sock`, fallback to `/tmp/canon-<hash>.sock` or `--isolated`) servicing all repositories and AI agent sessions.
+    - Lazy on-demand cold starts on first touch with single-flight initialization and Copy-on-Write overlay indexing for Git worktrees.
+    - Dynamic multi-path file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.go` across all active registered workspaces.
+    - Multi-tier file logging (timestamped daemon log + isolated per-workspace log files) and process RSS/heap memory telemetry in MB.
     - Non-destructive tool hook handlers (`hook post-read`).
 - **NON-DESTRUCTIVE ADVISORY CONTEXT INJECTION (CRITICAL INVARIANT)**:
   - **Preserve target source files strictly byte-identical on disk at all times during tool hook execution** (e.g., `hook post-read` across `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.go`). Keep line numbers and byte offsets perfectly stable so downstream patch and diff editing tools (Claude Code, Antigravity) operate with complete accuracy.
@@ -88,9 +90,9 @@ cargo canon invariants --scaffold <SYMBOL> --lang go               # scaffold ra
 cargo canon state-machine --fuzz-transitions                       # fuzz pure Sans-I/O Rust state machine
 cargo canon state-machine --ts-reducer <PATH> --fuzz-transitions   # fuzz pure TypeScript reducer transitions
 cargo canon state-machine --lang go --transitions 500000           # fuzz pure Sans-I/O Go state machine transitions
-cargo canon daemon --start                                         # start background indexing daemon
+cargo canon daemon                                                 # start system-wide multi-tenant indexing daemon (or --isolated)
 cargo canon daemon --ping                                          # probe running daemon liveness and latency
-cargo canon daemon --status                                        # query running daemon status, index metrics, and cache statistics
+cargo canon daemon --status                                        # query multi-tenant registry, RSS memory in MB, and log paths
 cargo canon daemon --stop                                          # gracefully stop running background daemon
 cargo canon daemon --hook-post-read --file <PATH>                  # advisory post-read tool hook (.rs / .ts / .tsx / .go)
 ```

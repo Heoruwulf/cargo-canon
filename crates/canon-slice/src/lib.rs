@@ -35,6 +35,17 @@ pub fn slice_target(
     mode: SliceMode,
     index: Option<&SymbolIndex>,
 ) -> Result<SliceBundle, SliceError> {
+    slice_target_with_overlay(target_path, mode, index, None)
+}
+
+/// Slices a file or target symbol according to the requested SliceMode,
+/// querying an optional overlay index before falling through to the base index.
+pub fn slice_target_with_overlay(
+    target_path: &Path,
+    mode: SliceMode,
+    base_index: Option<&SymbolIndex>,
+    overlay_index: Option<&SymbolIndex>,
+) -> Result<SliceBundle, SliceError> {
     let raw_source = std::fs::read_to_string(target_path).map_err(SliceError::Io)?;
     let raw_len = raw_source.len().max(1);
 
@@ -68,41 +79,50 @@ pub fn slice_target(
     let mut contracts = Vec::new();
     let mut callers = Vec::new();
     let mut callees = Vec::new();
-    let mut cross_boundary = None;
 
-    if let Some(idx) = index {
+    if overlay_index.is_some() || base_index.is_some() {
         if matches!(mode, SliceMode::Contracts | SliceMode::Bundle) {
-            contracts = idx.get_contracts(target_name);
+            let ov_contracts = overlay_index
+                .map(|idx| idx.get_contracts(target_name))
+                .unwrap_or_default();
+            contracts = if !ov_contracts.is_empty() {
+                ov_contracts
+            } else {
+                base_index
+                    .map(|idx| idx.get_contracts(target_name))
+                    .unwrap_or_default()
+            };
         }
         if matches!(mode, SliceMode::Hierarchy | SliceMode::Bundle) {
-            callers = idx.get_callers(target_name, 2);
-            callees = idx.get_callees(target_name, 2);
+            let ov_callers = overlay_index
+                .map(|idx| idx.get_callers(target_name, 2))
+                .unwrap_or_default();
+            callers = if !ov_callers.is_empty() {
+                ov_callers
+            } else {
+                base_index
+                    .map(|idx| idx.get_callers(target_name, 2))
+                    .unwrap_or_default()
+            };
+
+            let ov_callees = overlay_index
+                .map(|idx| idx.get_callees(target_name, 2))
+                .unwrap_or_default();
+            callees = if !ov_callees.is_empty() {
+                ov_callees
+            } else {
+                base_index
+                    .map(|idx| idx.get_callees(target_name, 2))
+                    .unwrap_or_default()
+            };
         }
-        let sym_stem = target_name
-            .trim_end_matches(".rs")
-            .trim_end_matches(".tsx")
-            .trim_end_matches(".ts")
-            .trim_end_matches(".jsx")
-            .trim_end_matches(".js")
-            .trim_end_matches(".go");
-        cross_boundary = idx
-            .get_cross_boundary_impact(sym_stem)
-            .or_else(|| idx.get_cross_boundary_impact(target_name))
-            .or_else(|| {
-                let file_str = target_path.to_string_lossy();
-                for (sym_name, defs) in &idx.symbols_map {
-                    if defs
-                        .iter()
-                        .any(|d| d.file == file_str || target_path.ends_with(&d.file))
-                    {
-                        if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
-                            return Some(cb);
-                        }
-                    }
-                }
-                None
-            });
     }
+
+    let cross_boundary = overlay_index
+        .and_then(|ov| resolve_cross_boundary(ov, target_path, target_name))
+        .or_else(|| {
+            base_index.and_then(|base| resolve_cross_boundary(base, target_path, target_name))
+        });
 
     Ok(SliceBundle {
         target: target_path.display().to_string(),
@@ -113,6 +133,36 @@ pub fn slice_target(
         token_reduction_pct: reduction_pct,
         cross_boundary,
     })
+}
+
+fn resolve_cross_boundary(
+    idx: &SymbolIndex,
+    target_path: &Path,
+    target_name: &str,
+) -> Option<CrossBoundaryImpact> {
+    let sym_stem = target_name
+        .trim_end_matches(".rs")
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".ts")
+        .trim_end_matches(".jsx")
+        .trim_end_matches(".js")
+        .trim_end_matches(".go");
+    idx.get_cross_boundary_impact(sym_stem)
+        .or_else(|| idx.get_cross_boundary_impact(target_name))
+        .or_else(|| {
+            let file_str = target_path.to_string_lossy();
+            for (sym_name, defs) in &idx.symbols_map {
+                if defs
+                    .iter()
+                    .any(|d| d.file == file_str || target_path.ends_with(&d.file))
+                {
+                    if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+                        return Some(cb);
+                    }
+                }
+            }
+            None
+        })
 }
 
 #[cfg(test)]
@@ -246,5 +296,68 @@ mod tests {
         assert!(md.contains("Token Reduction:"));
         assert!(md.contains("## Cross-Boundary Impact"));
         assert!(md.contains("Go Backend Model:"));
+    }
+
+    #[test]
+    fn test_slice_target_with_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let rs_path = dir.path().join("service.rs");
+
+        // Write initial file and index into base
+        std::fs::write(
+            &rs_path,
+            r#"
+            pub struct Service;
+            pub trait Handler { fn execute(&self); }
+            impl Handler for Service { fn execute(&self) {} }
+            pub fn run() { let s = Service; s.execute(); base_call(); }
+            pub fn base_call() {}
+            "#,
+        )
+        .unwrap();
+
+        let mut base_index = SymbolIndex::new();
+        base_index.index_directory(dir.path()).unwrap();
+
+        // Modify file with new implementation and new callee
+        std::fs::write(
+            &rs_path,
+            r#"
+            pub struct Service;
+            pub trait Handler { fn execute(&self); }
+            impl Handler for Service { fn execute(&self) {} }
+            pub fn run() { let s = Service; s.execute(); overlay_call(); }
+            pub fn overlay_call() {}
+            "#,
+        )
+        .unwrap();
+
+        let overlay_index = base_index.create_overlay(std::slice::from_ref(&rs_path));
+
+        // Slice with overlay
+        let bundle = slice_target_with_overlay(
+            &rs_path,
+            SliceMode::Bundle,
+            Some(&base_index),
+            Some(&overlay_index),
+        )
+        .unwrap();
+
+        assert!(bundle.skeleton.contains("pub struct Service"));
+        assert!(bundle.skeleton.contains("pub fn overlay_call ()"));
+
+        // Overlay contracts fallback
+        let contracts = overlay_index.get_contracts_with_fallback(Some(&base_index), "Service");
+        assert!(!contracts.is_empty());
+        assert_eq!(contracts[0].trait_name, "Handler");
+
+        // Overridden callers in overlay take precedence
+        assert!(!overlay_index.get_callers("overlay_call", 1).is_empty());
+        assert!(base_index.get_callers("overlay_call", 1).is_empty());
+        assert!(
+            !overlay_index
+                .get_callers_with_fallback(Some(&base_index), "base_call", 1)
+                .is_empty()
+        );
     }
 }

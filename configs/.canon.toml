@@ -44,14 +44,32 @@ default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
 
 [daemon]
-# Unix domain socket path override (optional; auto-derived per workspace/worktree if omitted)
-# socket_path = "/tmp/canon.sock"
+# Whether this daemon operates in system-wide multi-tenant mode (default: true)
+system_daemon = true
 
-# Enable background incremental file watching via notify
+# Global Unix domain socket path override (default: auto-derived in XDG runtime dir)
+# global_socket = "/run/user/1000/canon/daemon.sock"
+
+# Inactivity threshold in seconds before unindexing an idle workspace (default: 7200 = 2 hours)
+idle_ttl_secs = 7200
+
+# Directory path where linked worktrees reside (relative to workspace root)
+worktrees_dir = ".claude/worktrees"
+
+# Additional directories to ignore machine-wide or project-wide
+ignored_dirs = [".claude", ".cursor", ".worktrees"]
+
+# Enable background incremental file watching via notify across all active workspaces
 enable_file_watcher = true
 
-# Paths to monitor for source modifications (.rs, .ts, .tsx, .js, .jsx, .go)
-watch_paths = ["crates", "frontend/src", "backend"]
+# Directory for file logging (default: ~/.local/state/canon/logs)
+# log_dir = "~/.local/state/canon/logs"
+
+# Enable per-workspace isolated log files under <log_dir>/workspaces/ (default: true)
+workspace_logging = true
+
+# Subdirectories to monitor for source modifications within each registered workspace
+watch_paths = ["crates", "frontend/src", "backend", "src"]
 
 [typescript]
 # Enable TypeScript and TSX context slicing via oxc_parser

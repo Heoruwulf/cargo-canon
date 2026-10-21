@@ -280,17 +280,19 @@ cargo canon state-machine --lang go --transitions 500000
 
 ### Background Daemon & Agent Hooks
 
+`cargo canon daemon` runs as a high-throughput, system-wide multi-tenant background service. It binds to a global user socket (`$XDG_RUNTIME_DIR/canon/daemon.sock`), lazily indexing projects on first touch, reusing base repository symbol graphs via Copy-on-Write overlays for Git worktrees, and emitting multi-tier logs with process memory telemetry in Megabytes.
+
 ```sh
-# Start background IPC daemon (auto-derives /tmp/canon-<hash>.sock per workspace/worktree)
-cargo canon daemon --start
+# Start system-wide multi-tenant IPC daemon (or pass --isolated for single-workspace mode)
+cargo canon daemon
 
 # Probe running daemon liveness and report round-trip latency
 cargo canon daemon --ping
 
-# Query running daemon status, index metrics, and context bloat reduction
+# Query running daemon status, active workspace registry, memory (MB), and context bloat reduction
 cargo canon daemon --status
 
-# Export machine-readable status with full bloat telemetry in JSON
+# Export machine-readable status with full workspace breakdown and telemetry in JSON
 cargo canon daemon --status --json
 
 # Gracefully terminate the running background daemon (logs cumulative session savings)
@@ -306,9 +308,9 @@ cargo canon daemon --hook-post-read --file frontend/src/App.tsx
 cargo canon daemon --hook-post-read --file backend/pkg/service/user.go
 ```
 
-#### Context Bloat Reduction Telemetry
+#### Multi-Tenant Operational Telemetry & Memory in Megabytes
 
-The daemon server instruments all post-read hook and slice requests with lock-free atomic counters (`AtomicU64`, `Ordering::Relaxed`), providing ground-truth operational visibility into context savings without adding request latency:
+The daemon tracks Resident Set Size (RSS) memory consumption globally and per-workspace heap consumption in Megabytes, providing ground-truth operational visibility into context savings without adding request latency:
 
 - **Source of Truth:** Exact raw bytes processed vs. delivered advisory context bytes.
 - **Tokens Saved:** Conservative estimate derived from empirical code ratios ($\approx 4\text{ bytes/token}$).
@@ -320,38 +322,49 @@ Sample human-readable status table (`cargo canon daemon --status`):
 Canon Daemon Status: Active
 PID:            48210
 Uptime:         12m 45s
-Socket Path:    /tmp/canon-a1b2c3d4e5f6.sock
-Workspace Root: /home/user/project
+Socket Path:    /run/user/1000/canon/daemon.sock
+Main Daemon Log: /home/user/.local/state/canon/logs/daemon-20261020-174724.log
+Memory RSS:     48.2 MB
+Active Workspaces: 2
 Indexed Files:  142 files
 Total Symbols:  3,810 declarations
 Call Edges:     1,124 edges
 Contracts:      456 trait implementations
 Routes:         48 API endpoints
 File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
+
+Active Workspace Registry:
+  WORKSPACE                        TYPE    FILES    SYMBOLS     MEMORY  LOG FILE                           ACCESSED
+  ----------------------------------------------------------------------------------------------------------------
+  /projects/cargo-canon            Repo      142      3,810     2.4 MB  cargo-canon-cbf29ce48422.log         4s ago
+  .../.claude/worktrees/feat1      WkTr       12        210     0.4 MB  feat1-8a9b1c2d3e4f.log              18s ago
+
 Hooks Served:   35 requests
 Context Bloat:  1.24 MB raw -> 142.6 KB delivered (88.5% reduction)
 Tokens Saved:   ~275,340 tokens (est. 4B/token)
 ```
 
-#### Structured Logging & `RUST_LOG` Support
+#### Multi-Tier Structured Logging
 
-All crates utilize `tracing` with standard `EnvFilter` support. `cargo-canon` enforces a strict dual-tier logging discipline to keep logs clean during high-frequency agent tool loops:
+All crates utilize `tracing` and a non-blocking asynchronous file logger (`DaemonLogManager`):
 
+- **Main Daemon Log**: Written to `$XDG_STATE_HOME/canon/logs/daemon-YYYYMMDD-HHMMSS.log` with a `daemon-latest.log` pointer, capturing daemon lifecycles and global milestones.
+- **Per-Workspace Logs**: Written to `$XDG_STATE_HOME/canon/logs/workspaces/<slug>-<hash>.log`, recording cold starts, watcher file modifications, hook latencies, and reduction ratios.
 - **`tracing::debug!`**: Per-request structured telemetry (`raw_bytes`, `delivered_bytes`, `reduction_pct`, `elapsed_us`).
-- **`tracing::info!`**: Daemon lifecycle milestones (server start, socket bind, file watcher active) and session shutdown summaries reporting cumulative context saved.
+- **`tracing::info!`**: Daemon lifecycle milestones and session shutdown summaries reporting cumulative context saved.
 
 ```sh
 # Default info-level logging
-cargo canon daemon --start
+cargo canon daemon
 
 # Stream per-request bloat metrics in real-time
-RUST_LOG=canon_daemon=debug cargo canon daemon --start
+RUST_LOG=canon_daemon=debug cargo canon daemon
 
 # Enable debug logging via CLI verbosity flag (-v = debug, -vv = trace)
-cargo canon daemon --start -v
+cargo canon daemon -v
 
 # Emit structured JSON log streams for CI, sidecars, or log aggregators
-RUST_LOG=debug cargo canon daemon --start --json
+RUST_LOG=debug cargo canon daemon --json
 ```
 
 ---
@@ -384,9 +397,15 @@ default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
 
 [daemon]
-# socket_path = "/tmp/canon.sock"  # Optional override; auto-derived per workspace/worktree if omitted
+system_daemon = true                  # Multi-tenant mode (default: true; false = legacy isolated mode)
+# global_socket = "/run/user/1000/canon/daemon.sock" # Optional override
+idle_ttl_secs = 7200                  # Inactivity threshold before unindexing idle workspaces
+worktrees_dir = ".claude/worktrees"   # Nested worktree directory (auto-pruned from parent walks)
+ignored_dirs = [".claude", ".cursor", ".worktrees"]
 enable_file_watcher = true
-watch_paths = ["crates", "frontend/src", "backend"]
+# log_dir = "~/.local/state/canon/logs"
+workspace_logging = true              # Isolated logs under <log_dir>/workspaces/
+watch_paths = ["crates", "frontend/src", "backend", "src"]
 
 [typescript]
 enabled = true
