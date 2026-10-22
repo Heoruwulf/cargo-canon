@@ -9,7 +9,7 @@ Guidance for AI coding agents working in this repository. This is a Rust **2024*
   - `crates/cargo-canon` (or root binary crate): executable CLI entrypoint and cargo subcommand router (`cargo canon <COMMAND>` / `cargo groundtruth <COMMAND>`). Dispatches to subcommands: `slice`, `simulate`, `diff-fuzz`, `verify`, `invariants`, `state-machine`, `daemon`.
   - `crates/canon-core`: workspace foundation:
     - CLI argument parsing via `clap` (derive API with structured subcommands).
-    - Configuration discovery and deserialization: strict two-location configuration model (system-wide daemon configuration at `~/.config/canon/canon.toml` or `--config`, and repository-local configuration discovering `config/canon.toml`, `.canon.toml`, `canon.toml`, `.config/canon.toml`, `configs/canon.toml`) supporting declarative project namespaces (`[projects.<name>]` / `[<project-name>]`), `ProjectConfig`, `TypeScriptConfig`, `GoConfig`, and `CrossBoundaryConfig`.
+    - Configuration loading and management: strictly centralized configuration model loaded from the system path (`~/.config/canon/canon.toml`, `$XDG_CONFIG_HOME/canon/canon.toml`, `/etc/canon/canon.toml`) or explicitly via the `--config` switch. Enforces strict CWD isolation (no repository-local config candidate searching), supporting daemon infrastructure (`[daemon]`), declarative project namespaces (`[projects.<name>]` / `[<project-name>]`), `ProjectConfig`, `TypeScriptConfig`, `GoConfig`, and `CrossBoundaryConfig`.
     - Structured logging initialization (`tracing`, `tracing-subscriber`).
     - Standardized terminal diagnostics (`colored`, `anstream`).
     - Core error primitives (`thiserror`).

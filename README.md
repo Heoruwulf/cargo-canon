@@ -374,23 +374,34 @@ RUST_LOG=debug cargo canon daemon --json
 
 ## Configuration
 
-`cargo-canon` uses a strict two-tier configuration model ensuring seamless multi-tenant indexing across concurrent AI agent workflows while retaining complete repository-local flexibility.
+`cargo-canon` uses a strictly centralized configuration model. All daemon infrastructure controls and per-project definitions are managed in a single system configuration file, or provided explicitly via the `--config` switch. There is no repository-local configuration candidate precedence or file discovery.
 
-### 1. System-Wide Daemon Configuration (`~/.config/canon/canon.toml`)
+### System Configuration Locations
 
-The background indexing daemon services all repositories and AI coding agent sessions (Claude Code, Antigravity, Cursor). It reads shared daemon infrastructure controls and declarative project registrations from a central system location:
+The configuration file is loaded from one of the following system locations:
 
-- **Config Discovery Hierarchy**:
-  1. `$XDG_CONFIG_HOME/canon/canon.toml`
-  2. `~/.config/canon/canon.toml`
-  3. `~/Library/Application Support/canon/canon.toml` (macOS)
-  4. `/etc/canon/canon.toml` or `/etc/canon/config.toml` (Linux / Docker / Kubernetes)
-  5. Explicit CLI flag: `cargo canon daemon --config <PATH>`
+1. `$XDG_CONFIG_HOME/canon/canon.toml`
+2. `~/.config/canon/canon.toml`
+3. `~/Library/Application Support/canon/canon.toml` (macOS)
+4. `/etc/canon/canon.toml` or `/etc/canon/config.toml` (Linux / Docker / Kubernetes)
+
+### Explicit Override via `--config`
+
+You can pass an explicit configuration path using `--config`:
+
+```sh
+# Start daemon with explicit configuration file override
+cargo canon daemon --config /path/to/canon.toml
+```
 
 > [!IMPORTANT]
-> **Strict Daemon CWD Isolation**: To guarantee deterministic multi-tenant security and prevent configuration poisoning across agent sessions, the background daemon loads its configuration **strictly** from the system path or `--config`. It never executes or merges arbitrary workspace-local configuration files from client working directories.
+> **Strict CWD Isolation**: To guarantee deterministic multi-tenant security and prevent configuration poisoning across agent sessions, the background daemon loads its configuration **strictly** from the system path or `--config`. It never executes or searches for arbitrary workspace-local configuration files in client working directories.
 
-A representative system-wide daemon configuration (`~/.config/canon/canon.toml`):
+---
+
+### Configuration Structure
+
+A complete configuration file contains shared daemon infrastructure settings and one or more declared project namespaces (`[projects.<name>]` or top-level `[<project-name>]`):
 
 ```toml
 # ==============================================================================
@@ -429,78 +440,22 @@ strip_hook_bodies = true
 rust_models = "crates/shared-types/src"
 ts_types = "frontend/src/types"
 strict_casing_check = true
-```
 
-### 2. Repository-Local Configuration (`.canon.toml`)
-
-For standalone CLI commands (`cargo canon slice`, `simulate`, `verify`, `diff-fuzz`, `state-machine`), `cargo-canon` discovers repository settings from the project root. Candidate files are checked in order:
-
-1. `config/canon.toml`
-2. `.canon.toml`
-3. `canon.toml`
-4. `.config/canon.toml`
-5. `configs/canon.toml`
-
-A representative repository-local `.canon.toml`:
-
-```toml
-[general]
-codebase_scale = "massive"    # "small", "medium", "massive"
-default_format = "markdown"   # "markdown", "json", "text"
-
-[slice]
-max_call_depth = 2
-strip_comments = false
-include_private_types = true
-
-[simulate]
+[projects.acme-fullstack.simulate]
 default_seeds = 5000
 timeout_seconds = 30
 panic_hook = "capture_backtrace"
 
-[verify]
+[projects.acme-fullstack.verify]
 default_unwind = 4
-solver = "kissat"             # "kissat", "cadical", "z3"
+solver = "kissat"                     # "kissat", "cadical", "z3"
 
-[diff_fuzz]
+[projects.acme-fullstack.diff_fuzz]
 default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
-
-[typescript]
-enabled = true
-tsconfig_path = "frontend/tsconfig.json"
-extensions = ["ts", "tsx", "js", "jsx"]
-strip_jsx = true
-strip_hook_bodies = true
-
-[go]
-enabled = true
-module_root = "backend"
-extensions = ["go"]
-strip_function_bodies = true
-index_implicit_interfaces = true
-include_private_types = false
-
-[go.concurrency]
-race_detector = true
-goleak_check = true
-gomaxprocs_sweep = [1, 2, 4, 8]
-default_passes = 100
-
-[go.state_machine]
-fuzz_transitions = 100000
-seed = "0x1337C0DECAFEE00D"
-
-[cross_boundary]
-rust_models = "crates/shared-types/src"
-ts_types = "frontend/src/types"
-go_models = "backend/pkg/models"
-strict_casing_check = true
-strict_omitempty_check = true
-strict_nil_slice_check = true
 ```
 
-A complete, battle-tested reference template with 4 distinct production setups (Fullstack Monorepo with Worktrees, Pure Go Service, Systems Rust Engine, and TypeScript Frontend) is available in [`configs/canon.example.toml`](configs/canon.example.toml).
+A complete reference template covering 4 distinct production setups (Fullstack Monorepo with Worktrees, Pure Go Service, Systems Rust Engine, and TypeScript Frontend) is available in [`configs/canon.example.toml`](configs/canon.example.toml).
 
 ---
 
