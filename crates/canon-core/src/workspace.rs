@@ -32,7 +32,7 @@ pub fn splitmix64_str(s: &str) -> u64 {
 ///
 /// Hierarchy:
 /// 1. Ascend looking for `.git` (file or directory, handling worktrees and standard repos).
-/// 2. Ascend looking for `.canon.toml` or `.groundtruth.toml`.
+/// 2. Ascend looking for a valid canon config (`WORKSPACE_CONFIG_CANDIDATES`).
 /// 3. Fallback to `start_dir`.
 pub fn resolve_workspace_root(start_dir: &Path) -> PathBuf {
     let start = if start_dir.is_file() {

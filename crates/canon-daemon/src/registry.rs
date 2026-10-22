@@ -181,11 +181,19 @@ impl WorkspaceRegistry {
         canonical_root: &Path,
         parent_repo: Option<&Path>,
     ) -> (Option<String>, canon_core::ProjectConfig, Option<PathBuf>) {
-        if let Some((name, proj)) = self
-            .daemon_config
-            .find_project_for_path(canonical_root)
-            .or_else(|| parent_repo.and_then(|p| self.daemon_config.find_project_for_path(p)))
-        {
+        let direct = self.daemon_config.find_project_for_path(canonical_root);
+        let via_parent = parent_repo.and_then(|p| self.daemon_config.find_project_for_path(p));
+        let matched = match (direct, via_parent) {
+            (Some(d), Some(p))
+                if p.1.qualified_path.as_os_str().len() > d.1.qualified_path.as_os_str().len() =>
+            {
+                Some(p)
+            }
+            (Some(d), _) => Some(d),
+            (None, Some(p)) => Some(p),
+            (None, None) => None,
+        };
+        if let Some((name, proj)) = matched {
             return (
                 Some(name.to_string()),
                 proj.clone(),
@@ -676,7 +684,7 @@ pub mod tests {
         std::fs::create_dir_all(undeclared_repo.path().join(".git")).unwrap();
         std::fs::write(
             undeclared_repo.path().join(".canon.toml"),
-            "[daemon]\nignored_dirs = [\"src\"]\n",
+            "[slice]\ncustom_ignored_dirs = [\"src\"]\n",
         )
         .unwrap();
         std::fs::create_dir_all(undeclared_repo.path().join("src")).unwrap();

@@ -457,18 +457,32 @@ async fn handle_slice(
     cfg: &CanonConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut index = SymbolIndex::new();
-    let proj = cfg
+    let raw_parent = args
+        .target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
+    let ws_root = resolve_workspace_root(&parent);
+    let mut proj = cfg
         .find_project_for_path(&args.target)
+        .or_else(|| cfg.find_project_for_path(&ws_root))
         .map(|(_, p)| p.clone())
         .unwrap_or_else(|| {
-            let root = resolve_workspace_root(args.target.parent().unwrap_or(&args.target));
-            canon_core::ProjectConfig::from_canon_config(root, cfg)
+            let local_cfg = CanonConfig::discover_for_workspace(&ws_root);
+            local_cfg
+                .find_project_for_path(&ws_root)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| {
+                    canon_core::ProjectConfig::from_canon_config(ws_root.clone(), &local_cfg)
+                })
         });
-    if let Some(parent) = args.target.parent() {
-        let _ = index.index_directory_with_project(parent, &proj);
+    if args.depth != 2 {
+        proj.slice.max_call_depth = args.depth;
     }
-    if index.symbols_map.is_empty() {
-        let _ = index.index_directory_with_project(&PathBuf::from("."), &proj);
+    let _ = index.index_directory_with_project(&parent, &proj);
+    if index.symbols_map.is_empty() && parent != ws_root {
+        let _ = index.index_directory_with_project(&ws_root, &proj);
     }
     let bundle =
         slice_target_for_project(&args.target, args.mode, Some(&index), None, Some(&proj))?;

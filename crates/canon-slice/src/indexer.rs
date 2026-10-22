@@ -327,6 +327,14 @@ impl SymbolIndex {
         root: &Path,
         project: &canon_core::ProjectConfig,
     ) -> Vec<PathBuf> {
+        let rel_base = if !project.qualified_path.as_os_str().is_empty()
+            && root.starts_with(&project.qualified_path)
+            && !root.join(".git").exists()
+        {
+            project.qualified_path.as_path()
+        } else {
+            root
+        };
         WalkDir::new(root)
             .into_iter()
             .filter_entry(|e| {
@@ -334,7 +342,7 @@ impl SymbolIndex {
                 if e.depth() == 0 || p == root {
                     return true;
                 }
-                let Ok(rel) = p.strip_prefix(root) else {
+                let Ok(rel) = p.strip_prefix(rel_base) else {
                     return false;
                 };
                 if project.is_relative_path_ignored(rel) {
@@ -349,7 +357,7 @@ impl SymbolIndex {
                     if rel == Path::new(".worktrees") || rel.starts_with(".worktrees") {
                         return false;
                     }
-                    if let Some(wt_rel) = project.relative_custom_worktree_path(root) {
+                    if let Some(wt_rel) = project.relative_custom_worktree_path(rel_base) {
                         if rel == wt_rel || rel.starts_with(wt_rel) {
                             return false;
                         }
@@ -365,7 +373,7 @@ impl SymbolIndex {
             .filter(|e| {
                 let p = e.path();
                 let in_watch_paths = p
-                    .strip_prefix(root)
+                    .strip_prefix(rel_base)
                     .is_ok_and(|rel| project.is_file_in_watch_paths(rel));
                 in_watch_paths
                     && p.extension()
@@ -1704,6 +1712,14 @@ mod tests {
             ..canon_core::ProjectConfig::default()
         };
         let scoped_files = idx.collect_source_files_for_project(&ws_root, &scoped_proj);
-        assert_eq!(scoped_files, vec![watched_file]);
+        assert_eq!(scoped_files, vec![watched_file.clone()]);
+
+        // 3. Indexing a subdirectory under `ws_root` (as `handle_slice` does) still evaluates `watch_paths` relative to `qualified_path`.
+        let sub_files =
+            idx.collect_source_files_for_project(&ws_root.join("crates/core/src"), &scoped_proj);
+        assert_eq!(sub_files, vec![watched_file]);
+        let unwatched_sub =
+            idx.collect_source_files_for_project(&ws_root.join("unwatched/src"), &scoped_proj);
+        assert!(unwatched_sub.is_empty());
     }
 }

@@ -8,7 +8,7 @@ This directory contains drop-in configuration templates and starter kits for int
 
 | Template | Target Path in Your Project | Purpose |
 | :--- | :--- | :--- |
-| [`.canon.toml`](.canon.toml) | `.canon.toml` (repo root) | Full configuration options for slicing, simulation, fuzzing, Kani, daemon, TypeScript, Go (Tier 1 TSan/goleak & Tier 2 state machine), and cross-boundary contracts. |
+| [`canon.example.toml`](canon.example.toml) | `~/.config/canon/canon.toml` or `.canon.toml` | Full configuration template with daemon infrastructure controls and 4 real-world project scenarios (polyglot monorepo with worktrees, pure Go service, systems Rust engine, and TypeScript frontend). |
 | [`claude-config.json`](claude-config.json) | `.claude/config.json` | Configures Claude Code to automatically invoke the post-read advisory context hook (`.rs`, `.ts`, `.tsx`, `.go`). |
 | [`ground-truth.yml`](ground-truth.yml) | `.github/workflows/ground-truth.yml` | GitHub Actions CI workflow running deterministic simulation, differential fuzzing, and model checking across Rust and Go. |
 | [`pre-commit.sh`](pre-commit.sh) | `.git/hooks/pre-commit` or `.githooks/pre-commit` | Fast local git pre-commit hook verifying state machine reachability and running 500 simulation seeds. |
@@ -20,8 +20,12 @@ This directory contains drop-in configuration templates and starter kits for int
 ### 1. Enable Project Configuration
 
 ```sh
-# Copy reference config into your repository root
-cp configs/.canon.toml /path/to/your-project/.canon.toml
+# Copy reference config as system-wide daemon configuration:
+mkdir -p ~/.config/canon
+cp configs/canon.example.toml ~/.config/canon/canon.toml
+
+# Or copy into your repository root:
+cp configs/canon.example.toml /path/to/your-project/.canon.toml
 ```
 
 ### 2. Configure Claude Code Post-Read Hook

@@ -1,0 +1,267 @@
+# ==============================================================================
+# Canon Configuration Template (configs/canon.example.toml)
+# ==============================================================================
+#
+# This file serves as the canonical reference template for configuring cargo-canon.
+#
+# FILE LOCATIONS:
+#   1. System-wide / Multi-tenant daemon configuration:
+#      ~/.config/canon/canon.toml  (or /etc/canon/canon.toml)
+#   2. Repository-local configuration:
+#      <project-root>/config/canon.toml  or  <project-root>/.canon.toml
+#
+# CONFIGURATION ARCHITECTURE:
+#   - [daemon] defines shared background daemon infrastructure (socket, TTL, logging).
+#   - [<project-name>] defines per-project configuration. The daemon identifies projects
+#     by matching the workspace root path against `qualified_path` (longest prefix match)
+#     or by workspace directory name.
+#   - Below are realistic, annotated example configurations covering four common setups:
+#       1. Fullstack Polyglot Monorepo (Rust + TypeScript/React with Git Worktrees)
+#       2. High-Performance Pure Go Service (Single Checkout, No Worktrees)
+#       3. Mission-Critical Systems Rust Engine (Simulation, Model Checking, Fuzzing)
+#       4. Frontend-Only TypeScript / React Application
+# ==============================================================================
+
+# ==============================================================================
+# Daemon Infrastructure & Service Controls
+# ==============================================================================
+[daemon]
+# Whether this daemon operates in system-wide multi-tenant mode servicing all
+# repositories and AI coding agent sessions (Antigravity, Claude Code, Cursor).
+system_daemon = true
+
+# Defers memory-intensive AST parsing and index construction until first touch
+# on a workspace, eliminating cold-start latency and idle resource consumption.
+lazy_indexing = true
+
+# Inactivity threshold in seconds before unindexing an idle workspace from RAM.
+# Default: 7200 seconds (2 hours).
+idle_ttl_secs = 7200
+
+# Enables background filesystem watching via `notify` across all active workspaces.
+# Monitored files (.rs, .ts, .tsx, .js, .jsx, .go) trigger incremental re-indexing.
+enable_file_watcher = true
+
+# Enables isolated, per-workspace log files under <log_dir>/workspaces/<project>.log
+# in addition to the central daemon log.
+workspace_logging = true
+
+# Optional: Override Unix domain socket path (default: auto-derived in XDG runtime dir)
+# global_socket = "/run/user/1000/canon/daemon.sock"
+
+# Optional: Override directory for file logging (default: ~/.local/state/canon/logs)
+# log_dir = "~/.local/state/canon/logs"
+
+
+# ==============================================================================
+# SITUATION 1: Full-Stack Polyglot Monorepo (Rust + TypeScript/React + Worktrees)
+# ==============================================================================
+# Use this pattern for large repositories with a Rust backend/engine and a
+# TypeScript/React web frontend, where concurrent AI agent sessions run in isolated
+# Git worktrees (e.g. .claude/worktrees or .worktrees).
+# ==============================================================================
+[acme-fullstack]
+# Canonical absolute path to the main repository root.
+qualified_path = "/home/user/projects/acme-fullstack"
+
+# Whether this repository employs Git worktrees for concurrent agent workflows.
+has_worktrees = true
+
+# Path or subdirectory where worktrees are located (relative to root or absolute).
+# Both `custom_worktree_path` and `has_custom_worktree_path` are supported.
+custom_worktree_path = ".claude/worktrees"
+
+# Languages enabled for indexing and context slicing ("rust", "typescript", "go").
+# Can be specified as a comma-separated string or an array: ["rust", "typescript"]
+lang = "rust,typescript"
+
+# Codebase scale hint: "small", "medium", or "massive".
+# Allocates cache capacity, thread pools, and AST symbol tables accordingly.
+codebase_scale = "massive"
+
+# Output format for generated context slices and reports: "markdown", "json", or "text".
+default_format = "markdown"
+
+# Subdirectories to monitor for source modifications. Leave empty to monitor entire repo.
+watch_paths = ["crates", "frontend/src"]
+
+# Directory names to exclude from filesystem watching and indexing.
+ignored_dirs = [".claude", ".cursor", ".idea", ".vscode", "target", "node_modules", "dist"]
+
+# Slicing call-graph exploration depth bound (default: 2).
+max_call_depth = 2
+
+# Whether to strip comments during AST skeleton unparsing.
+strip_comments = false
+
+# Whether to include private/internal types in context exports.
+include_private_types = true
+
+# Custom directory names to ignore during candidate file discovery.
+custom_ignored_dirs = ["node_modules", "target", "dist", "build"]
+
+# TypeScript / TSX Context Slicing Engine
+[acme-fullstack.typescript]
+enabled = true
+tsconfig_path = "frontend/tsconfig.json"
+extensions = ["ts", "tsx", "js", "jsx"]
+# Strips JSX element trees down to component signatures: <div ... /> -> signature
+strip_jsx = true
+# Strips React hook internals (useEffect, useState, useCallback) to signatures
+strip_hook_bodies = true
+
+# Cross-Boundary Serde <-> TypeScript Contract Correlation
+[acme-fullstack.cross_boundary]
+# Directory containing shared Rust Serde structs/enums
+rust_models = "crates/shared-types/src"
+# Directory containing corresponding TypeScript interface definitions
+ts_types = "frontend/src/types"
+# Enforce strict camelCase vs snake_case field serialization checks
+strict_casing_check = true
+# Validate optional vs omitempty field consistency across language boundary
+strict_omitempty_check = true
+# Validate null vs empty list/slice serialization consistency
+strict_nil_slice_check = true
+
+# Deterministic Simulation Testing (madsim DST)
+[acme-fullstack.simulate]
+default_seeds = 5000
+timeout_seconds = 30
+panic_hook = "capture_backtrace"
+
+# Bounded Model Checking (cargo kani)
+[acme-fullstack.verify]
+default_unwind = 4
+solver = "kissat"
+
+# Differential Fuzzing (bolero)
+[acme-fullstack.diff_fuzz]
+default_iterations = 50000
+corpus_dir = "tests/fuzz/corpus"
+
+
+# ==============================================================================
+# SITUATION 2: High-Performance Pure Go Backend Service (Single Checkout, No Worktrees)
+# ==============================================================================
+# Use this pattern for Go services (APIs, payment gateways, microservices)
+# in a standard single git checkout without worktrees. Includes TSan race detector,
+# goroutine leak inspection, and pure Sans-I/O state machine fuzzing.
+# ==============================================================================
+[payment-service]
+qualified_path = "/home/user/projects/payment-service"
+has_worktrees = false
+lang = "go"
+codebase_scale = "medium"
+default_format = "markdown"
+
+# Focus watcher strictly on Go package directories
+watch_paths = ["cmd", "internal", "pkg"]
+ignored_dirs = [".claude", ".cursor", ".idea", ".vscode", "vendor", "bin"]
+
+max_call_depth = 2
+strip_comments = false
+include_private_types = false
+
+# Go AST Engine & Implicit Interface Resolver
+[payment-service.go]
+enabled = true
+module_root = "."
+extensions = ["go"]
+# Strips function and method bodies to /* implementation omitted */
+strip_function_bodies = true
+# Computes value receiver M(T) and pointer receiver M(*T) method sets to resolve
+# implicit interface satisfaction (T satisfies I iff M(I) subset M(T))
+index_implicit_interfaces = true
+include_private_types = false
+
+# Tier 1: Concurrency Race Detector & Goroutine Leak Verification
+[payment-service.go.concurrency]
+# Runs `go test -race` (TSan)
+race_detector = true
+# Integrates `uber-go/goleak` at test teardown to detect orphaned goroutines
+goleak_check = true
+# Randomized GOMAXPROCS sweeps to surface scheduler-dependent race conditions
+gomaxprocs_sweep = [1, 2, 4, 8]
+default_passes = 100
+
+# Tier 2: Pure Sans-I/O State Machine Transition Fuzzer
+[payment-service.go.state_machine]
+fuzz_transitions = 100000
+seed = "0x1337C0DECAFEE00D"
+
+# Cross-Boundary Go Backend Model Indexing
+[payment-service.cross_boundary]
+go_models = "pkg/models"
+strict_casing_check = true
+strict_omitempty_check = true
+strict_nil_slice_check = true
+
+
+# ==============================================================================
+# SITUATION 3: Systems Rust Library / Storage Engine (Simulation & Model Checking)
+# ==============================================================================
+# Use this pattern for mission-critical systems Rust (databases, storage engines,
+# consensus protocols, parsers) where correctness is verified via deterministic
+# simulation (DST), bounded model checking (Kani), and differential fuzzing.
+# ==============================================================================
+[storage-engine]
+qualified_path = "/home/user/projects/storage-engine"
+has_worktrees = false
+lang = "rust"
+codebase_scale = "massive"
+default_format = "markdown"
+
+watch_paths = ["crates", "src", "benches", "tests", "fuzz"]
+ignored_dirs = [".git", "target", "fixtures"]
+
+max_call_depth = 3
+strip_comments = false
+include_private_types = true
+custom_ignored_dirs = ["target", "dist"]
+
+# Deterministic Simulation Testing (DST via madsim)
+# Tests pass through thousands of randomized seeds under simulated scheduling & network faults.
+[storage-engine.simulate]
+default_seeds = 10000
+timeout_seconds = 60
+panic_hook = "capture_backtrace"
+
+# Bounded Model Checking (cargo kani)
+# Formally verifies panic-freedom, absence of arithmetic overflow, and invariant preservation.
+[storage-engine.verify]
+default_unwind = 8
+solver = "kissat"
+
+# Differential Property Fuzzing (bolero)
+# Proves behavioral equivalence across symbolic inputs and legacy implementations.
+[storage-engine.diff_fuzz]
+default_iterations = 100000
+corpus_dir = "fuzz/corpus"
+
+
+# ==============================================================================
+# SITUATION 4: Frontend-Only TypeScript / React Application (Single Checkout)
+# ==============================================================================
+# Use this pattern for web applications, SPAs, and UI dashboards (Next.js, Vite, React)
+# to produce compact, high-signal type skeletons for coding agents.
+# ==============================================================================
+[web-dashboard]
+qualified_path = "/home/user/projects/web-dashboard"
+has_worktrees = false
+lang = "typescript"
+codebase_scale = "small"
+default_format = "markdown"
+
+watch_paths = ["src", "public"]
+ignored_dirs = ["node_modules", ".next", "dist", ".cache", "build"]
+
+max_call_depth = 2
+strip_comments = false
+include_private_types = true
+
+[web-dashboard.typescript]
+enabled = true
+tsconfig_path = "tsconfig.json"
+extensions = ["ts", "tsx", "js", "jsx"]
+strip_jsx = true
+strip_hook_bodies = true

@@ -37,10 +37,7 @@ pub const WORKSPACE_CONFIG_CANDIDATES: &[&str] = &[
     ".canon.toml",
     "canon.toml",
     ".config/canon.toml",
-    "configs/.canon.toml",
     "configs/canon.toml",
-    ".groundtruth.toml",
-    "groundtruth.toml",
 ];
 
 /// Primary configuration structure for cargo-canon workspaces.
@@ -238,7 +235,7 @@ impl Default for DiffFuzzConfig {
 /// Background daemon configuration options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Legacy Unix domain socket path override (None = auto-derived per workspace/worktree).
+    /// Unix domain socket path override (None = auto-derived per workspace/worktree).
     #[serde(default)]
     pub socket_path: Option<String>,
     /// Whether this daemon operates in system-wide multi-tenant mode (default: true).
@@ -253,12 +250,6 @@ pub struct DaemonConfig {
     /// Inactivity threshold in seconds before unindexing an idle workspace (default: 7200 = 2 hours).
     #[serde(default = "default_idle_ttl_secs")]
     pub idle_ttl_secs: u64,
-    /// Directory path where linked worktrees reside (relative to workspace root).
-    #[serde(default)]
-    pub worktrees_dir: Option<String>,
-    /// Additional directories to ignore machine-wide or project-wide.
-    #[serde(default)]
-    pub ignored_dirs: Vec<String>,
     /// Whether background filesystem watching is enabled across active workspaces.
     #[serde(default = "default_true")]
     pub enable_file_watcher: bool,
@@ -268,22 +259,10 @@ pub struct DaemonConfig {
     /// Enable per-workspace isolated log files under <log_dir>/workspaces/ (default: true).
     #[serde(default = "default_true")]
     pub workspace_logging: bool,
-    /// Paths to monitor for source code modifications within each registered workspace.
-    #[serde(default = "default_watch_paths")]
-    pub watch_paths: Vec<String>,
 }
 
 fn default_idle_ttl_secs() -> u64 {
     7200
-}
-
-fn default_watch_paths() -> Vec<String> {
-    vec![
-        "crates".to_string(),
-        "frontend/src".to_string(),
-        "backend".to_string(),
-        "src".to_string(),
-    ]
 }
 
 impl Default for DaemonConfig {
@@ -294,12 +273,9 @@ impl Default for DaemonConfig {
             lazy_indexing: true,
             global_socket: None,
             idle_ttl_secs: default_idle_ttl_secs(),
-            worktrees_dir: None,
-            ignored_dirs: Vec::new(),
             enable_file_watcher: true,
             log_dir: None,
             workspace_logging: true,
-            watch_paths: default_watch_paths(),
         }
     }
 }
@@ -616,13 +592,13 @@ impl ProjectConfig {
     pub fn from_canon_config(root: PathBuf, cfg: &CanonConfig) -> Self {
         let mut proj = Self {
             qualified_path: root,
-            has_worktrees: cfg.daemon.worktrees_dir.is_some(),
-            custom_worktree_path: cfg.daemon.worktrees_dir.as_ref().map(PathBuf::from),
+            has_worktrees: false,
+            custom_worktree_path: None,
             lang: Vec::new(),
             codebase_scale: cfg.general.codebase_scale.clone(),
             default_format: cfg.general.default_format,
             watch_paths: Vec::new(),
-            ignored_dirs: cfg.daemon.ignored_dirs.clone(),
+            ignored_dirs: Vec::new(),
             max_call_depth: cfg.slice.max_call_depth,
             strip_comments: cfg.slice.strip_comments,
             include_private_types: cfg.slice.include_private_types,
@@ -1139,16 +1115,6 @@ impl CanonConfig {
         if overlay.daemon.idle_ttl_secs != def.daemon.idle_ttl_secs {
             self.daemon.idle_ttl_secs = overlay.daemon.idle_ttl_secs;
         }
-        if overlay.daemon.worktrees_dir.is_some() {
-            self.daemon.worktrees_dir = overlay.daemon.worktrees_dir.clone();
-        }
-        if !overlay.daemon.ignored_dirs.is_empty() {
-            self.daemon
-                .ignored_dirs
-                .extend(overlay.daemon.ignored_dirs.clone());
-            self.daemon.ignored_dirs.sort();
-            self.daemon.ignored_dirs.dedup();
-        }
         if overlay.daemon.enable_file_watcher != def.daemon.enable_file_watcher {
             self.daemon.enable_file_watcher = overlay.daemon.enable_file_watcher;
         }
@@ -1157,9 +1123,6 @@ impl CanonConfig {
         }
         if overlay.daemon.workspace_logging != def.daemon.workspace_logging {
             self.daemon.workspace_logging = overlay.daemon.workspace_logging;
-        }
-        if overlay.daemon.watch_paths != def.daemon.watch_paths {
-            self.daemon.watch_paths = overlay.daemon.watch_paths.clone();
         }
     }
 
@@ -1264,8 +1227,8 @@ impl CanonConfig {
         (Self::default(), ConfigProvenance::default())
     }
 
-    /// Automatically discovers `.canon.toml` or `.groundtruth.toml` from the current
-    /// directory or its ancestors. Falls back to default settings if neither exists.
+    /// Automatically discovers workspace configuration (`canon.toml` / `.canon.toml`) from the current
+    /// directory or its ancestors. Falls back to default settings if none exists.
     pub fn discover() -> Self {
         Self::discover_with_provenance().0
     }
@@ -1351,9 +1314,6 @@ strip_jsx = true
 rust_models = "crates/shared-types/src"
 ts_types = "frontend/src/types"
 strict_casing_check = true
-
-[daemon]
-watch_paths = ["crates", "frontend/src"]
 "#
         )
         .unwrap();
@@ -1365,7 +1325,6 @@ watch_paths = ["crates", "frontend/src"]
         assert_eq!(cfg.cross_boundary.rust_models, "crates/shared-types/src");
         assert_eq!(cfg.cross_boundary.ts_types, "frontend/src/types");
         assert!(cfg.cross_boundary.strict_casing_check);
-        assert_eq!(cfg.daemon.watch_paths.len(), 2);
     }
 
     #[test]
@@ -1433,12 +1392,9 @@ strict_nil_slice_check = true
 system_daemon = true
 global_socket = "/tmp/global.sock"
 idle_ttl_secs = 3600
-worktrees_dir = ".claude/worktrees"
-ignored_dirs = [".claude", ".cursor"]
 enable_file_watcher = false
 log_dir = "/var/log/canon"
 workspace_logging = true
-watch_paths = ["crates", "src"]
 "#
         )
         .unwrap();
@@ -1450,15 +1406,9 @@ watch_paths = ["crates", "src"]
             Some("/tmp/global.sock".to_string())
         );
         assert_eq!(cfg.daemon.idle_ttl_secs, 3600);
-        assert_eq!(
-            cfg.daemon.worktrees_dir,
-            Some(".claude/worktrees".to_string())
-        );
-        assert_eq!(cfg.daemon.ignored_dirs, vec![".claude", ".cursor"]);
         assert!(!cfg.daemon.enable_file_watcher);
         assert_eq!(cfg.daemon.log_dir, Some("/var/log/canon".to_string()));
         assert!(cfg.daemon.workspace_logging);
-        assert_eq!(cfg.daemon.watch_paths, vec!["crates", "src"]);
     }
 
     #[test]
@@ -1467,14 +1417,10 @@ watch_paths = ["crates", "src"]
         let mut overlay = CanonConfig::default();
         overlay.general.codebase_scale = "small".to_string();
         overlay.daemon.idle_ttl_secs = 1800;
-        overlay.daemon.worktrees_dir = Some(".worktrees".to_string());
-        overlay.daemon.ignored_dirs = vec![".tmp".to_string()];
 
         base.merge(overlay);
         assert_eq!(base.general.codebase_scale, "small");
         assert_eq!(base.daemon.idle_ttl_secs, 1800);
-        assert_eq!(base.daemon.worktrees_dir, Some(".worktrees".to_string()));
-        assert_eq!(base.daemon.ignored_dirs, vec![".tmp"]);
     }
 
     #[test]
@@ -1641,5 +1587,58 @@ module_root = "backend"
             Some(std::fs::canonicalize(&cfg_file).unwrap().as_path())
         );
         assert!(prov.primary_path().is_some());
+    }
+
+    #[test]
+    fn test_template_config_file_validity() {
+        let template_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/canon.example.toml");
+        let (cfg, loaded_path) =
+            CanonConfig::load_daemon_config(Some(&template_path)).expect("failed to load template");
+        assert!(loaded_path.is_some());
+        assert!(cfg.daemon.system_daemon);
+        assert!(cfg.daemon.lazy_indexing);
+        assert_eq!(cfg.daemon.idle_ttl_secs, 7200);
+        assert!(cfg.daemon.enable_file_watcher);
+        assert!(cfg.daemon.workspace_logging);
+
+        assert_eq!(cfg.projects.len(), 4);
+        assert!(cfg.projects.contains_key("acme-fullstack"));
+        assert!(cfg.projects.contains_key("payment-service"));
+        assert!(cfg.projects.contains_key("storage-engine"));
+        assert!(cfg.projects.contains_key("web-dashboard"));
+
+        let acme = cfg.projects.get("acme-fullstack").unwrap();
+        assert!(acme.has_worktrees);
+        assert_eq!(acme.lang, vec!["rust", "typescript"]);
+        assert!(acme.typescript.enabled);
+        assert!(acme.typescript.strip_jsx);
+        assert!(acme.typescript.strip_hook_bodies);
+        assert!(acme.cross_boundary.strict_casing_check);
+        assert_eq!(acme.simulate.default_seeds, 5000);
+        assert_eq!(acme.verify.solver, "kissat");
+        assert_eq!(acme.diff_fuzz.default_iterations, 50000);
+
+        let payment = cfg.projects.get("payment-service").unwrap();
+        assert!(!payment.has_worktrees);
+        assert_eq!(payment.lang, vec!["go"]);
+        assert!(payment.go.enabled);
+        assert!(payment.go.index_implicit_interfaces);
+        assert!(payment.go.concurrency.race_detector);
+        assert!(payment.go.concurrency.goleak_check);
+        assert_eq!(payment.go.state_machine.fuzz_transitions, 100000);
+
+        let storage = cfg.projects.get("storage-engine").unwrap();
+        assert!(!storage.has_worktrees);
+        assert_eq!(storage.lang, vec!["rust"]);
+        assert_eq!(storage.simulate.default_seeds, 10000);
+        assert_eq!(storage.verify.default_unwind, 8);
+        assert_eq!(storage.diff_fuzz.default_iterations, 100000);
+
+        let web = cfg.projects.get("web-dashboard").unwrap();
+        assert!(!web.has_worktrees);
+        assert_eq!(web.lang, vec!["typescript"]);
+        assert_eq!(web.codebase_scale, "small");
+        assert!(web.typescript.enabled);
     }
 }

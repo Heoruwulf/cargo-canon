@@ -399,13 +399,11 @@ corpus_dir = "tests/fuzz/corpus"
 [daemon]
 system_daemon = true                  # Multi-tenant mode (default: true; false = legacy isolated mode)
 # global_socket = "/run/user/1000/canon/daemon.sock" # Optional override
+lazy_indexing = true                  # Defer AST indexing until first touch on workspace
 idle_ttl_secs = 7200                  # Inactivity threshold before unindexing idle workspaces
-worktrees_dir = ".claude/worktrees"   # Nested worktree directory (auto-pruned from parent walks)
-ignored_dirs = [".claude", ".cursor", ".worktrees"]
 enable_file_watcher = true
 # log_dir = "~/.local/state/canon/logs"
 workspace_logging = true              # Isolated logs under <log_dir>/workspaces/
-watch_paths = ["crates", "frontend/src", "backend", "src"]
 
 [typescript]
 enabled = true
@@ -441,7 +439,7 @@ strict_omitempty_check = true
 strict_nil_slice_check = true
 ```
 
-Annotated template available in [`configs/.canon.toml`](configs/.canon.toml).
+Annotated template available in [`configs/canon.example.toml`](configs/canon.example.toml).
 
 ---
 
@@ -467,7 +465,7 @@ Pre-packaged configuration templates and starter kits are provided in the [`conf
 
 - [`docs/overview.md`](docs/overview.md): Illustrated architectural guide to token savings, AST slicing, and context bloat reduction for Claude and Antigravity.
 - [`docs/instructions.md`](docs/instructions.md): Step-by-step setup guide for your codebase & Claude Code onboarding.
-- [`configs/.canon.toml`](configs/.canon.toml): Full repository configuration template.
+- [`configs/canon.example.toml`](configs/canon.example.toml): Full repository configuration template.
 - [`configs/claude-config.json`](configs/claude-config.json): Claude Code hook setup.
 - [`configs/ground-truth.yml`](configs/ground-truth.yml): GitHub Actions CI verification workflow.
 - [`configs/pre-commit.sh`](configs/pre-commit.sh): Local git pre-commit hook script.
