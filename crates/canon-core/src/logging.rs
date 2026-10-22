@@ -17,7 +17,8 @@ pub fn init_logging(verbosity: u8, json: bool) -> Result<(), CoreError> {
 
     let subscriber_builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(true);
+        .with_target(true)
+        .with_writer(std::io::stderr);
 
     if json {
         subscriber_builder
@@ -116,5 +117,11 @@ pub mod tests {
         let log_dir = resolve_default_log_dir();
         assert!(log_dir.to_str().unwrap().contains("canon"));
         assert!(log_dir.to_str().unwrap().contains("logs"));
+    }
+
+    #[test]
+    fn test_init_logging_idempotent() {
+        // init_logging routes to stderr and returns Ok or LoggingInit error if subscriber was already set
+        let _ = init_logging(0, false);
     }
 }

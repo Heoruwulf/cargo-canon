@@ -24,7 +24,10 @@ pub use indexer::{
     SymbolIndexMetrics, is_ignored_path,
 };
 pub use skeleton::{SkeletonStripper, extract_file_skeleton, extract_skeleton, strip_file_ast};
-pub use ts_skeleton::{extract_ts_file_skeleton, extract_ts_skeleton};
+pub use ts_skeleton::{
+    extract_ts_file_skeleton, extract_ts_file_skeleton_with_options, extract_ts_skeleton,
+    extract_ts_skeleton_with_options,
+};
 
 use canon_core::model::SliceMode;
 use std::path::Path;
@@ -66,7 +69,12 @@ pub fn slice_target_for_project(
         .and_then(|e| e.to_str())
         .unwrap_or("");
     let skeleton = if matches!(ext, "ts" | "tsx" | "js" | "jsx") {
-        extract_ts_skeleton(&raw_source, matches!(ext, "tsx" | "jsx"))?
+        let include_private = project.is_none_or(|p| p.slice.include_private_types);
+        extract_ts_skeleton_with_options(
+            &raw_source,
+            matches!(ext, "tsx" | "jsx"),
+            include_private,
+        )?
     } else if ext == "go" {
         let include_private =
             project.is_none_or(|p| p.go.include_private_types && p.slice.include_private_types);
@@ -107,24 +115,24 @@ pub fn slice_target_for_project(
         }
         if matches!(mode, SliceMode::Hierarchy | SliceMode::Bundle) {
             let ov_callers = overlay_index
-                .map(|idx| idx.get_callers(target_name, call_depth))
+                .map(|idx| collect_callers(idx, target_path, target_name, call_depth))
                 .unwrap_or_default();
             callers = if !ov_callers.is_empty() {
                 ov_callers
             } else {
                 base_index
-                    .map(|idx| idx.get_callers(target_name, call_depth))
+                    .map(|idx| collect_callers(idx, target_path, target_name, call_depth))
                     .unwrap_or_default()
             };
 
             let ov_callees = overlay_index
-                .map(|idx| idx.get_callees(target_name, call_depth))
+                .map(|idx| collect_callees(idx, target_path, target_name, call_depth))
                 .unwrap_or_default();
             callees = if !ov_callees.is_empty() {
                 ov_callees
             } else {
                 base_index
-                    .map(|idx| idx.get_callees(target_name, call_depth))
+                    .map(|idx| collect_callees(idx, target_path, target_name, call_depth))
                     .unwrap_or_default()
             };
         }
@@ -147,6 +155,101 @@ pub fn slice_target_for_project(
     })
 }
 
+fn path_matches(p1: &Path, p2: &Path) -> bool {
+    p1 == p2 || p1.ends_with(p2) || p2.ends_with(p1)
+}
+
+fn collect_callers(
+    idx: &SymbolIndex,
+    target_path: &Path,
+    target_name: &str,
+    depth: usize,
+) -> Vec<CallEdge> {
+    let mut callers = idx.get_callers(target_name, depth);
+    let file_str = target_path.to_string_lossy();
+    let syms = idx.file_to_symbols.get(file_str.as_ref()).or_else(|| {
+        idx.file_to_symbols.iter().find_map(|(f, s)| {
+            if path_matches(target_path, Path::new(f)) {
+                Some(s)
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(sym_names) = syms {
+        for sym in sym_names {
+            for edge in idx.get_callers(sym, depth) {
+                if !callers.contains(&edge) {
+                    callers.push(edge);
+                }
+            }
+        }
+    }
+    callers
+}
+
+fn collect_callees(
+    idx: &SymbolIndex,
+    target_path: &Path,
+    target_name: &str,
+    depth: usize,
+) -> Vec<CallEdge> {
+    let mut callees = idx.get_callees(target_name, depth);
+    let file_str = target_path.to_string_lossy();
+    let syms = idx.file_to_symbols.get(file_str.as_ref()).or_else(|| {
+        idx.file_to_symbols.iter().find_map(|(f, s)| {
+            if path_matches(target_path, Path::new(f)) {
+                Some(s)
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(sym_names) = syms {
+        for sym in sym_names {
+            for edge in idx.get_callees(sym, depth) {
+                if !callees.contains(&edge) {
+                    callees.push(edge);
+                }
+            }
+        }
+    }
+    callees
+}
+
+fn def_matches_path(def_opt: &Option<String>, target_path: &Path) -> bool {
+    let Some(def) = def_opt else { return false };
+    let file_part = def.split(':').next().unwrap_or("");
+    if file_part.is_empty() {
+        return false;
+    }
+    path_matches(target_path, Path::new(file_part))
+}
+
+fn is_valid_cross_boundary(cb: &CrossBoundaryImpact, target_path: &Path) -> bool {
+    let rust_matches_target = def_matches_path(&cb.rust_definition, target_path);
+    let go_matches_target = def_matches_path(&cb.go_definition, target_path);
+    let ts_matches_target = def_matches_path(&cb.ts_interface, target_path);
+
+    let has_other_backend = (cb.rust_definition.is_some() && !rust_matches_target)
+        || (cb.go_definition.is_some() && !go_matches_target);
+    let has_other_ts = cb.ts_interface.is_some() && !ts_matches_target;
+
+    let has_valid_backend = if rust_matches_target || go_matches_target {
+        has_other_ts
+    } else {
+        cb.rust_definition.is_some() || cb.go_definition.is_some()
+    };
+
+    let has_valid_ts = if ts_matches_target {
+        has_other_backend
+    } else {
+        cb.ts_interface.is_some()
+    };
+
+    (has_valid_backend && has_valid_ts) || !cb.api_call_sites.is_empty()
+}
+
 fn resolve_cross_boundary(
     idx: &SymbolIndex,
     target_path: &Path,
@@ -159,28 +262,40 @@ fn resolve_cross_boundary(
         .trim_end_matches(".jsx")
         .trim_end_matches(".js")
         .trim_end_matches(".go");
-    idx.get_cross_boundary_impact(sym_stem)
-        .or_else(|| idx.get_cross_boundary_impact(target_name))
-        .or_else(|| {
-            let file_str = target_path.to_string_lossy();
-            if let Some(sym_names) = idx.file_to_symbols.get(file_str.as_ref()) {
-                for sym_name in sym_names {
-                    if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+
+    if let Some(cb) = idx.get_cross_boundary_impact(sym_stem) {
+        if is_valid_cross_boundary(&cb, target_path) {
+            return Some(cb);
+        }
+    }
+    if let Some(cb) = idx.get_cross_boundary_impact(target_name) {
+        if is_valid_cross_boundary(&cb, target_path) {
+            return Some(cb);
+        }
+    }
+
+    let file_str = target_path.to_string_lossy();
+    if let Some(sym_names) = idx.file_to_symbols.get(file_str.as_ref()) {
+        for sym_name in sym_names {
+            if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+                if is_valid_cross_boundary(&cb, target_path) {
+                    return Some(cb);
+                }
+            }
+        }
+    }
+    for (indexed_file, sym_names) in &idx.file_to_symbols {
+        if path_matches(target_path, Path::new(indexed_file)) {
+            for sym_name in sym_names {
+                if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
+                    if is_valid_cross_boundary(&cb, target_path) {
                         return Some(cb);
                     }
                 }
             }
-            for (indexed_file, sym_names) in &idx.file_to_symbols {
-                if file_str.ends_with(indexed_file) || indexed_file.ends_with(file_str.as_ref()) {
-                    for sym_name in sym_names {
-                        if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
-                            return Some(cb);
-                        }
-                    }
-                }
-            }
-            None
-        })
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -404,5 +519,77 @@ mod tests {
         let bundle_with_priv =
             slice_target_for_project(&go_path, SliceMode::Bundle, None, None, Some(&proj)).unwrap();
         assert!(bundle_with_priv.skeleton.contains("func helper()"));
+    }
+
+    #[test]
+    fn test_ts_import_callers_and_no_self_referential_cross_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let utils_path = dir.path().join("utils.ts");
+        let component_path = dir.path().join("Button.tsx");
+
+        std::fs::write(
+            &utils_path,
+            r#"
+            export function cn(...inputs: any[]) {
+                return inputs.filter(Boolean).join(" ");
+            }
+            "#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &component_path,
+            r#"
+            import { cn } from "./utils";
+
+            export function Button() {
+                return <div className={cn("btn", "primary")}>Click</div>;
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut index = SymbolIndex::new();
+        index.index_directory(dir.path()).unwrap();
+
+        let bundle = slice_target(&utils_path, SliceMode::Bundle, Some(&index)).unwrap();
+
+        // 1. Must NOT emit self-referential cross-boundary impact
+        assert!(
+            bundle.cross_boundary.is_none(),
+            "Pure TypeScript symbol must not emit cross-boundary impact"
+        );
+
+        // 2. Must list Button.tsx as an upstream caller
+        assert!(!bundle.callers.is_empty(), "Must index callers of cn");
+        assert_eq!(bundle.callers[0].callee, "cn");
+        assert!(bundle.callers[0].caller.contains("Button.tsx"));
+
+        // 3. Formatted markdown verification
+        let md = bundle.format_markdown();
+        assert!(!md.contains("## Cross-Boundary Impact"));
+        assert!(md.contains("## Upstream Callers"));
+        assert!(md.contains("calls `cn`"));
+        assert!(md.contains("Button.tsx"));
+    }
+
+    #[test]
+    fn test_path_matches_component_isolation() {
+        assert!(path_matches(
+            Path::new("/path/to/utils.ts"),
+            Path::new("utils.ts")
+        ));
+        assert!(path_matches(
+            Path::new("utils.ts"),
+            Path::new("/path/to/utils.ts")
+        ));
+        assert!(!path_matches(
+            Path::new("/path/to/other_utils.ts"),
+            Path::new("utils.ts")
+        ));
+        assert!(!path_matches(
+            Path::new("my_utils.ts"),
+            Path::new("/path/to/utils.ts")
+        ));
     }
 }
