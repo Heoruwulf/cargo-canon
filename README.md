@@ -286,6 +286,9 @@ cargo canon state-machine --lang go --transitions 500000
 # Start system-wide multi-tenant IPC daemon (or pass --isolated for single-workspace mode)
 cargo canon daemon
 
+# Start daemon with explicit configuration file override
+cargo canon daemon --config ~/.config/canon/canon.toml
+
 # Probe running daemon liveness and report round-trip latency
 cargo canon daemon --ping
 
@@ -369,9 +372,76 @@ RUST_LOG=debug cargo canon daemon --json
 
 ---
 
-## Configuration (`.canon.toml`)
+## Configuration
 
-Place a `.canon.toml` file in your repository root:
+`cargo-canon` uses a strict two-tier configuration model ensuring seamless multi-tenant indexing across concurrent AI agent workflows while retaining complete repository-local flexibility.
+
+### 1. System-Wide Daemon Configuration (`~/.config/canon/canon.toml`)
+
+The background indexing daemon services all repositories and AI coding agent sessions (Claude Code, Antigravity, Cursor). It reads shared daemon infrastructure controls and declarative project registrations from a central system location:
+
+- **Config Discovery Hierarchy**:
+  1. `$XDG_CONFIG_HOME/canon/canon.toml`
+  2. `~/.config/canon/canon.toml`
+  3. `~/Library/Application Support/canon/canon.toml` (macOS)
+  4. `/etc/canon/canon.toml` or `/etc/canon/config.toml` (Linux / Docker / Kubernetes)
+  5. Explicit CLI flag: `cargo canon daemon --config <PATH>`
+
+> [!IMPORTANT]
+> **Strict Daemon CWD Isolation**: To guarantee deterministic multi-tenant security and prevent configuration poisoning across agent sessions, the background daemon loads its configuration **strictly** from the system path or `--config`. It never executes or merges arbitrary workspace-local configuration files from client working directories.
+
+A representative system-wide daemon configuration (`~/.config/canon/canon.toml`):
+
+```toml
+# ==============================================================================
+# Daemon Infrastructure & Service Controls
+# ==============================================================================
+[daemon]
+system_daemon = true                  # Multi-tenant mode servicing all workspaces
+lazy_indexing = true                  # Defers AST indexing until first touch on workspace
+idle_ttl_secs = 7200                  # Unindexes idle workspaces after 2 hours of inactivity
+enable_file_watcher = true            # Background notify file watcher across active repos
+workspace_logging = true              # Isolated logs under <log_dir>/workspaces/<project>.log
+# global_socket = "/run/user/1000/canon/daemon.sock" # Optional Unix domain socket override
+# log_dir = "~/.local/state/canon/logs"               # Optional log directory override
+
+# ==============================================================================
+# Declared Project Registration (Longest-Prefix Path Matching)
+# ==============================================================================
+[projects.acme-fullstack]
+qualified_path = "/home/user/projects/acme-fullstack"
+has_worktrees = true                  # Enables Copy-on-Write overlay indexing for Git worktrees
+custom_worktree_path = ".claude/worktrees" # Path to linked worktree checkouts
+lang = ["rust", "typescript"]         # Enabled language analyzers ("rust", "typescript", "go")
+codebase_scale = "massive"            # "small", "medium", "massive"
+default_format = "markdown"           # "markdown", "json", "text"
+watch_paths = ["crates", "frontend/src"] # Subdirectories to monitor for file changes
+ignored_dirs = [".claude", ".cursor", "target", "node_modules", "dist"]
+
+[projects.acme-fullstack.typescript]
+enabled = true
+tsconfig_path = "frontend/tsconfig.json"
+extensions = ["ts", "tsx", "js", "jsx"]
+strip_jsx = true
+strip_hook_bodies = true
+
+[projects.acme-fullstack.cross_boundary]
+rust_models = "crates/shared-types/src"
+ts_types = "frontend/src/types"
+strict_casing_check = true
+```
+
+### 2. Repository-Local Configuration (`.canon.toml`)
+
+For standalone CLI commands (`cargo canon slice`, `simulate`, `verify`, `diff-fuzz`, `state-machine`), `cargo-canon` discovers repository settings from the project root. Candidate files are checked in order:
+
+1. `config/canon.toml`
+2. `.canon.toml`
+3. `canon.toml`
+4. `.config/canon.toml`
+5. `configs/canon.toml`
+
+A representative repository-local `.canon.toml`:
 
 ```toml
 [general]
@@ -395,15 +465,6 @@ solver = "kissat"             # "kissat", "cadical", "z3"
 [diff_fuzz]
 default_iterations = 50000
 corpus_dir = "tests/fuzz/corpus"
-
-[daemon]
-system_daemon = true                  # Multi-tenant mode (default: true; false = legacy isolated mode)
-# global_socket = "/run/user/1000/canon/daemon.sock" # Optional override
-lazy_indexing = true                  # Defer AST indexing until first touch on workspace
-idle_ttl_secs = 7200                  # Inactivity threshold before unindexing idle workspaces
-enable_file_watcher = true
-# log_dir = "~/.local/state/canon/logs"
-workspace_logging = true              # Isolated logs under <log_dir>/workspaces/
 
 [typescript]
 enabled = true
@@ -439,7 +500,7 @@ strict_omitempty_check = true
 strict_nil_slice_check = true
 ```
 
-Annotated template available in [`configs/canon.example.toml`](configs/canon.example.toml).
+A complete, battle-tested reference template with 4 distinct production setups (Fullstack Monorepo with Worktrees, Pure Go Service, Systems Rust Engine, and TypeScript Frontend) is available in [`configs/canon.example.toml`](configs/canon.example.toml).
 
 ---
 

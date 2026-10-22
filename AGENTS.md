@@ -9,7 +9,7 @@ Guidance for AI coding agents working in this repository. This is a Rust **2024*
   - `crates/cargo-canon` (or root binary crate): executable CLI entrypoint and cargo subcommand router (`cargo canon <COMMAND>` / `cargo groundtruth <COMMAND>`). Dispatches to subcommands: `slice`, `simulate`, `diff-fuzz`, `verify`, `invariants`, `state-machine`, `daemon`.
   - `crates/canon-core`: workspace foundation:
     - CLI argument parsing via `clap` (derive API with structured subcommands).
-    - Configuration discovery and deserialization (`.groundtruth.toml` / `.canon.toml`) including `TypeScriptConfig`, `GoConfig`, and `CrossBoundaryConfig`.
+    - Configuration discovery and deserialization: strict two-location configuration model (system-wide daemon configuration at `~/.config/canon/canon.toml` or `--config`, and repository-local configuration discovering `config/canon.toml`, `.canon.toml`, `canon.toml`, `.config/canon.toml`, `configs/canon.toml`) supporting declarative project namespaces (`[projects.<name>]` / `[<project-name>]`), `ProjectConfig`, `TypeScriptConfig`, `GoConfig`, and `CrossBoundaryConfig`.
     - Structured logging initialization (`tracing`, `tracing-subscriber`).
     - Standardized terminal diagnostics (`colored`, `anstream`).
     - Core error primitives (`thiserror`).
@@ -33,8 +33,8 @@ Guidance for AI coding agents working in this repository. This is a Rust **2024*
     - Exhaustive transition matrix fuzzer capable of >1,000,000 state transitions/sec for Rust state machines, pure TypeScript reducers (`--ts-reducer`), and pure Go state machines (`--lang go` / `--go-state-machine`).
   - `crates/canon-daemon`: agent sidecar and background indexing daemon:
     - High-throughput system-wide multi-tenant IPC server (`$XDG_RUNTIME_DIR/canon/daemon.sock`, fallback to `/tmp/canon-<hash>.sock` or `--isolated`) servicing all repositories and AI agent sessions.
-    - Lazy on-demand cold starts on first touch with single-flight initialization and Copy-on-Write overlay indexing for Git worktrees.
-    - Dynamic multi-path file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.go` across all active registered workspaces.
+    - Lazy on-demand cold starts on first touch with single-flight initialization, Copy-on-Write overlay indexing for Git worktrees, longest-prefix project resolution against declarative system configuration, and strict CWD isolation (daemon never loads untrusted workspace-local configs).
+    - Dynamic multi-path file watcher via `notify` monitoring `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, and `.go` scoped to per-project `watch_paths` and `ignored_dirs`.
     - Multi-tier file logging (timestamped daemon log + isolated per-workspace log files) and process RSS/heap memory telemetry in MB.
     - Non-destructive tool hook handlers (`hook post-read`).
 - **NON-DESTRUCTIVE ADVISORY CONTEXT INJECTION (CRITICAL INVARIANT)**:
@@ -91,6 +91,7 @@ cargo canon state-machine --fuzz-transitions                       # fuzz pure S
 cargo canon state-machine --ts-reducer <PATH> --fuzz-transitions   # fuzz pure TypeScript reducer transitions
 cargo canon state-machine --lang go --transitions 500000           # fuzz pure Sans-I/O Go state machine transitions
 cargo canon daemon                                                 # start system-wide multi-tenant indexing daemon (or --isolated)
+cargo canon daemon --config <PATH>                                 # start daemon with explicit configuration file override
 cargo canon daemon --ping                                          # probe running daemon liveness and latency
 cargo canon daemon --status                                        # query multi-tenant registry, RSS memory in MB, and log paths
 cargo canon daemon --stop                                          # gracefully stop running background daemon
@@ -290,7 +291,8 @@ cargo doc --package tracing --no-deps --open      # view structured diagnostic i
   - Utilize `miette` or `anstream` to format terminal error diagnostics with clear source code snippets, colored underlines, and specific error codes.
 - **Daemon Architecture & IPC**:
   - Deliver background indexing and sub-millisecond agent tool hook execution via `crates/canon-daemon`.
-  - Conduct IPC over Unix domain sockets (`/tmp/canon-<hash>.sock` per workspace) or named pipes using length-prefixed JSON or bincode framing.
+  - Conduct IPC over Unix domain sockets (`$XDG_RUNTIME_DIR/canon/daemon.sock` for system multi-tenant mode, fallback to `/tmp/canon-<hash>.sock` or `--isolated`) using length-prefixed JSON framing.
+  - Load configuration strictly from system paths (`~/.config/canon/canon.toml`, `/etc/canon/canon.toml`) or `--config`; preserve CWD isolation across multi-tenant sessions.
   - Configure `notify::RecommendedWatcher` with debouncing (e.g., 50ms) to consolidate rapid multi-file IDE save events before triggering AST re-indexing.
 - **Graceful Shutdown**:
   - Monitor termination signals via `tokio::signal::ctrl_c()` and Unix `tokio::signal::unix::signal(SignalKind::terminate())`.
