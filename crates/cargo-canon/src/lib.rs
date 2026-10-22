@@ -1122,34 +1122,7 @@ fn print_daemon_status_table(status: &DaemonStatusInfo) {
     println!("File Watcher:   {}", watcher_str);
 
     if !status.workspaces.is_empty() {
-        println!("\nActive Workspace Registry:");
-        println!(
-            "  {:<32} {:<6} {:>8} {:>10} {:>10}  {:<32} {:>8}",
-            "WORKSPACE", "TYPE", "FILES", "SYMBOLS", "MEMORY", "LOG FILE", "ACCESSED"
-        );
-        println!("  {}", "-".repeat(112));
-        for ws in &status.workspaces {
-            let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
-            let root_trunc = truncate_tail(&ws.root.display().to_string(), 32);
-            let log_str = ws
-                .log_path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("");
-            let log_trunc = truncate_tail(log_str, 32);
-            let accessed_str = format_time_ago(ws.last_accessed_secs_ago);
-            println!(
-                "  {:<32} {:<6} {:>8} {:>10} {:>8.1} MB  {:<32} {:>8}",
-                root_trunc,
-                ws_type,
-                format_with_commas(ws.indexed_files),
-                format_with_commas(ws.total_symbols),
-                ws.memory_mb,
-                log_trunc,
-                accessed_str
-            );
-        }
-        println!();
+        print_workspace_registry_table(&status.workspaces);
     }
 
     // --- Context Bloat Section ---
@@ -1171,6 +1144,55 @@ fn print_daemon_status_table(status: &DaemonStatusInfo) {
     } else {
         println!("Context Bloat:  0 B (no requests served yet)");
     }
+}
+
+fn print_workspace_registry_table(workspaces: &[canon_daemon::WorkspaceSummary]) {
+    println!("\nActive Workspace Registry:");
+    println!(
+        "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>10}  {:<24} {:<28} {:>8}",
+        "WORKSPACE",
+        "PROJECT",
+        "TYPE",
+        "FILES",
+        "SYMBOLS",
+        "MEMORY",
+        "CONFIG",
+        "LOG FILE",
+        "ACCESSED"
+    );
+    println!("  {}", "-".repeat(150));
+    for ws in workspaces {
+        let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
+        let root_trunc = truncate_tail(&ws.root.display().to_string(), 28);
+        let proj_trunc = truncate_tail(ws.project_name.as_deref().unwrap_or("-"), 16);
+        let cfg_str = ws
+            .config_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|f| f.to_str())
+            .unwrap_or("-");
+        let cfg_trunc = truncate_tail(cfg_str, 24);
+        let log_str = ws
+            .log_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        let log_trunc = truncate_tail(log_str, 28);
+        let accessed_str = format_time_ago(ws.last_accessed_secs_ago);
+        println!(
+            "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>8.1} MB  {:<24} {:<28} {:>8}",
+            root_trunc,
+            proj_trunc,
+            ws_type,
+            format_with_commas(ws.indexed_files),
+            format_with_commas(ws.total_symbols),
+            ws.memory_mb,
+            cfg_trunc,
+            log_trunc,
+            accessed_str
+        );
+    }
+    println!();
 }
 
 async fn handle_daemon_stop(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {

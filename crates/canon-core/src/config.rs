@@ -537,7 +537,8 @@ pub struct ProjectConfig {
     pub default_format: OutputFormat,
 
     /// Subdirectories to monitor for source code modifications within this project.
-    #[serde(default = "default_watch_paths")]
+    /// Empty means all non-ignored paths under the workspace root are monitored.
+    #[serde(default)]
     pub watch_paths: Vec<String>,
     /// Additional directory names to ignore during indexing and watching.
     #[serde(default)]
@@ -588,7 +589,7 @@ impl Default for ProjectConfig {
             lang: Vec::new(),
             codebase_scale: default_codebase_scale(),
             default_format: OutputFormat::Markdown,
-            watch_paths: default_watch_paths(),
+            watch_paths: Vec::new(),
             ignored_dirs: Vec::new(),
             max_call_depth: default_max_call_depth(),
             strip_comments: false,
@@ -615,7 +616,7 @@ impl ProjectConfig {
             lang: Vec::new(),
             codebase_scale: cfg.general.codebase_scale.clone(),
             default_format: cfg.general.default_format,
-            watch_paths: cfg.daemon.watch_paths.clone(),
+            watch_paths: Vec::new(),
             ignored_dirs: cfg.daemon.ignored_dirs.clone(),
             max_call_depth: cfg.slice.max_call_depth,
             strip_comments: cfg.slice.strip_comments,
@@ -659,6 +660,15 @@ impl ProjectConfig {
     /// directly evaluating universal build artifacts, project-specific `ignored_dirs`,
     /// and slicing `custom_ignored_dirs`.
     pub fn is_relative_path_ignored(&self, rel: &Path) -> bool {
+        if self
+            .ignored_dirs
+            .iter()
+            .chain(&self.custom_ignored_dirs)
+            .chain(&self.slice.custom_ignored_dirs)
+            .any(|d| !d.is_empty() && rel.starts_with(d))
+        {
+            return true;
+        }
         for comp in rel.components() {
             if let std::path::Component::Normal(c) = comp {
                 if let Some(s) = c.to_str() {
@@ -677,6 +687,31 @@ impl ProjectConfig {
             }
         }
         false
+    }
+
+    /// Returns `true` if a workspace-relative directory `rel_dir` is within or is an ancestor
+    /// of any configured `watch_paths` entry (or if `watch_paths` is empty/unrestricted).
+    pub fn is_dir_in_watch_paths(&self, rel_dir: &Path) -> bool {
+        if self.watch_paths.is_empty() || rel_dir.as_os_str().is_empty() {
+            return true;
+        }
+        self.watch_paths.iter().any(|wp| {
+            let wp_path = Path::new(wp);
+            !wp_path.as_os_str().is_empty()
+                && (rel_dir.starts_with(wp_path) || wp_path.starts_with(rel_dir))
+        })
+    }
+
+    /// Returns `true` if a workspace-relative file `rel_file` resides inside any configured
+    /// `watch_paths` entry (or if `watch_paths` is empty/unrestricted).
+    pub fn is_file_in_watch_paths(&self, rel_file: &Path) -> bool {
+        if self.watch_paths.is_empty() {
+            return true;
+        }
+        self.watch_paths.iter().any(|wp| {
+            let wp_path = Path::new(wp);
+            !wp_path.as_os_str().is_empty() && rel_file.starts_with(wp_path)
+        })
     }
 
     /// Checks whether a file extension is enabled by this project's `lang` setting.
@@ -897,9 +932,18 @@ impl CanonConfig {
         let dynamic = std::mem::take(&mut self.dynamic_projects);
         for (key, val) in dynamic {
             if !reserved.contains(&key.as_str()) {
-                if let Ok(mut proj_cfg) = val.try_into::<ProjectConfig>() {
-                    proj_cfg.normalize();
-                    self.projects.entry(key).or_insert(proj_cfg);
+                match val.try_into::<ProjectConfig>() {
+                    Ok(mut proj_cfg) => {
+                        proj_cfg.normalize();
+                        self.projects.entry(key).or_insert(proj_cfg);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            project = %key,
+                            error = %err,
+                            "Ignoring malformed top-level project configuration section"
+                        );
+                    }
                 }
             }
         }
@@ -908,17 +952,23 @@ impl CanonConfig {
         }
     }
 
-    /// Finds a declared project configuration that encompasses the given path.
+    /// Finds the most specific declared project configuration that encompasses the given path
+    /// using deterministic longest-prefix matching (with lexicographical project-name tie-breaking).
     pub fn find_project_for_path(&self, target_path: &Path) -> Option<(&str, &ProjectConfig)> {
         let canonical_target = canonicalize_best_effort(target_path);
+        let mut best: Option<(usize, &str, &ProjectConfig)> = None;
+
         for (name, proj) in &self.projects {
             if proj.qualified_path.as_os_str().is_empty() {
                 continue;
             }
             let canonical_proj = canonicalize_best_effort(&proj.qualified_path);
-            if canonical_target.starts_with(&canonical_proj) {
-                return Some((name.as_str(), proj));
-            }
+            let mut matched_len = if canonical_target.starts_with(&canonical_proj) {
+                Some(canonical_proj.as_os_str().len())
+            } else {
+                None
+            };
+
             if let Some(ref wt_path) = proj.custom_worktree_path {
                 let full_wt_path = if wt_path.is_relative() {
                     canonical_proj.join(wt_path)
@@ -927,11 +977,24 @@ impl CanonConfig {
                 };
                 let canonical_wt = canonicalize_best_effort(&full_wt_path);
                 if canonical_target.starts_with(&canonical_wt) {
-                    return Some((name.as_str(), proj));
+                    let wt_len = canonical_wt.as_os_str().len();
+                    matched_len = Some(matched_len.map_or(wt_len, |l| l.max(wt_len)));
+                }
+            }
+
+            if let Some(len) = matched_len {
+                let is_better = match best {
+                    None => true,
+                    Some((best_len, best_name, _)) => {
+                        len > best_len || (len == best_len && name.as_str() < best_name)
+                    }
+                };
+                if is_better {
+                    best = Some((len, name.as_str(), proj));
                 }
             }
         }
-        None
+        best.map(|(_, name, proj)| (name, proj))
     }
 
     /// Loads configuration specifically for the daemon runtime.
@@ -941,16 +1004,20 @@ impl CanonConfig {
     pub fn load_daemon_config(
         custom_path: Option<&Path>,
     ) -> Result<(Self, Option<PathBuf>), CoreError> {
+        Self::load_daemon_config_with_system(custom_path, resolve_system_config_path())
+    }
+
+    fn load_daemon_config_with_system(
+        custom_path: Option<&Path>,
+        system_path: Option<PathBuf>,
+    ) -> Result<(Self, Option<PathBuf>), CoreError> {
         let (mut cfg, path) = if let Some(path) = custom_path {
             let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let cfg = Self::load(&canonical)?;
             (cfg, Some(canonical))
-        } else if let Some(system_path) = resolve_system_config_path() {
-            if let Ok(cfg) = Self::load(&system_path) {
-                (cfg, Some(system_path))
-            } else {
-                (Self::default(), None)
-            }
+        } else if let Some(sys_path) = system_path {
+            let cfg = Self::load(&sys_path)?;
+            (cfg, Some(sys_path))
         } else {
             (Self::default(), None)
         };
@@ -1110,6 +1177,19 @@ impl CanonConfig {
         }
     }
 
+    fn try_merge_layer(&mut self, path: PathBuf, layer: &str) -> Option<PathBuf> {
+        match Self::load(&path) {
+            Ok(cfg) => {
+                self.merge(cfg);
+                Some(path)
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), layer, error = %err, "Failed to load configuration layer; skipping");
+                None
+            }
+        }
+    }
+
     /// Discovers configuration for a specific workspace root or worktree path,
     /// returning both the merged configuration and the provenance of all loaded layers.
     pub fn discover_for_workspace_with_provenance(root: &Path) -> (Self, ConfigProvenance) {
@@ -1117,29 +1197,22 @@ impl CanonConfig {
         let mut provenance = ConfigProvenance::default();
 
         if let Some(global_path) = resolve_system_config_path() {
-            if let Ok(global_cfg) = Self::load(&global_path) {
-                config.merge(global_cfg);
-                provenance.global_path = Some(global_path);
-            }
+            provenance.global_path = config.try_merge_layer(global_path, "global");
         }
-
         if let Some(parent_repo) = crate::workspace::detect_worktree_parent_repo(root) {
             if let Some(parent_cfg_path) = find_config_in_dir(&parent_repo) {
-                if let Ok(parent_cfg) = Self::load(&parent_cfg_path) {
-                    config.merge(parent_cfg);
-                    provenance.parent_repo_path = Some(parent_cfg_path);
-                }
+                provenance.parent_repo_path =
+                    config.try_merge_layer(parent_cfg_path, "parent_repo");
             }
         }
-
         let workspace_root = crate::workspace::resolve_workspace_root(root);
         if let Some(local_cfg_path) = find_config_in_dir(&workspace_root) {
             if provenance.parent_repo_path.as_ref() != Some(&local_cfg_path) {
-                if let Ok(local_cfg) = Self::load(&local_cfg_path) {
-                    config.merge(local_cfg);
-                }
+                provenance.local_workspace_path =
+                    config.try_merge_layer(local_cfg_path, "local_workspace");
+            } else {
+                provenance.local_workspace_path = Some(local_cfg_path);
             }
-            provenance.local_workspace_path = Some(local_cfg_path);
         }
 
         config.normalize_projects();
@@ -1449,6 +1522,13 @@ module_root = "backend"
         assert!(acme.is_relative_path_ignored(Path::new("target/debug/main")));
         assert!(acme.is_relative_path_ignored(Path::new("dist/bundle.js")));
         assert!(!acme.is_relative_path_ignored(Path::new("crates/core/src/lib.rs")));
+        assert!(acme.is_dir_in_watch_paths(Path::new("")));
+        assert!(acme.is_dir_in_watch_paths(Path::new("crates/core")));
+        assert!(acme.is_dir_in_watch_paths(Path::new("frontend")));
+        assert!(!acme.is_dir_in_watch_paths(Path::new("scripts")));
+        assert!(acme.is_file_in_watch_paths(Path::new("crates/core/src/lib.rs")));
+        assert!(acme.is_file_in_watch_paths(Path::new("frontend/src/App.tsx")));
+        assert!(!acme.is_file_in_watch_paths(Path::new("frontend/public/index.html")));
 
         let pg = cfg.projects.get("payment-gateway").unwrap();
         assert_eq!(pg.lang, vec!["go"]);
@@ -1461,6 +1541,44 @@ module_root = "backend"
             ))
             .unwrap();
         assert_eq!(matched_name, "acme-web");
+    }
+
+    #[test]
+    fn test_longest_prefix_project_matching_and_system_config_error() {
+        use std::io::Write;
+        let mut cfg = CanonConfig::default();
+        let root_proj = ProjectConfig {
+            qualified_path: PathBuf::from("/workspace/monorepo"),
+            ..Default::default()
+        };
+        let sub_proj = ProjectConfig {
+            qualified_path: PathBuf::from("/workspace/monorepo/services/payments"),
+            ignored_dirs: vec!["generated/proto".to_string()],
+            ..Default::default()
+        };
+        assert!(sub_proj.is_relative_path_ignored(Path::new("generated/proto/api.rs")));
+
+        cfg.projects.insert("z-root".to_string(), root_proj.clone());
+        cfg.projects.insert("a-payments".to_string(), sub_proj);
+        assert_eq!(
+            cfg.find_project_for_path(Path::new("/workspace/monorepo/services/payments/main.rs"))
+                .unwrap()
+                .0,
+            "a-payments"
+        );
+        assert_eq!(
+            cfg.find_project_for_path(Path::new("/workspace/monorepo/crates/core/lib.rs"))
+                .unwrap()
+                .0,
+            "z-root"
+        );
+
+        let mut bad_sys = NamedTempFile::new().unwrap();
+        writeln!(bad_sys, "[daemon\ninvalid_toml = ").unwrap();
+        assert!(
+            CanonConfig::load_daemon_config_with_system(None, Some(bad_sys.path().to_path_buf()))
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,14 +1,14 @@
 //! Unix domain socket IPC server.
 
 use crate::error::DaemonError;
-use crate::hook::{execute_post_read_hook, execute_post_read_hook_with_overlay};
+use crate::hook::{execute_post_read_hook, execute_post_read_hook_for_project};
 use crate::logging::DaemonLogManager;
 use crate::protocol::{
     DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
 };
 use crate::registry::{WorkspaceEntry, WorkspaceRegistry};
 use crate::watcher::DynamicWatcherManager;
-use canon_slice::{SymbolIndex, slice_target, slice_target_with_overlay};
+use canon_slice::{SymbolIndex, slice_target, slice_target_for_project};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -355,10 +355,15 @@ async fn handle_post_read_request(
         if let Some(ref base) = ws.base_index {
             let base_guard = base.read().await;
             let ov_guard = ws.index.read().await;
-            execute_post_read_hook_with_overlay(file, Some(&*base_guard), Some(&*ov_guard))
+            execute_post_read_hook_for_project(
+                file,
+                Some(&*base_guard),
+                Some(&*ov_guard),
+                Some(&ws.config),
+            )
         } else {
             let guard = ws.index.read().await;
-            execute_post_read_hook_with_overlay(file, Some(&*guard), None)
+            execute_post_read_hook_for_project(file, Some(&*guard), None, Some(&ws.config))
         }
     } else {
         let guard = state.legacy_index.read().await;
@@ -455,10 +460,16 @@ async fn handle_slice_request(
         if let Some(ref base) = ws.base_index {
             let base_guard = base.read().await;
             let ov_guard = ws.index.read().await;
-            slice_target_with_overlay(file, mode, Some(&*base_guard), Some(&*ov_guard))
+            slice_target_for_project(
+                file,
+                mode,
+                Some(&*base_guard),
+                Some(&*ov_guard),
+                Some(&ws.config),
+            )
         } else {
             let guard = ws.index.read().await;
-            slice_target_with_overlay(file, mode, Some(&*guard), None)
+            slice_target_for_project(file, mode, Some(&*guard), None, Some(&ws.config))
         }
     } else {
         let guard = state.legacy_index.read().await;

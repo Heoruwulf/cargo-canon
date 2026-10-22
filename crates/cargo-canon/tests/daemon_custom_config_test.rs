@@ -17,6 +17,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
 
 fn setup_fullstack_project(project_dir: &Path) -> PathBuf {
     std::fs::create_dir_all(project_dir.join("crates/core")).unwrap();
+    std::fs::create_dir_all(project_dir.join("unwatched_rust")).unwrap();
     std::fs::create_dir_all(project_dir.join("ignored_secret")).unwrap();
     std::fs::create_dir_all(project_dir.join("go_service")).unwrap();
 
@@ -29,6 +30,13 @@ fn setup_fullstack_project(project_dir: &Path) -> PathBuf {
     std::fs::write(
         &core_rs,
         "pub struct AcmeEngine {\n    pub ready: bool,\n}\n\npub trait AcmeService {\n    fn execute(&self) -> bool;\n}\n",
+    )
+    .unwrap();
+
+    // Rust file outside `watch_paths = ["crates"]`
+    std::fs::write(
+        project_dir.join("unwatched_rust/extra.rs"),
+        "pub struct UnwatchedRustSymbol {\n    pub skipped: bool,\n}\n",
     )
     .unwrap();
 
@@ -201,8 +209,27 @@ lang = "go"
     let ws = &status_after.workspaces[0];
     assert_eq!(ws.project_name.as_deref(), Some("acme-web"));
     assert_eq!(ws.config_path, Some(canonical_custom_toml));
-    // Only `crates/core/lib.rs` should be indexed (`ignored_secret/` and `.go` excluded)
+    // Only `crates/core/lib.rs` should be indexed (`unwatched_rust/`, `ignored_secret/`, and `.go` excluded)
     assert_eq!(ws.indexed_files, 1);
+
+    // Verify human status table output includes PROJECT (`acme-web`) and CONFIG (`custom_daemon.toml`)
+    let status_human_out = tokio::process::Command::new(canon_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ])
+        .current_dir(&poisoned_cwd)
+        .output()
+        .await
+        .expect("failed to run daemon --status human table");
+    assert!(status_human_out.status.success());
+    let status_human_stdout = String::from_utf8_lossy(&status_human_out.stdout);
+    assert!(status_human_stdout.contains("PROJECT"));
+    assert!(status_human_stdout.contains("CONFIG"));
+    assert!(status_human_stdout.contains("acme-web"));
+    assert!(status_human_stdout.contains("custom_daemon.toml"));
 
     // 8. Stop daemon cleanly
     let stop_out = tokio::process::Command::new(canon_bin)

@@ -334,7 +334,10 @@ impl SymbolIndex {
                 if e.depth() == 0 || p == root {
                     return true;
                 }
-                if is_ignored_path(p) {
+                let Ok(rel) = p.strip_prefix(root) else {
+                    return false;
+                };
+                if project.is_relative_path_ignored(rel) {
                     return false;
                 }
                 if e.file_type().is_dir() {
@@ -342,31 +345,20 @@ impl SymbolIndex {
                     if p.join(".git").exists() {
                         return false;
                     }
-                    // 2. Prune configured worktrees and ignored directories relative to root
-                    if let Ok(rel) = p.strip_prefix(root) {
-                        if rel == Path::new(".worktrees") || rel.starts_with(".worktrees") {
-                            return false;
-                        }
-                        if let Some(ref wt) = project.custom_worktree_path {
-                            let wt_rel = wt.strip_prefix(root).unwrap_or(wt.as_path());
-                            if !wt_rel.as_os_str().is_empty()
-                                && (rel == wt_rel || rel.starts_with(wt_rel))
-                            {
-                                return false;
-                            }
-                        }
-                        if project.is_relative_path_ignored(rel)
-                            || project
-                                .ignored_dirs
-                                .iter()
-                                .chain(project.custom_ignored_dirs.iter())
-                                .chain(project.slice.custom_ignored_dirs.iter())
-                                .any(|d| {
-                                    !d.is_empty() && (rel == Path::new(d) || rel.starts_with(d))
-                                })
+                    // 2. Prune configured worktrees and directories outside watch_paths relative to root
+                    if rel == Path::new(".worktrees") || rel.starts_with(".worktrees") {
+                        return false;
+                    }
+                    if let Some(ref wt) = project.custom_worktree_path {
+                        let wt_rel = wt.strip_prefix(root).unwrap_or(wt.as_path());
+                        if !wt_rel.as_os_str().is_empty()
+                            && (rel == wt_rel || rel.starts_with(wt_rel))
                         {
                             return false;
                         }
+                    }
+                    if !project.is_dir_in_watch_paths(rel) {
+                        return false;
                     }
                 }
                 true
@@ -374,10 +366,14 @@ impl SymbolIndex {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| project.is_extension_enabled(ext))
+                let p = e.path();
+                let in_watch_paths = p
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| project.is_file_in_watch_paths(rel));
+                in_watch_paths
+                    && p.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| project.is_extension_enabled(ext))
             })
             .map(|e| e.into_path())
             .collect()
@@ -985,26 +981,7 @@ pub fn is_ignored_path(path: &Path) -> bool {
     for component in path.components() {
         if let std::path::Component::Normal(c) = component {
             if let Some(s) = c.to_str() {
-                if matches!(
-                    s,
-                    "target"
-                        | ".git"
-                        | "node_modules"
-                        | "vendor"
-                        | "dist"
-                        | "build"
-                        | "out"
-                        | ".next"
-                        | ".nuxt"
-                        | ".turbo"
-                        | ".yarn"
-                        | ".pnpm-store"
-                        | ".output"
-                        | ".svelte-kit"
-                        | "coverage"
-                        | ".idea"
-                        | ".vscode"
-                ) {
+                if canon_core::STANDARD_IGNORED_DIRS.contains(&s) {
                     return true;
                 }
             }
@@ -1688,5 +1665,48 @@ mod tests {
         let count = wt2_idx.index_directory_with_project(&wt2, &proj).unwrap();
         assert_eq!(count, 1);
         assert!(wt2_idx.symbols_map.contains_key("wt2_fn"));
+    }
+
+    #[test]
+    fn test_workspace_under_ignored_ancestor_and_watch_paths_scoping() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Workspace root resides inside ancestor directories named `build` and `target`
+        let ws_root = temp_dir
+            .path()
+            .join("build")
+            .join("target")
+            .join("my_workspace");
+        std::fs::create_dir_all(ws_root.join("crates/core/src")).unwrap();
+        std::fs::create_dir_all(ws_root.join("unwatched/src")).unwrap();
+        std::fs::create_dir_all(ws_root.join("target/debug")).unwrap();
+
+        let watched_file = ws_root.join("crates/core/src/lib.rs");
+        let unwatched_file = ws_root.join("unwatched/src/extra.rs");
+        let internal_target_file = ws_root.join("target/debug/gen.rs");
+
+        std::fs::write(&watched_file, "pub fn watched_fn() {}").unwrap();
+        std::fs::write(&unwatched_file, "pub fn unwatched_fn() {}").unwrap();
+        std::fs::write(&internal_target_file, "pub fn gen_fn() {}").unwrap();
+
+        let idx = SymbolIndex::new();
+
+        // 1. Default ProjectConfig (unrestricted watch_paths) must index both crates/ and unwatched/
+        //    despite ancestor `build/target/` in ws_root, while still pruning internal `target/debug/gen.rs`.
+        let default_proj = canon_core::ProjectConfig {
+            qualified_path: ws_root.clone(),
+            ..canon_core::ProjectConfig::default()
+        };
+        let mut all_files = idx.collect_source_files_for_project(&ws_root, &default_proj);
+        all_files.sort();
+        assert_eq!(all_files, vec![watched_file.clone(), unwatched_file]);
+
+        // 2. Explicit watch_paths = ["crates"] restricts discovery strictly to `crates/**`.
+        let scoped_proj = canon_core::ProjectConfig {
+            qualified_path: ws_root.clone(),
+            watch_paths: vec!["crates".to_string()],
+            ..canon_core::ProjectConfig::default()
+        };
+        let scoped_files = idx.collect_source_files_for_project(&ws_root, &scoped_proj);
+        assert_eq!(scoped_files, vec![watched_file]);
     }
 }

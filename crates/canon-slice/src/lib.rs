@@ -46,6 +46,18 @@ pub fn slice_target_with_overlay(
     base_index: Option<&SymbolIndex>,
     overlay_index: Option<&SymbolIndex>,
 ) -> Result<SliceBundle, SliceError> {
+    slice_target_for_project(target_path, mode, base_index, overlay_index, None)
+}
+
+/// Slices a file or target symbol according to the requested SliceMode and optional
+/// per-project slicing options (`max_call_depth`, `include_private_types`).
+pub fn slice_target_for_project(
+    target_path: &Path,
+    mode: SliceMode,
+    base_index: Option<&SymbolIndex>,
+    overlay_index: Option<&SymbolIndex>,
+    project: Option<&canon_core::ProjectConfig>,
+) -> Result<SliceBundle, SliceError> {
     let raw_source = std::fs::read_to_string(target_path).map_err(SliceError::Io)?;
     let raw_len = raw_source.len().max(1);
 
@@ -53,13 +65,12 @@ pub fn slice_target_with_overlay(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    let is_ts = matches!(ext, "ts" | "tsx" | "js" | "jsx");
-    let is_go = ext == "go";
-    let skeleton = if is_ts {
-        let is_jsx = matches!(ext, "tsx" | "jsx");
-        extract_ts_skeleton(&raw_source, is_jsx)?
-    } else if is_go {
-        extract_go_skeleton(&raw_source)?
+    let skeleton = if matches!(ext, "ts" | "tsx" | "js" | "jsx") {
+        extract_ts_skeleton(&raw_source, matches!(ext, "tsx" | "jsx"))?
+    } else if ext == "go" {
+        let include_private =
+            project.is_none_or(|p| p.go.include_private_types && p.slice.include_private_types);
+        extract_go_skeleton_with_options(&raw_source, include_private)?
     } else {
         extract_skeleton(&raw_source)?
     };
@@ -75,6 +86,7 @@ pub fn slice_target_with_overlay(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("target");
+    let call_depth = project.map_or(2, |p| p.slice.max_call_depth);
 
     let mut contracts = Vec::new();
     let mut callers = Vec::new();
@@ -95,24 +107,24 @@ pub fn slice_target_with_overlay(
         }
         if matches!(mode, SliceMode::Hierarchy | SliceMode::Bundle) {
             let ov_callers = overlay_index
-                .map(|idx| idx.get_callers(target_name, 2))
+                .map(|idx| idx.get_callers(target_name, call_depth))
                 .unwrap_or_default();
             callers = if !ov_callers.is_empty() {
                 ov_callers
             } else {
                 base_index
-                    .map(|idx| idx.get_callers(target_name, 2))
+                    .map(|idx| idx.get_callers(target_name, call_depth))
                     .unwrap_or_default()
             };
 
             let ov_callees = overlay_index
-                .map(|idx| idx.get_callees(target_name, 2))
+                .map(|idx| idx.get_callees(target_name, call_depth))
                 .unwrap_or_default();
             callees = if !ov_callees.is_empty() {
                 ov_callees
             } else {
                 base_index
-                    .map(|idx| idx.get_callees(target_name, 2))
+                    .map(|idx| idx.get_callees(target_name, call_depth))
                     .unwrap_or_default()
             };
         }
@@ -365,5 +377,32 @@ mod tests {
                 .get_callers_with_fallback(Some(&base_index), "base_call", 1)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_slice_target_for_project_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let go_path = dir.path().join("handler.go");
+        std::fs::write(
+            &go_path,
+            "package api\nfunc Exported() { helper() }\nfunc helper() {}\n",
+        )
+        .unwrap();
+
+        let mut proj = canon_core::ProjectConfig::default();
+        proj.go.include_private_types = false;
+        proj.slice.include_private_types = false;
+        proj.slice.max_call_depth = 1;
+
+        let bundle_no_priv =
+            slice_target_for_project(&go_path, SliceMode::Bundle, None, None, Some(&proj)).unwrap();
+        assert!(bundle_no_priv.skeleton.contains("func Exported()"));
+        assert!(!bundle_no_priv.skeleton.contains("func helper()"));
+
+        proj.go.include_private_types = true;
+        proj.slice.include_private_types = true;
+        let bundle_with_priv =
+            slice_target_for_project(&go_path, SliceMode::Bundle, None, None, Some(&proj)).unwrap();
+        assert!(bundle_with_priv.skeleton.contains("func helper()"));
     }
 }

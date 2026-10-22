@@ -167,9 +167,11 @@ impl DynamicWatcherManager {
             return;
         }
 
-        // Two-Tier Relative Ignore & Extension Check against loaded ProjectConfig
+        // Two-Tier Relative Ignore, Watch-Paths & Extension Check against loaded ProjectConfig
         if let Ok(rel) = canonical_path.strip_prefix(&target_root) {
-            if target_ws.config.is_relative_path_ignored(rel) {
+            if target_ws.config.is_relative_path_ignored(rel)
+                || !target_ws.config.is_file_in_watch_paths(rel)
+            {
                 tracing::debug!(
                     path = %canonical_path.display(),
                     "Ignored by loaded project configuration"
@@ -536,6 +538,7 @@ pub mod tests {
             has_worktrees: true,
             custom_worktree_path: Some(PathBuf::from(".claude/worktrees")),
             lang: vec!["rust".to_string()],
+            watch_paths: vec!["src".to_string()],
             ignored_dirs: vec![".claude".to_string()],
             ..canon_core::ProjectConfig::default()
         };
@@ -607,6 +610,20 @@ pub mod tests {
                 .await
                 .symbols_map
                 .contains_key("wt_live_updated")
+        );
+
+        // 4. Edit outside configured watch_paths = ["src"] must be ignored
+        let unwatched_dir = parent_root.join("unwatched");
+        std::fs::create_dir_all(&unwatched_dir).unwrap();
+        let unwatched_file = unwatched_dir.join("extra.rs");
+        std::fs::write(&unwatched_file, "pub fn unwatched_outside_src() {}").unwrap();
+        DynamicWatcherManager::dispatch_mutation(&manager.inner, unwatched_file).await;
+        assert!(
+            !parent_idx
+                .read()
+                .await
+                .symbols_map
+                .contains_key("unwatched_outside_src")
         );
 
         token.cancel();

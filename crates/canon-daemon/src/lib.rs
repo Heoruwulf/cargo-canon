@@ -16,7 +16,9 @@ pub mod server;
 pub mod watcher;
 
 pub use error::DaemonError;
-pub use hook::{execute_post_read_hook, execute_post_read_hook_with_overlay};
+pub use hook::{
+    execute_post_read_hook, execute_post_read_hook_for_project, execute_post_read_hook_with_overlay,
+};
 pub use logging::{DaemonLogManager, WorkspaceLogger};
 pub use protocol::{
     DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
