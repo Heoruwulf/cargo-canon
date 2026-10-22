@@ -1409,7 +1409,11 @@ async fn handle_daemon_start(
             &format!("Starting initial indexing for '{}'...", r.display()),
         );
         let mut idx = SymbolIndex::new();
-        let indexed = idx.index_directory(r).unwrap_or(0);
+        let proj = cfg
+            .find_project_for_path(r)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| canon_core::ProjectConfig::from_canon_config(r.to_path_buf(), cfg));
+        let indexed = idx.index_directory_with_project(r, &proj).unwrap_or(0);
         let elapsed = index_start.elapsed();
         let metrics = idx.metrics();
         let throughput = if elapsed.as_secs_f64() > 0.0 {

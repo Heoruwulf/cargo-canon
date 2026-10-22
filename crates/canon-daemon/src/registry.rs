@@ -174,7 +174,8 @@ impl WorkspaceRegistry {
     }
 
     /// Resolves `(project_name, project_config, config_path)` for a workspace root.
-    /// Checks declared projects in `self.daemon_config` first, falling back to workspace discovery.
+    /// Uses exclusively the daemon configuration loaded at startup (system path or `--config`),
+    /// never reading or merging configuration files from workspace directories.
     pub fn resolve_project_for_root(
         &self,
         canonical_root: &Path,
@@ -192,26 +193,14 @@ impl WorkspaceRegistry {
             );
         }
 
-        let (mut ws_cfg, provenance) =
-            canon_core::CanonConfig::discover_for_workspace_with_provenance(canonical_root);
-        ws_cfg.normalize_projects();
-        let cfg_path = provenance
-            .primary_path()
-            .map(Path::to_path_buf)
-            .or_else(|| self.daemon_config_path.clone());
-
-        if let Some((name, proj)) = ws_cfg
-            .find_project_for_path(canonical_root)
-            .or_else(|| parent_repo.and_then(|p| ws_cfg.find_project_for_path(p)))
-        {
-            (Some(name.to_string()), proj.clone(), cfg_path)
-        } else {
-            (
-                None,
-                canon_core::ProjectConfig::from_canon_config(canonical_root.to_path_buf(), &ws_cfg),
-                cfg_path,
-            )
-        }
+        (
+            None,
+            canon_core::ProjectConfig::from_canon_config(
+                canonical_root.to_path_buf(),
+                &self.daemon_config,
+            ),
+            self.daemon_config_path.clone(),
+        )
     }
 
     /// Retrieves an existing workspace entry or lazily indexes it on first touch (single-flight).
@@ -679,5 +668,34 @@ pub mod tests {
         assert!(p_guard.symbols_map.contains_key("parent_fn"));
         assert!(!p_guard.symbols_map.contains_key("GoIgnored"));
         assert!(!p_guard.symbols_map.contains_key("nested_wt_fn"));
+        drop(p_guard);
+
+        // Undeclared workspace with a local `.canon.toml` must NOT load local config;
+        // daemon uses strictly its own config (system path or --config).
+        let undeclared_repo = tempdir().unwrap();
+        std::fs::create_dir_all(undeclared_repo.path().join(".git")).unwrap();
+        std::fs::write(
+            undeclared_repo.path().join(".canon.toml"),
+            "[daemon]\nignored_dirs = [\"src\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(undeclared_repo.path().join("src")).unwrap();
+        std::fs::write(
+            undeclared_repo.path().join("src/lib.rs"),
+            "pub fn undeclared_fn() {}",
+        )
+        .unwrap();
+
+        let undeclared_entry = registry.get_or_init(undeclared_repo.path()).await.unwrap();
+        assert!(undeclared_entry.project_name.is_none());
+        assert_eq!(undeclared_entry.config_path.as_ref(), Some(&cfg_path));
+        assert!(
+            undeclared_entry
+                .index
+                .read()
+                .await
+                .symbols_map
+                .contains_key("undeclared_fn")
+        );
     }
 }

@@ -606,8 +606,13 @@ impl Default for ProjectConfig {
     }
 }
 
+fn normalize_rel_pattern(pattern: &str) -> &Path {
+    let p = Path::new(pattern.trim());
+    p.strip_prefix(".").unwrap_or(p)
+}
+
 impl ProjectConfig {
-    /// Constructs a `ProjectConfig` synthesized from a workspace `CanonConfig`.
+    /// Constructs a `ProjectConfig` synthesized from a `CanonConfig`.
     pub fn from_canon_config(root: PathBuf, cfg: &CanonConfig) -> Self {
         let mut proj = Self {
             qualified_path: root,
@@ -660,12 +665,16 @@ impl ProjectConfig {
     /// directly evaluating universal build artifacts, project-specific `ignored_dirs`,
     /// and slicing `custom_ignored_dirs`.
     pub fn is_relative_path_ignored(&self, rel: &Path) -> bool {
+        let rel = rel.strip_prefix(".").unwrap_or(rel);
         if self
             .ignored_dirs
             .iter()
             .chain(&self.custom_ignored_dirs)
             .chain(&self.slice.custom_ignored_dirs)
-            .any(|d| !d.is_empty() && rel.starts_with(d))
+            .any(|d| {
+                let pat = normalize_rel_pattern(d);
+                !pat.as_os_str().is_empty() && rel.starts_with(pat)
+            })
         {
             return true;
         }
@@ -675,11 +684,12 @@ impl ProjectConfig {
                     if STANDARD_IGNORED_DIRS.contains(&s) {
                         return true;
                     }
-                    if self.ignored_dirs.iter().any(|d| d == s) {
-                        return true;
-                    }
-                    if self.custom_ignored_dirs.iter().any(|d| d == s)
-                        || self.slice.custom_ignored_dirs.iter().any(|d| d == s)
+                    if self
+                        .ignored_dirs
+                        .iter()
+                        .chain(&self.custom_ignored_dirs)
+                        .chain(&self.slice.custom_ignored_dirs)
+                        .any(|d| normalize_rel_pattern(d).as_os_str() == s)
                     {
                         return true;
                     }
@@ -692,25 +702,34 @@ impl ProjectConfig {
     /// Returns `true` if a workspace-relative directory `rel_dir` is within or is an ancestor
     /// of any configured `watch_paths` entry (or if `watch_paths` is empty/unrestricted).
     pub fn is_dir_in_watch_paths(&self, rel_dir: &Path) -> bool {
+        let rel_dir = rel_dir.strip_prefix(".").unwrap_or(rel_dir);
         if self.watch_paths.is_empty() || rel_dir.as_os_str().is_empty() {
             return true;
         }
         self.watch_paths.iter().any(|wp| {
-            let wp_path = Path::new(wp);
-            !wp_path.as_os_str().is_empty()
-                && (rel_dir.starts_with(wp_path) || wp_path.starts_with(rel_dir))
+            if wp.trim().is_empty() {
+                return false;
+            }
+            let wp_path = normalize_rel_pattern(wp);
+            wp_path.as_os_str().is_empty()
+                || rel_dir.starts_with(wp_path)
+                || wp_path.starts_with(rel_dir)
         })
     }
 
     /// Returns `true` if a workspace-relative file `rel_file` resides inside any configured
     /// `watch_paths` entry (or if `watch_paths` is empty/unrestricted).
     pub fn is_file_in_watch_paths(&self, rel_file: &Path) -> bool {
+        let rel_file = rel_file.strip_prefix(".").unwrap_or(rel_file);
         if self.watch_paths.is_empty() {
             return true;
         }
         self.watch_paths.iter().any(|wp| {
-            let wp_path = Path::new(wp);
-            !wp_path.as_os_str().is_empty() && rel_file.starts_with(wp_path)
+            if wp.trim().is_empty() {
+                return false;
+            }
+            let wp_path = normalize_rel_pattern(wp);
+            wp_path.as_os_str().is_empty() || rel_file.starts_with(wp_path)
         })
     }
 
@@ -1553,10 +1572,15 @@ module_root = "backend"
         };
         let sub_proj = ProjectConfig {
             qualified_path: PathBuf::from("/workspace/monorepo/services/payments"),
-            ignored_dirs: vec!["generated/proto".to_string()],
+            watch_paths: vec!["./src".to_string()],
+            ignored_dirs: vec!["./generated/proto".to_string()],
             ..Default::default()
         };
         assert!(sub_proj.is_relative_path_ignored(Path::new("generated/proto/api.rs")));
+        assert!(sub_proj.is_relative_path_ignored(Path::new("./generated/proto/api.rs")));
+        assert!(sub_proj.is_dir_in_watch_paths(Path::new("src/handlers")));
+        assert!(sub_proj.is_file_in_watch_paths(Path::new("src/main.rs")));
+        assert!(!sub_proj.is_file_in_watch_paths(Path::new("scripts/deploy.rs")));
 
         cfg.projects.insert("z-root".to_string(), root_proj.clone());
         cfg.projects.insert("a-payments".to_string(), sub_proj);
