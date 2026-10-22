@@ -297,9 +297,11 @@ impl SymbolIndex {
     /// Discovers candidate source files filtering ignored directories and nested worktrees.
     pub fn collect_source_files(&self, root: &Path) -> Vec<PathBuf> {
         let cfg = canon_core::config::CanonConfig::discover_for_workspace(root);
-        let mut ignored = cfg.slice.custom_ignored_dirs;
-        ignored.extend(cfg.daemon.ignored_dirs);
-        self.collect_source_files_with_options(root, &ignored, cfg.daemon.worktrees_dir.as_deref())
+        if let Some((_, proj)) = cfg.find_project_for_path(root) {
+            return self.collect_source_files_for_project(root, proj);
+        }
+        let proj = canon_core::ProjectConfig::from_canon_config(root.to_path_buf(), &cfg);
+        self.collect_source_files_for_project(root, &proj)
     }
 
     /// Discovers candidate source files with explicit ignored directories and worktrees directory.
@@ -308,6 +310,22 @@ impl SymbolIndex {
         root: &Path,
         ignored_dirs: &[String],
         worktrees_dir: Option<&str>,
+    ) -> Vec<PathBuf> {
+        let proj = canon_core::ProjectConfig {
+            qualified_path: root.to_path_buf(),
+            has_worktrees: worktrees_dir.is_some(),
+            custom_worktree_path: worktrees_dir.map(PathBuf::from),
+            ignored_dirs: ignored_dirs.to_vec(),
+            ..canon_core::ProjectConfig::default()
+        };
+        self.collect_source_files_for_project(root, &proj)
+    }
+
+    /// Discovers candidate source files under `root` honoring a declarative `ProjectConfig`.
+    pub fn collect_source_files_for_project(
+        &self,
+        root: &Path,
+        project: &canon_core::ProjectConfig,
     ) -> Vec<PathBuf> {
         WalkDir::new(root)
             .into_iter()
@@ -320,24 +338,34 @@ impl SymbolIndex {
                     return false;
                 }
                 if e.file_type().is_dir() {
-                    // Prune nested worktree directories (d != root containing a .git file or directory)
+                    // 1. Prune nested git repositories/worktrees inside parent
                     if p.join(".git").exists() {
                         return false;
                     }
+                    // 2. Prune configured worktrees and ignored directories relative to root
                     if let Ok(rel) = p.strip_prefix(root) {
-                        if ignored_dirs.iter().any(|d| {
-                            p.file_name().and_then(|n| n.to_str()) == Some(d)
-                                || rel == Path::new(d)
-                                || rel.starts_with(d)
-                        }) {
+                        if rel == Path::new(".worktrees") || rel.starts_with(".worktrees") {
                             return false;
                         }
-                    }
-                    if let Some(wt) = worktrees_dir {
-                        if let Ok(rel) = p.strip_prefix(root) {
-                            if rel == Path::new(wt) || rel.starts_with(wt) {
+                        if let Some(ref wt) = project.custom_worktree_path {
+                            let wt_rel = wt.strip_prefix(root).unwrap_or(wt.as_path());
+                            if !wt_rel.as_os_str().is_empty()
+                                && (rel == wt_rel || rel.starts_with(wt_rel))
+                            {
                                 return false;
                             }
+                        }
+                        if project.is_relative_path_ignored(rel)
+                            || project
+                                .ignored_dirs
+                                .iter()
+                                .chain(project.custom_ignored_dirs.iter())
+                                .chain(project.slice.custom_ignored_dirs.iter())
+                                .any(|d| {
+                                    !d.is_empty() && (rel == Path::new(d) || rel.starts_with(d))
+                                })
+                        {
+                            return false;
                         }
                     }
                 }
@@ -349,7 +377,7 @@ impl SymbolIndex {
                 e.path()
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "go"))
+                    .is_some_and(|ext| project.is_extension_enabled(ext))
             })
             .map(|e| e.into_path())
             .collect()
@@ -360,6 +388,26 @@ impl SymbolIndex {
     pub fn index_directory(&mut self, root: &Path) -> Result<usize, SliceError> {
         let start = std::time::Instant::now();
         let files = self.collect_source_files(root);
+        self.index_discovered_files(root, &files, start)
+    }
+
+    /// Discovers and indexes all valid source files under `root` honoring `project` configuration.
+    pub fn index_directory_with_project(
+        &mut self,
+        root: &Path,
+        project: &canon_core::ProjectConfig,
+    ) -> Result<usize, SliceError> {
+        let start = std::time::Instant::now();
+        let files = self.collect_source_files_for_project(root, project);
+        self.index_discovered_files(root, &files, start)
+    }
+
+    fn index_discovered_files(
+        &mut self,
+        root: &Path,
+        files: &[PathBuf],
+        start: std::time::Instant,
+    ) -> Result<usize, SliceError> {
         let discovery_ms = start.elapsed().as_millis();
         let total_files = files.len();
         if total_files == 0 {
@@ -956,7 +1004,6 @@ pub fn is_ignored_path(path: &Path) -> bool {
                         | "coverage"
                         | ".idea"
                         | ".vscode"
-                        | ".worktrees"
                 ) {
                     return true;
                 }
@@ -1333,7 +1380,7 @@ mod tests {
         assert!(is_ignored_path(Path::new("coverage/lcov.info")));
         assert!(is_ignored_path(Path::new(".idea/workspace.xml")));
         assert!(is_ignored_path(Path::new(".vscode/settings.json")));
-        assert!(is_ignored_path(Path::new(".worktrees/feat1/src/lib.rs")));
+        assert!(!is_ignored_path(Path::new(".worktrees/feat1/src/lib.rs")));
 
         // Ignored nested subdirectories and absolute paths
         assert!(is_ignored_path(Path::new(
@@ -1585,5 +1632,61 @@ mod tests {
         let syms = &overlay_idx.file_to_symbols[&file_key];
         assert!(syms.contains(&"NewStruct".to_string()));
         assert!(syms.contains(&"ServiceConfig".to_string()));
+    }
+
+    #[test]
+    fn test_nested_worktree_and_project_config_indexing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "pub fn parent_main() {}").unwrap();
+
+        // 1. Nested worktree inside .worktrees/wt-1
+        let wt1 = root.join(".worktrees").join("wt-1");
+        std::fs::create_dir_all(wt1.join("src")).unwrap();
+        std::fs::write(wt1.join(".git"), "gitdir: /path/to/git/worktrees/wt-1").unwrap();
+        std::fs::write(wt1.join("src/wt1.rs"), "pub fn wt1_fn() {}").unwrap();
+
+        assert!(!is_ignored_path(&wt1.join("src/wt1.rs")));
+        let idx = SymbolIndex::new();
+        let parent_files = idx.collect_source_files(root);
+        assert_eq!(parent_files, vec![root.join("src/main.rs")]);
+        let wt1_files = idx.collect_source_files(&wt1);
+        assert_eq!(wt1_files, vec![wt1.join("src/wt1.rs")]);
+
+        // 2. Nested worktree inside .claude/worktrees/wt-2 with ignored_dirs = [".claude"]
+        let wt2 = root.join(".claude").join("worktrees").join("wt-2");
+        std::fs::create_dir_all(wt2.join("src")).unwrap();
+        std::fs::write(wt2.join(".git"), "gitdir: /path/to/git/worktrees/wt-2").unwrap();
+        std::fs::write(wt2.join("src/wt2.rs"), "pub fn wt2_fn() {}").unwrap();
+        std::fs::write(wt2.join("src/ui.ts"), "export const x = 1;").unwrap();
+        std::fs::write(wt2.join("src/svc.go"), "package main\nfunc Run() {}").unwrap();
+
+        // Internal target/ and .claude/ inside the worktree must still be pruned
+        std::fs::create_dir_all(wt2.join("target/debug")).unwrap();
+        std::fs::write(wt2.join("target/debug/gen.rs"), "pub fn gen() {}").unwrap();
+        std::fs::create_dir_all(wt2.join(".claude")).unwrap();
+        std::fs::write(wt2.join(".claude/cache.rs"), "pub fn cache() {}").unwrap();
+        std::fs::create_dir_all(wt2.join("custom_ign")).unwrap();
+        std::fs::write(wt2.join("custom_ign/skip.rs"), "pub fn skip() {}").unwrap();
+
+        let proj = canon_core::ProjectConfig {
+            qualified_path: root.to_path_buf(),
+            has_worktrees: true,
+            custom_worktree_path: Some(PathBuf::from(".claude/worktrees")),
+            ignored_dirs: vec![".claude".to_string()],
+            custom_ignored_dirs: vec!["custom_ign".to_string()],
+            lang: vec!["rust".to_string()],
+            ..canon_core::ProjectConfig::default()
+        };
+
+        let wt2_files = idx.collect_source_files_for_project(&wt2, &proj);
+        assert_eq!(wt2_files, vec![wt2.join("src/wt2.rs")]);
+
+        let mut wt2_idx = SymbolIndex::new();
+        let count = wt2_idx.index_directory_with_project(&wt2, &proj).unwrap();
+        assert_eq!(count, 1);
+        assert!(wt2_idx.symbols_map.contains_key("wt2_fn"));
     }
 }

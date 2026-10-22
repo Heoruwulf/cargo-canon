@@ -74,6 +74,10 @@ pub struct ServerOptions {
     pub log_dir: Option<PathBuf>,
     /// Inactivity threshold in seconds before unindexing an idle workspace (default: 7200).
     pub idle_ttl_secs: u64,
+    /// Loaded daemon configuration (projects, service settings).
+    pub daemon_config: canon_core::CanonConfig,
+    /// Canonical provenance path of the loaded daemon configuration file, if any.
+    pub config_path: Option<PathBuf>,
 }
 
 impl Default for ServerOptions {
@@ -84,6 +88,8 @@ impl Default for ServerOptions {
             watcher_active: false,
             log_dir: None,
             idle_ttl_secs: 7200,
+            daemon_config: canon_core::CanonConfig::default(),
+            config_path: None,
         }
     }
 }
@@ -137,6 +143,88 @@ async fn probe_active_socket(socket_path: &Path) -> bool {
     )
 }
 
+async fn init_server_state(
+    options: ServerOptions,
+    index: Arc<RwLock<SymbolIndex>>,
+    token: CancellationToken,
+    start_time: std::time::Instant,
+) -> Result<Arc<ServerState>, DaemonError> {
+    let pid = std::process::id();
+    let log_dir = options
+        .log_dir
+        .clone()
+        .unwrap_or_else(canon_core::logging::resolve_default_log_dir);
+    let log_manager = Arc::new(DaemonLogManager::init(&log_dir)?);
+    let cfg_label = options
+        .config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "built-in defaults".to_string());
+    log_manager.log_daemon(&format!(
+        "Canon daemon IPC server started: pid={}, socket='{}', config='{}', declared_projects={}",
+        pid,
+        options.socket_path.display(),
+        cfg_label,
+        options.daemon_config.projects.len()
+    ));
+
+    let registry = Arc::new(WorkspaceRegistry::with_config(
+        Arc::clone(&log_manager),
+        options.daemon_config.clone(),
+        options.config_path.clone(),
+    ));
+
+    let watcher_manager = if options.watcher_active {
+        Some(Arc::new(DynamicWatcherManager::new(token.clone())?))
+    } else {
+        None
+    };
+
+    let raw_root = &options.workspace_root;
+    if !raw_root.as_os_str().is_empty() {
+        let canonical_root = std::fs::canonicalize(raw_root).unwrap_or_else(|_| raw_root.clone());
+        if let Ok(ws_logger) = log_manager.create_workspace_logger(&canonical_root) {
+            let (project_name, project_config, config_path) =
+                registry.resolve_project_for_root(&canonical_root, None);
+            let ws_entry = Arc::new(
+                WorkspaceEntry::new(
+                    canonical_root.clone(),
+                    false,
+                    None,
+                    Arc::clone(&index),
+                    None,
+                    Arc::new(ws_logger),
+                )
+                .with_project_metadata(
+                    project_name,
+                    config_path,
+                    project_config.clone(),
+                ),
+            );
+            registry.register(ws_entry.clone()).await;
+            if let Some(ref w) = watcher_manager {
+                let _ = w.watch_workspace_with_config(
+                    canonical_root,
+                    Arc::clone(&index),
+                    Arc::clone(&ws_entry.logger),
+                    project_config,
+                );
+            }
+        }
+    }
+
+    Ok(Arc::new(ServerState {
+        options: Arc::new(options),
+        start_time,
+        legacy_index: index,
+        registry,
+        log_manager,
+        watcher_manager,
+        token,
+        telemetry: Arc::new(ServerTelemetry::default()),
+    }))
+}
+
 /// Runs the IPC daemon server with explicit options until shutdown token is cancelled.
 pub async fn run_server_with_options(
     mut options: ServerOptions,
@@ -168,59 +256,7 @@ pub async fn run_server_with_options(
     let pid = std::process::id();
     tracing::info!(socket = %socket_path.display(), pid, "Starting canon daemon IPC server");
 
-    let log_dir = options
-        .log_dir
-        .clone()
-        .unwrap_or_else(canon_core::logging::resolve_default_log_dir);
-    let log_manager = Arc::new(DaemonLogManager::init(&log_dir)?);
-    log_manager.log_daemon(&format!(
-        "Canon daemon IPC server started: pid={}, socket='{}'",
-        pid,
-        socket_path.display()
-    ));
-
-    let registry = Arc::new(WorkspaceRegistry::new(Arc::clone(&log_manager)));
-
-    let watcher_manager = if options.watcher_active {
-        let mgr = Arc::new(DynamicWatcherManager::new(token.clone())?);
-        Some(mgr)
-    } else {
-        None
-    };
-
-    let raw_root = &options.workspace_root;
-    if !raw_root.as_os_str().is_empty() {
-        let canonical_root = std::fs::canonicalize(raw_root).unwrap_or_else(|_| raw_root.clone());
-        if let Ok(ws_logger) = log_manager.create_workspace_logger(&canonical_root) {
-            let ws_entry = Arc::new(WorkspaceEntry::new(
-                canonical_root.clone(),
-                false,
-                None,
-                Arc::clone(&index),
-                None,
-                Arc::new(ws_logger),
-            ));
-            registry.register(ws_entry.clone()).await;
-            if let Some(ref w) = watcher_manager {
-                let _ = w.watch_workspace(
-                    canonical_root,
-                    Arc::clone(&index),
-                    Arc::clone(&ws_entry.logger),
-                );
-            }
-        }
-    }
-
-    let state = Arc::new(ServerState {
-        options: Arc::new(options),
-        start_time,
-        legacy_index: index,
-        registry: Arc::clone(&registry),
-        log_manager,
-        watcher_manager,
-        token: token.clone(),
-        telemetry: Arc::new(ServerTelemetry::default()),
-    });
+    let state = init_server_state(options, index, token.clone(), start_time).await?;
 
     let mut prune_interval = tokio::time::interval(Duration::from_secs(60));
     prune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -270,9 +306,7 @@ pub async fn run_server(
     let opts = ServerOptions {
         socket_path: socket_path.to_path_buf(),
         workspace_root: root,
-        watcher_active: false,
-        log_dir: None,
-        idle_ttl_secs: 7200,
+        ..ServerOptions::default()
     };
     run_server_with_options(opts, index, token).await
 }
@@ -294,10 +328,11 @@ async fn handle_post_read_request(
         Ok(e) => {
             if let Some(ref watcher) = state.watcher_manager {
                 if !watcher.is_watching(&e.root) {
-                    let _ = watcher.watch_workspace(
+                    let _ = watcher.watch_workspace_with_config(
                         e.root.clone(),
                         Arc::clone(&e.index),
                         Arc::clone(&e.logger),
+                        e.config.clone(),
                     );
                 }
             }
@@ -395,10 +430,11 @@ async fn handle_slice_request(
         Ok(e) => {
             if let Some(ref watcher) = state.watcher_manager {
                 if !watcher.is_watching(&e.root) {
-                    let _ = watcher.watch_workspace(
+                    let _ = watcher.watch_workspace_with_config(
                         e.root.clone(),
                         Arc::clone(&e.index),
                         Arc::clone(&e.logger),
+                        e.config.clone(),
                     );
                 }
             }
@@ -463,6 +499,85 @@ async fn handle_slice_request(
     }
 }
 
+async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
+    let memory_rss = canon_core::logging::get_process_rss_mb();
+    let entries = state.registry.entries().await;
+    let mut ws_summaries = Vec::with_capacity(entries.len());
+    let mut agg_files = 0;
+    let mut agg_symbols = 0;
+    let mut agg_call_edges = 0;
+    let mut agg_contracts = 0;
+    let mut agg_routes = 0;
+
+    for entry in &entries {
+        let (metrics, mem_mb) = {
+            let guard = entry.index.read().await;
+            (guard.metrics(), guard.estimate_memory_mb())
+        };
+        agg_files += metrics.distinct_files_count;
+        agg_symbols += metrics.total_symbols_count;
+        agg_call_edges += metrics.total_call_edges_count;
+        agg_contracts += metrics.total_contracts_count;
+        agg_routes += metrics.total_routes_count;
+
+        ws_summaries.push(WorkspaceSummary {
+            root: entry.root.clone(),
+            project_name: entry.project_name.clone(),
+            config_path: entry.config_path.clone(),
+            is_worktree: entry.is_worktree,
+            parent_repo: entry.parent_repo.clone(),
+            indexed_files: metrics.distinct_files_count,
+            total_symbols: metrics.total_symbols_count,
+            memory_mb: mem_mb,
+            log_path: entry.logger.log_path().to_path_buf(),
+            last_accessed_secs_ago: entry.last_accessed_secs_ago(),
+        });
+    }
+
+    if entries.is_empty() {
+        let guard = state.legacy_index.read().await;
+        let m = guard.metrics();
+        agg_files = m.distinct_files_count;
+        agg_symbols = m.total_symbols_count;
+        agg_call_edges = m.total_call_edges_count;
+        agg_contracts = m.total_contracts_count;
+        agg_routes = m.total_routes_count;
+    }
+
+    let daemon_mode = if state.options.workspace_root.as_os_str().is_empty() {
+        "System-Wide Multi-Tenant".to_string()
+    } else {
+        "Isolated Workspace".to_string()
+    };
+
+    let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+    DaemonStatusInfo {
+        pid: std::process::id(),
+        uptime_secs: state.start_time.elapsed().as_secs(),
+        socket_path: state.options.socket_path.clone(),
+        daemon_mode,
+        config_path: state.options.config_path.clone(),
+        declared_projects_count: state.options.daemon_config.projects.len(),
+        workspace_root: state.options.workspace_root.clone(),
+        main_log_path: state.log_manager.main_log_path().to_path_buf(),
+        memory_rss_mb: memory_rss,
+        active_workspaces_count: entries.len(),
+        workspaces: ws_summaries,
+        indexed_files: agg_files,
+        total_symbols: agg_symbols,
+        total_call_edges: agg_call_edges,
+        total_contracts: agg_contracts,
+        total_routes: agg_routes,
+        watcher_active: state.options.watcher_active,
+        hooks_served: hooks,
+        raw_bytes_served: raw,
+        delivered_bytes_served: delivered,
+        bytes_saved: saved,
+        token_reduction_pct: pct,
+        est_tokens_saved: est_tokens,
+    }
+}
+
 async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Result<(), DaemonError> {
     loop {
         let req: DaemonRequest = match read_message(&mut stream).await {
@@ -482,71 +597,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 write_message(&mut stream, &DaemonResponse::Pong).await?;
             }
             DaemonRequest::Status => {
-                let memory_rss = canon_core::logging::get_process_rss_mb();
-                let entries = state.registry.entries().await;
-                let mut ws_summaries = Vec::with_capacity(entries.len());
-                let mut agg_files = 0;
-                let mut agg_symbols = 0;
-                let mut agg_call_edges = 0;
-                let mut agg_contracts = 0;
-                let mut agg_routes = 0;
-
-                for entry in &entries {
-                    let (metrics, mem_mb) = {
-                        let guard = entry.index.read().await;
-                        (guard.metrics(), guard.estimate_memory_mb())
-                    };
-                    agg_files += metrics.distinct_files_count;
-                    agg_symbols += metrics.total_symbols_count;
-                    agg_call_edges += metrics.total_call_edges_count;
-                    agg_contracts += metrics.total_contracts_count;
-                    agg_routes += metrics.total_routes_count;
-
-                    ws_summaries.push(WorkspaceSummary {
-                        root: entry.root.clone(),
-                        is_worktree: entry.is_worktree,
-                        parent_repo: entry.parent_repo.clone(),
-                        indexed_files: metrics.distinct_files_count,
-                        total_symbols: metrics.total_symbols_count,
-                        memory_mb: mem_mb,
-                        log_path: entry.logger.log_path().to_path_buf(),
-                        last_accessed_secs_ago: entry.last_accessed_secs_ago(),
-                    });
-                }
-
-                if entries.is_empty() {
-                    let guard = state.legacy_index.read().await;
-                    let m = guard.metrics();
-                    agg_files = m.distinct_files_count;
-                    agg_symbols = m.total_symbols_count;
-                    agg_call_edges = m.total_call_edges_count;
-                    agg_contracts = m.total_contracts_count;
-                    agg_routes = m.total_routes_count;
-                }
-
-                let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
-                let status_info = DaemonStatusInfo {
-                    pid: std::process::id(),
-                    uptime_secs: state.start_time.elapsed().as_secs(),
-                    socket_path: state.options.socket_path.clone(),
-                    workspace_root: state.options.workspace_root.clone(),
-                    main_log_path: state.log_manager.main_log_path().to_path_buf(),
-                    memory_rss_mb: memory_rss,
-                    active_workspaces_count: entries.len(),
-                    workspaces: ws_summaries,
-                    indexed_files: agg_files,
-                    total_symbols: agg_symbols,
-                    total_call_edges: agg_call_edges,
-                    total_contracts: agg_contracts,
-                    total_routes: agg_routes,
-                    watcher_active: state.options.watcher_active,
-                    hooks_served: hooks,
-                    raw_bytes_served: raw,
-                    delivered_bytes_served: delivered,
-                    bytes_saved: saved,
-                    token_reduction_pct: pct,
-                    est_tokens_saved: est_tokens,
-                };
+                let status_info = build_status_response(&state).await;
                 write_message(&mut stream, &DaemonResponse::Status(status_info)).await?;
             }
             DaemonRequest::PostReadHook {

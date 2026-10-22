@@ -319,6 +319,11 @@ pub struct DaemonArgs {
     #[arg(long, help_heading = "Daemon Lifecycle")]
     pub start: bool,
 
+    /// Explicit path to daemon configuration file (Docker, K8s ConfigMap, or custom path).
+    /// If omitted, configuration is loaded exclusively from the system path.
+    #[arg(short = 'c', long, help_heading = "Configuration")]
+    pub config: Option<PathBuf>,
+
     /// Run as legacy isolated per-workspace daemon instead of system-wide daemon
     #[arg(long, help_heading = "Daemon Lifecycle")]
     pub isolated: bool,
@@ -386,7 +391,49 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse_from(args);
     let _ = canon_core::init_logging(cli.verbose, cli.json);
-    let cfg = CanonConfig::discover();
+
+    // If running daemon subcommand, isolate config loading strictly to custom path or system path!
+    if let Some(Commands::Daemon(ref daemon_args)) = cli.command {
+        let (daemon_cfg, qualified_path) =
+            CanonConfig::load_daemon_config(daemon_args.config.as_deref())?;
+        let is_lifecycle_start = !daemon_args.ping
+            && !daemon_args.status
+            && !daemon_args.stop
+            && !daemon_args.hook_post_read;
+        if is_lifecycle_start {
+            if let Some(ref path) = qualified_path {
+                info_banner(
+                    "Config",
+                    &format!("Daemon configuration loaded from '{}'", path.display()),
+                );
+                tracing::info!(
+                    path = %path.display(),
+                    projects = daemon_cfg.projects.len(),
+                    "Daemon configuration loaded"
+                );
+            } else {
+                info_banner(
+                    "Config",
+                    "Operating with default built-in daemon configuration (no system config found)",
+                );
+                tracing::info!("Operating with default built-in daemon configuration");
+            }
+        }
+        return handle_daemon(daemon_args.clone(), &daemon_cfg, qualified_path, cli.json).await;
+    }
+
+    // For all other commands, discover workspace configuration normally
+    let (mut cfg, provenance) = CanonConfig::discover_with_provenance();
+    cfg.normalize_projects();
+    provenance.log_details();
+    if let Some(p) = provenance.primary_path() {
+        if cli.verbose > 0 && !cli.json {
+            info_banner(
+                "Config",
+                &format!("Loaded qualified workspace config from '{}'", p.display()),
+            );
+        }
+    }
 
     match cli.command {
         Some(Commands::Slice(args)) => handle_slice(args).await?,
@@ -395,7 +442,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Verify(args)) => handle_verify(args).await?,
         Some(Commands::Invariants(args)) => handle_invariants(args).await?,
         Some(Commands::StateMachine(args)) => handle_state_machine(args).await?,
-        Some(Commands::Daemon(args)) => handle_daemon(args, &cfg, cli.json).await?,
+        Some(Commands::Daemon(_)) => unreachable!(),
         None => {
             Cli::command().print_help()?;
             println!();
@@ -823,6 +870,7 @@ fn handle_rust_state_machine(transitions: usize) -> Result<(), Box<dyn std::erro
 async fn handle_daemon(
     args: DaemonArgs,
     cfg: &CanonConfig,
+    config_path: Option<PathBuf>,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let current_dir = std::env::current_dir()?;
@@ -878,16 +926,16 @@ async fn handle_daemon(
     let (socket_path, root) = if is_isolated {
         let root = resolve_workspace_root(&current_dir);
         let socket_path = resolve_active_socket(socket_override, &root);
-        (socket_path, root)
+        (socket_path, Some(root))
     } else {
         let socket_path = socket_override
             .map(PathBuf::from)
             .unwrap_or_else(resolve_global_socket);
-        let root = resolve_workspace_root(&current_dir);
-        (socket_path, root)
+        // System daemon: do not bind or pre-index CWD
+        (socket_path, None)
     };
 
-    handle_daemon_start(&socket_path, &root, cfg).await
+    handle_daemon_start(&socket_path, root.as_deref(), cfg, config_path).await
 }
 
 async fn handle_daemon_ping(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1027,6 +1075,16 @@ fn print_daemon_status_table(status: &DaemonStatusInfo) {
     println!("Canon Daemon Status: Active");
     println!("PID:            {}", status.pid);
     println!("Uptime:         {}", format_uptime(status.uptime_secs));
+    if !status.daemon_mode.is_empty() {
+        println!("Daemon Mode:    {}", status.daemon_mode);
+    }
+    let cfg_display = status
+        .config_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "built-in defaults".to_string());
+    println!("Config Path:    {}", cfg_display);
+    println!("Declared Projects: {}", status.declared_projects_count);
     println!("Socket Path:    {}", status.socket_path.display());
     if !status.main_log_path.as_os_str().is_empty() {
         println!("Main Daemon Log: {}", status.main_log_path.display());
@@ -1314,46 +1372,57 @@ async fn handle_daemon_hook_post_read(
 
 async fn handle_daemon_start(
     socket_path: &Path,
-    root: &Path,
+    root: Option<&Path>,
     cfg: &CanonConfig,
+    config_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info_banner(
-        "Daemon",
-        &format!(
-            "Starting background daemon on '{}'...",
-            socket_path.display()
-        ),
-    );
-    let index_start = std::time::Instant::now();
-    info_banner(
-        "Index",
-        &format!("Starting initial indexing for '{}'...", root.display()),
-    );
-    let mut initial_index = SymbolIndex::new();
-    let indexed = initial_index.index_directory(root).unwrap_or(0);
-    let elapsed = index_start.elapsed();
-    let metrics = initial_index.metrics();
-    let throughput = if elapsed.as_secs_f64() > 0.0 {
-        (indexed as f64) / elapsed.as_secs_f64()
+    let (initial_index, workspace_root) = if let Some(r) = root {
+        info_banner(
+            "Daemon",
+            &format!("Starting isolated daemon on '{}'...", socket_path.display()),
+        );
+        let index_start = std::time::Instant::now();
+        info_banner(
+            "Index",
+            &format!("Starting initial indexing for '{}'...", r.display()),
+        );
+        let mut idx = SymbolIndex::new();
+        let indexed = idx.index_directory(r).unwrap_or(0);
+        let elapsed = index_start.elapsed();
+        let metrics = idx.metrics();
+        let throughput = if elapsed.as_secs_f64() > 0.0 {
+            (indexed as f64) / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        info_banner(
+            "Index",
+            &format!(
+                "Initial indexing complete: {} files ({} symbols, {} call edges, {} contracts, {} routes) in {:.2?} ({:.0} files/sec)",
+                indexed,
+                metrics.total_symbols_count,
+                metrics.total_call_edges_count,
+                metrics.total_contracts_count,
+                metrics.total_routes_count,
+                elapsed,
+                throughput
+            ),
+        );
+        (idx, r.to_path_buf())
     } else {
-        0.0
+        info_banner(
+            "Daemon",
+            &format!(
+                "Starting system-wide daemon on '{}' (multi-tenant lazy indexing, {} declared projects)...",
+                socket_path.display(),
+                cfg.projects.len()
+            ),
+        );
+        (SymbolIndex::new(), PathBuf::new())
     };
-    info_banner(
-        "Index",
-        &format!(
-            "Initial indexing complete: {} files ({} symbols, {} call edges, {} contracts, {} routes) in {:.2?} ({:.0} files/sec)",
-            indexed,
-            metrics.total_symbols_count,
-            metrics.total_call_edges_count,
-            metrics.total_contracts_count,
-            metrics.total_routes_count,
-            elapsed,
-            throughput
-        ),
-    );
+
     let index = Arc::new(RwLock::new(initial_index));
     let token = CancellationToken::new();
-
     let watcher_active = cfg.daemon.enable_file_watcher;
 
     let tok_ctrl_c = token.clone();
@@ -1368,10 +1437,12 @@ async fn handle_daemon_start(
 
     let opts = ServerOptions {
         socket_path: socket_path.to_path_buf(),
-        workspace_root: root.to_path_buf(),
+        workspace_root,
         watcher_active,
         log_dir: cfg.daemon.log_dir.as_ref().map(PathBuf::from),
         idle_ttl_secs: cfg.daemon.idle_ttl_secs,
+        daemon_config: cfg.clone(),
+        config_path,
     };
     run_server_with_options(opts, index, token).await?;
     success("Daemon", "Daemon exited cleanly.");
@@ -1460,6 +1531,13 @@ mod tests {
         assert_eq!(d.start_line, Some(10));
         assert_eq!(d.end_line, Some(40));
         assert_eq!(d.vendor, Some(AgentVendor::Agy));
+
+        let cli_cfg = Cli::try_parse_from(["cargo-canon", "daemon", "-c", "/etc/canon/canon.toml"])
+            .expect("should parse -c config flag");
+        let Some(Commands::Daemon(d2)) = cli_cfg.command else {
+            panic!("expected Daemon command");
+        };
+        assert_eq!(d2.config, Some(PathBuf::from("/etc/canon/canon.toml")));
     }
 
     #[test]

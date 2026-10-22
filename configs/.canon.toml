@@ -47,6 +47,9 @@ corpus_dir = "tests/fuzz/corpus"
 # Whether this daemon operates in system-wide multi-tenant mode (default: true)
 system_daemon = true
 
+# Whether to defer indexing until first touch on each workspace (default: true)
+lazy_indexing = true
+
 # Global Unix domain socket path override (default: auto-derived in XDG runtime dir)
 # global_socket = "/run/user/1000/canon/daemon.sock"
 
@@ -57,7 +60,7 @@ idle_ttl_secs = 7200
 worktrees_dir = ".claude/worktrees"
 
 # Additional directories to ignore machine-wide or project-wide
-ignored_dirs = [".claude", ".cursor", ".worktrees"]
+ignored_dirs = [".claude", ".cursor"]
 
 # Enable background incremental file watching via notify across all active workspaces
 enable_file_watcher = true

@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 struct WatchedWorkspace {
     index: Arc<TokioRwLock<SymbolIndex>>,
     logger: Arc<WorkspaceLogger>,
+    config: canon_core::ProjectConfig,
 }
 
 /// Shared internal state for the dynamic file watcher.
@@ -94,54 +95,133 @@ impl DynamicWatcherManager {
         Ok(Self { inner, token })
     }
 
-    /// Dispatches an observed file modification event to the appropriate matching workspace index.
-    async fn dispatch_mutation(inner: &DynamicWatcherInner, path: PathBuf) {
-        let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let target = {
-            let ws_guard = match inner.workspaces.read() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            let mut best_match: Option<(PathBuf, WatchedWorkspace)> = None;
-            for (root, ws) in ws_guard.iter() {
-                if canonical_path.starts_with(root) {
-                    match &best_match {
-                        None => best_match = Some((root.clone(), ws.clone())),
-                        Some((best_root, _)) => {
-                            if root.as_os_str().len() > best_root.as_os_str().len() {
-                                best_match = Some((root.clone(), ws.clone()));
-                            }
+    fn find_best_workspace(
+        inner: &DynamicWatcherInner,
+        canonical_path: &Path,
+    ) -> Option<(PathBuf, WatchedWorkspace)> {
+        let ws_guard = inner.workspaces.read().ok()?;
+        let mut best_match: Option<(PathBuf, WatchedWorkspace)> = None;
+        for (root, ws) in ws_guard.iter() {
+            if canonical_path.starts_with(root) {
+                match &best_match {
+                    None => best_match = Some((root.clone(), ws.clone())),
+                    Some((best_root, _)) => {
+                        if root.as_os_str().len() > best_root.as_os_str().len() {
+                            best_match = Some((root.clone(), ws.clone()));
                         }
                     }
                 }
             }
-            best_match
+        }
+        best_match
+    }
+
+    fn is_nested_worktree_mutation(
+        target_root: &Path,
+        canonical_path: &Path,
+        config: &canon_core::ProjectConfig,
+    ) -> bool {
+        if let Some(parent) = canonical_path.parent() {
+            for anc in parent.ancestors() {
+                if anc == target_root || !anc.starts_with(target_root) {
+                    break;
+                }
+                if anc.join(".git").exists() {
+                    return true;
+                }
+            }
+        }
+        if !target_root.join(".git").is_file() {
+            if let Ok(rel) = canonical_path.strip_prefix(target_root) {
+                if rel
+                    .components()
+                    .any(|c| c.as_os_str() == "worktrees" || c.as_os_str() == ".worktrees")
+                {
+                    return true;
+                }
+                if let Some(ref wt) = config.custom_worktree_path {
+                    let wt_rel = wt.strip_prefix(target_root).unwrap_or(wt.as_path());
+                    if !wt_rel.as_os_str().is_empty() && rel.starts_with(wt_rel) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Dispatches an observed file modification event to the appropriate matching workspace index.
+    async fn dispatch_mutation(inner: &DynamicWatcherInner, path: PathBuf) {
+        let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let Some((target_root, target_ws)) = Self::find_best_workspace(inner, &canonical_path)
+        else {
+            return;
         };
 
-        if let Some((root, ws)) = target {
-            let start = std::time::Instant::now();
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let path_str = canonical_path.to_string_lossy().to_string();
-                let mut guard = ws.index.write().await;
-                let _ = guard.index_any_source_str(&path_str, &content);
-                drop(guard);
-                let elapsed_ms = start.elapsed().as_millis();
-                tracing::debug!(path = %path.display(), elapsed_ms, "Symbol index updated");
-                let rel_display = path.strip_prefix(&root).unwrap_or(&path).display();
-                ws.logger.log(&format!(
-                    "[DEBUG] File modified: '{}' -> updated symbol index in {}ms",
-                    rel_display, elapsed_ms
-                ));
+        // Worktree Carve-Out Rule: reject mutations inside nested worktrees when matched to parent repo
+        if Self::is_nested_worktree_mutation(&target_root, &canonical_path, &target_ws.config) {
+            tracing::debug!(
+                path = %canonical_path.display(),
+                "Dropped nested worktree edit from parent workspace index"
+            );
+            return;
+        }
+
+        // Two-Tier Relative Ignore & Extension Check against loaded ProjectConfig
+        if let Ok(rel) = canonical_path.strip_prefix(&target_root) {
+            if target_ws.config.is_relative_path_ignored(rel) {
+                tracing::debug!(
+                    path = %canonical_path.display(),
+                    "Ignored by loaded project configuration"
+                );
+                return;
             }
+        }
+        let ext_enabled = canonical_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| target_ws.config.is_extension_enabled(ext));
+        if !ext_enabled {
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        if let Ok(content) = std::fs::read_to_string(&canonical_path) {
+            let path_str = canonical_path.to_string_lossy().to_string();
+            let mut guard = target_ws.index.write().await;
+            let _ = guard.index_any_source_str(&path_str, &content);
+            drop(guard);
+            let elapsed_ms = start.elapsed().as_millis();
+            tracing::debug!(path = %path.display(), elapsed_ms, "Symbol index updated");
+            let rel_display = path.strip_prefix(&target_root).unwrap_or(&path).display();
+            target_ws.logger.log(&format!(
+                "[DEBUG] File modified: '{}' -> updated symbol index in {}ms",
+                rel_display, elapsed_ms
+            ));
         }
     }
 
-    /// Dynamically registers a workspace root for recursive file monitoring.
+    /// Dynamically registers a workspace root for recursive file monitoring using default project rules.
     pub fn watch_workspace(
         &self,
         root: PathBuf,
         index: Arc<TokioRwLock<SymbolIndex>>,
         logger: Arc<WorkspaceLogger>,
+    ) -> Result<(), DaemonError> {
+        let config = canon_core::ProjectConfig {
+            qualified_path: root.clone(),
+            ..canon_core::ProjectConfig::default()
+        };
+        self.watch_workspace_with_config(root, index, logger, config)
+    }
+
+    /// Dynamically registers a workspace root for recursive file monitoring with explicit `ProjectConfig`.
+    pub fn watch_workspace_with_config(
+        &self,
+        root: PathBuf,
+        index: Arc<TokioRwLock<SymbolIndex>>,
+        logger: Arc<WorkspaceLogger>,
+        config: canon_core::ProjectConfig,
     ) -> Result<(), DaemonError> {
         let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
 
@@ -171,7 +251,14 @@ impl DynamicWatcherManager {
                 .workspaces
                 .write()
                 .map_err(|e| DaemonError::Watcher(e.to_string()))?;
-            ws_guard.insert(canonical_root.clone(), WatchedWorkspace { index, logger });
+            ws_guard.insert(
+                canonical_root.clone(),
+                WatchedWorkspace {
+                    index,
+                    logger,
+                    config,
+                },
+            );
         }
 
         tracing::info!(root = %canonical_root.display(), "Workspace registered for file watching");
@@ -417,6 +504,109 @@ pub mod tests {
         assert!(
             !guard.symbols_map.contains_key("unwatched_symbol"),
             "unwatched workspace index should not update"
+        );
+
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_watcher_worktree_carve_out_and_relative_ignores() {
+        let dir = tempdir().unwrap();
+        let parent_root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(parent_root.join(".git")).unwrap();
+        std::fs::create_dir_all(parent_root.join("src")).unwrap();
+
+        let registered_wt = parent_root
+            .join(".claude")
+            .join("worktrees")
+            .join("agent-auth");
+        std::fs::create_dir_all(registered_wt.join("src")).unwrap();
+        std::fs::create_dir_all(registered_wt.join(".claude")).unwrap();
+        std::fs::write(registered_wt.join(".git"), "gitdir: ../../../.git\n").unwrap();
+
+        let unregistered_wt = parent_root
+            .join(".claude")
+            .join("worktrees")
+            .join("unregistered-wt");
+        std::fs::create_dir_all(unregistered_wt.join("src")).unwrap();
+        std::fs::write(unregistered_wt.join(".git"), "gitdir: ../../../.git\n").unwrap();
+
+        let proj_cfg = canon_core::ProjectConfig {
+            qualified_path: parent_root.clone(),
+            has_worktrees: true,
+            custom_worktree_path: Some(PathBuf::from(".claude/worktrees")),
+            lang: vec!["rust".to_string()],
+            ignored_dirs: vec![".claude".to_string()],
+            ..canon_core::ProjectConfig::default()
+        };
+
+        let token = CancellationToken::new();
+        let manager = DynamicWatcherManager::new(token.clone()).unwrap();
+
+        let parent_idx = Arc::new(TokioRwLock::new(SymbolIndex::new()));
+        let parent_logger = Arc::new(WorkspaceLogger::noop(parent_root.clone()));
+        manager
+            .watch_workspace_with_config(
+                parent_root.clone(),
+                Arc::clone(&parent_idx),
+                parent_logger,
+                proj_cfg.clone(),
+            )
+            .unwrap();
+
+        let wt_idx = Arc::new(TokioRwLock::new(SymbolIndex::new()));
+        let wt_logger = Arc::new(WorkspaceLogger::noop(registered_wt.clone()));
+        manager
+            .watch_workspace_with_config(
+                registered_wt.clone(),
+                Arc::clone(&wt_idx),
+                wt_logger,
+                proj_cfg,
+            )
+            .unwrap();
+
+        // 1. Edit in unregistered worktree must be carved out from parent index
+        let unreg_file = unregistered_wt.join("src").join("lib.rs");
+        std::fs::write(&unreg_file, "pub fn unreg_leak() {}").unwrap();
+        DynamicWatcherManager::dispatch_mutation(&manager.inner, unreg_file).await;
+        assert!(
+            !parent_idx
+                .read()
+                .await
+                .symbols_map
+                .contains_key("unreg_leak")
+        );
+
+        // 2. Edit inside registered worktree's internal .claude/ dir must be ignored
+        let wt_internal_ignored = registered_wt.join(".claude").join("cache.rs");
+        std::fs::write(&wt_internal_ignored, "pub fn internal_claude_ignored() {}").unwrap();
+        DynamicWatcherManager::dispatch_mutation(&manager.inner, wt_internal_ignored).await;
+        assert!(
+            !wt_idx
+                .read()
+                .await
+                .symbols_map
+                .contains_key("internal_claude_ignored")
+        );
+
+        // 3. Valid edit inside registered worktree (.claude/worktrees/agent-auth/src/lib.rs)
+        // must update wt_idx and NOT parent_idx
+        let wt_valid_file = registered_wt.join("src").join("lib.rs");
+        std::fs::write(&wt_valid_file, "pub fn wt_live_updated() {}").unwrap();
+        DynamicWatcherManager::dispatch_mutation(&manager.inner, wt_valid_file).await;
+        assert!(
+            wt_idx
+                .read()
+                .await
+                .symbols_map
+                .contains_key("wt_live_updated")
+        );
+        assert!(
+            !parent_idx
+                .read()
+                .await
+                .symbols_map
+                .contains_key("wt_live_updated")
         );
 
         token.cancel();

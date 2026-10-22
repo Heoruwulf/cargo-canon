@@ -2,11 +2,49 @@
 
 use crate::error::CoreError;
 use crate::output::OutputFormat;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Standard universal build artifacts, dependency directories, and VCS metadata.
+/// NOTE: `.worktrees` and `.claude` are intentionally EXCLUDED here because they may
+/// contain nested Git worktree roots; those are pruned relative to each workspace root.
+pub const STANDARD_IGNORED_DIRS: &[&str] = &[
+    "target",
+    ".git",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".yarn",
+    ".pnpm-store",
+    ".output",
+    ".svelte-kit",
+    "coverage",
+    ".idea",
+    ".vscode",
+    ".cache",
+];
+
+/// Ordered list of workspace configuration file candidates relative to a workspace root.
+pub const WORKSPACE_CONFIG_CANDIDATES: &[&str] = &[
+    "config/canon.toml",
+    ".canon.toml",
+    "canon.toml",
+    ".config/canon.toml",
+    "configs/.canon.toml",
+    "configs/canon.toml",
+    ".groundtruth.toml",
+    "groundtruth.toml",
+];
+
 /// Primary configuration structure for cargo-canon workspaces.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CanonConfig {
     /// General workspace settings.
     #[serde(default)]
@@ -35,7 +73,15 @@ pub struct CanonConfig {
     /// Configuration for cross-boundary contract correlation.
     #[serde(default)]
     pub cross_boundary: CrossBoundaryConfig,
+    /// Explicitly namespaced projects: `[projects.<name>]`.
+    #[serde(default)]
+    pub projects: HashMap<String, ProjectConfig>,
+    /// Top-level project tables: `[<project-name>]`.
+    #[serde(flatten)]
+    pub dynamic_projects: HashMap<String, toml::Value>,
 }
+
+impl Eq for CanonConfig {}
 
 /// General engine configuration options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +244,9 @@ pub struct DaemonConfig {
     /// Whether this daemon operates in system-wide multi-tenant mode (default: true).
     #[serde(default = "default_true")]
     pub system_daemon: bool,
+    /// Whether indexing is deferred lazily until first workspace touch (default: true).
+    #[serde(default = "default_true")]
+    pub lazy_indexing: bool,
     /// Global Unix domain socket path override (None = auto-derived in XDG runtime dir).
     #[serde(default)]
     pub global_socket: Option<String>,
@@ -242,6 +291,7 @@ impl Default for DaemonConfig {
         Self {
             socket_path: None,
             system_daemon: true,
+            lazy_indexing: true,
             global_socket: None,
             idle_ttl_secs: default_idle_ttl_secs(),
             worktrees_dir: None,
@@ -463,6 +513,273 @@ impl Default for GoStateMachineConfig {
     }
 }
 
+/// Declarative per-project configuration for multi-repo environments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// Canonical qualified path to the project root directory.
+    #[serde(default)]
+    pub qualified_path: PathBuf,
+    /// Whether this project employs Git worktrees.
+    #[serde(default)]
+    pub has_worktrees: bool,
+    /// Custom path or subdirectory where worktrees reside.
+    #[serde(default, alias = "has_custom_worktree_path")]
+    pub custom_worktree_path: Option<PathBuf>,
+    /// Languages enabled for this project (e.g. rust, typescript, go).
+    #[serde(default, deserialize_with = "deserialize_lang_list")]
+    pub lang: Vec<String>,
+
+    /// Codebase scale hint: "small", "medium", "massive".
+    #[serde(default = "default_codebase_scale")]
+    pub codebase_scale: String,
+    /// Default output format ("markdown", "json", "text").
+    #[serde(default)]
+    pub default_format: OutputFormat,
+
+    /// Subdirectories to monitor for source code modifications within this project.
+    #[serde(default = "default_watch_paths")]
+    pub watch_paths: Vec<String>,
+    /// Additional directory names to ignore during indexing and watching.
+    #[serde(default)]
+    pub ignored_dirs: Vec<String>,
+
+    /// Slicing call-graph exploration depth bound.
+    #[serde(default = "default_max_call_depth")]
+    pub max_call_depth: usize,
+    /// Whether to strip comments during skeleton unparsing.
+    #[serde(default)]
+    pub strip_comments: bool,
+    /// Whether to include private/internal types in context exports.
+    #[serde(default = "default_true")]
+    pub include_private_types: bool,
+    /// Custom directory names to ignore during file discovery.
+    #[serde(default)]
+    pub custom_ignored_dirs: Vec<String>,
+
+    /// Per-project slicing options.
+    #[serde(default)]
+    pub slice: SliceConfig,
+    /// Per-project TypeScript options.
+    #[serde(default)]
+    pub typescript: TypeScriptConfig,
+    /// Per-project Go options.
+    #[serde(default)]
+    pub go: GoConfig,
+    /// Per-project cross-boundary contract options.
+    #[serde(default)]
+    pub cross_boundary: CrossBoundaryConfig,
+    /// Per-project simulation options.
+    #[serde(default)]
+    pub simulate: SimulateConfig,
+    /// Per-project formal verification options.
+    #[serde(default)]
+    pub verify: VerifyConfig,
+    /// Per-project differential fuzzing options.
+    #[serde(default)]
+    pub diff_fuzz: DiffFuzzConfig,
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            qualified_path: PathBuf::new(),
+            has_worktrees: false,
+            custom_worktree_path: None,
+            lang: Vec::new(),
+            codebase_scale: default_codebase_scale(),
+            default_format: OutputFormat::Markdown,
+            watch_paths: default_watch_paths(),
+            ignored_dirs: Vec::new(),
+            max_call_depth: default_max_call_depth(),
+            strip_comments: false,
+            include_private_types: true,
+            custom_ignored_dirs: Vec::new(),
+            slice: SliceConfig::default(),
+            typescript: TypeScriptConfig::default(),
+            go: GoConfig::default(),
+            cross_boundary: CrossBoundaryConfig::default(),
+            simulate: SimulateConfig::default(),
+            verify: VerifyConfig::default(),
+            diff_fuzz: DiffFuzzConfig::default(),
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// Constructs a `ProjectConfig` synthesized from a workspace `CanonConfig`.
+    pub fn from_canon_config(root: PathBuf, cfg: &CanonConfig) -> Self {
+        let mut proj = Self {
+            qualified_path: root,
+            has_worktrees: cfg.daemon.worktrees_dir.is_some(),
+            custom_worktree_path: cfg.daemon.worktrees_dir.as_ref().map(PathBuf::from),
+            lang: Vec::new(),
+            codebase_scale: cfg.general.codebase_scale.clone(),
+            default_format: cfg.general.default_format,
+            watch_paths: cfg.daemon.watch_paths.clone(),
+            ignored_dirs: cfg.daemon.ignored_dirs.clone(),
+            max_call_depth: cfg.slice.max_call_depth,
+            strip_comments: cfg.slice.strip_comments,
+            include_private_types: cfg.slice.include_private_types,
+            custom_ignored_dirs: cfg.slice.custom_ignored_dirs.clone(),
+            slice: cfg.slice.clone(),
+            typescript: cfg.typescript.clone(),
+            go: cfg.go.clone(),
+            cross_boundary: cfg.cross_boundary.clone(),
+            simulate: cfg.simulate.clone(),
+            verify: cfg.verify.clone(),
+            diff_fuzz: cfg.diff_fuzz.clone(),
+        };
+        proj.normalize();
+        proj
+    }
+
+    /// Normalizes inline scalar fields with nested sub-table configurations.
+    pub fn normalize(&mut self) {
+        if self.max_call_depth != default_max_call_depth()
+            && self.slice.max_call_depth == default_max_call_depth()
+        {
+            self.slice.max_call_depth = self.max_call_depth;
+        }
+        if self.strip_comments && !self.slice.strip_comments {
+            self.slice.strip_comments = self.strip_comments;
+        }
+        if !self.include_private_types && self.slice.include_private_types {
+            self.slice.include_private_types = self.include_private_types;
+        }
+        if !self.custom_ignored_dirs.is_empty() {
+            self.slice
+                .custom_ignored_dirs
+                .extend(self.custom_ignored_dirs.clone());
+            self.slice.custom_ignored_dirs.sort();
+            self.slice.custom_ignored_dirs.dedup();
+        }
+    }
+
+    /// Determines whether a path relative to the workspace root should be ignored,
+    /// directly evaluating universal build artifacts, project-specific `ignored_dirs`,
+    /// and slicing `custom_ignored_dirs`.
+    pub fn is_relative_path_ignored(&self, rel: &Path) -> bool {
+        for comp in rel.components() {
+            if let std::path::Component::Normal(c) = comp {
+                if let Some(s) = c.to_str() {
+                    if STANDARD_IGNORED_DIRS.contains(&s) {
+                        return true;
+                    }
+                    if self.ignored_dirs.iter().any(|d| d == s) {
+                        return true;
+                    }
+                    if self.custom_ignored_dirs.iter().any(|d| d == s)
+                        || self.slice.custom_ignored_dirs.iter().any(|d| d == s)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Checks whether a file extension is enabled by this project's `lang` setting.
+    pub fn is_extension_enabled(&self, ext: &str) -> bool {
+        if self.lang.is_empty() {
+            return matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "go");
+        }
+        match ext {
+            "rs" => self.lang.iter().any(|l| l == "rust" || l == "rs"),
+            "ts" | "tsx" | "js" | "jsx" => {
+                self.typescript.enabled
+                    && self.lang.iter().any(|l| {
+                        matches!(
+                            l.as_str(),
+                            "typescript" | "ts" | "tsx" | "javascript" | "js"
+                        )
+                    })
+            }
+            "go" => self.go.enabled && self.lang.iter().any(|l| l == "go" || l == "golang"),
+            _ => false,
+        }
+    }
+}
+
+/// Flexible deserializer accepting either a comma-separated string ("rust,typescript")
+/// or an array of strings (["rust", "typescript"]).
+fn deserialize_lang_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum LangInput {
+        List(Vec<String>),
+        CommaString(String),
+    }
+
+    match LangInput::deserialize(deserializer)? {
+        LangInput::List(list) => Ok(list
+            .into_iter()
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| !part.is_empty())
+            .collect()),
+        LangInput::CommaString(s) => Ok(s
+            .split(',')
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| !part.is_empty())
+            .collect()),
+    }
+}
+
+/// Tracks the canonical file paths of all configuration layers merged during discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigProvenance {
+    /// Explicit `--config` override path, if supplied.
+    pub custom_path: Option<PathBuf>,
+    /// System/global configuration file path (`~/.config/canon/canon.toml` or `/etc/canon/canon.toml`).
+    pub global_path: Option<PathBuf>,
+    /// Parent repository configuration file path when operating inside a linked Git worktree.
+    pub parent_repo_path: Option<PathBuf>,
+    /// Local workspace configuration file path (`<root>/config/canon.toml`, `<root>/.canon.toml`, etc.).
+    pub local_workspace_path: Option<PathBuf>,
+}
+
+impl ConfigProvenance {
+    /// Returns the most specific configuration path loaded (custom -> local -> parent -> global).
+    pub fn primary_path(&self) -> Option<&Path> {
+        self.custom_path
+            .as_deref()
+            .or(self.local_workspace_path.as_deref())
+            .or(self.parent_repo_path.as_deref())
+            .or(self.global_path.as_deref())
+    }
+
+    /// Emits structured tracing logs detailing all resolved configuration layers.
+    pub fn log_details(&self) {
+        if let Some(ref p) = self.custom_path {
+            tracing::info!(path = %p.display(), layer = "custom", "Loaded custom configuration");
+        }
+        if let Some(ref p) = self.global_path {
+            tracing::debug!(path = %p.display(), layer = "global", "Loaded global configuration");
+        }
+        if let Some(ref p) = self.parent_repo_path {
+            tracing::debug!(path = %p.display(), layer = "parent_repo", "Loaded worktree parent repository configuration");
+        }
+        if let Some(ref p) = self.local_workspace_path {
+            tracing::debug!(path = %p.display(), layer = "local_workspace", "Loaded workspace configuration");
+        }
+    }
+}
+
+/// Searches `dir` for the first existing configuration file matching `WORKSPACE_CONFIG_CANDIDATES`
+/// and returns its canonicalized `PathBuf`.
+pub fn find_config_in_dir(dir: &Path) -> Option<PathBuf> {
+    for rel_candidate in WORKSPACE_CONFIG_CANDIDATES {
+        let candidate = dir.join(rel_candidate);
+        if candidate.is_file() {
+            return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+        }
+    }
+    None
+}
+
 /// Resolves the global user configuration path:
 /// `$XDG_CONFIG_HOME/canon/canon.toml` (default: `~/.config/canon/canon.toml`).
 pub fn resolve_global_config_path() -> PathBuf {
@@ -489,6 +806,64 @@ pub fn resolve_global_config_path() -> PathBuf {
     std::env::temp_dir().join("canon").join("canon.toml")
 }
 
+/// Resolves candidate system-level configuration paths:
+/// 1. `$XDG_CONFIG_HOME/canon/canon.toml`
+/// 2. `~/.config/canon/canon.toml`
+/// 3. `~/Library/Application Support/canon/canon.toml` (macOS)
+/// 4. `/etc/canon/canon.toml` (Linux / Docker / K8s system path)
+/// 5. `/etc/canon/config.toml` (Kubernetes ConfigMap standard)
+pub fn resolve_system_config_path() -> Option<PathBuf> {
+    if let Some(xdg_config) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg_config.is_empty() {
+            let p = PathBuf::from(xdg_config).join("canon").join("canon.toml");
+            if p.is_file() {
+                return std::fs::canonicalize(&p).ok().or(Some(p));
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        #[cfg(target_os = "macos")]
+        {
+            let mac_path = home_path
+                .join("Library")
+                .join("Application Support")
+                .join("canon")
+                .join("canon.toml");
+            if mac_path.is_file() {
+                return std::fs::canonicalize(&mac_path).ok().or(Some(mac_path));
+            }
+        }
+        let user_path = home_path.join(".config").join("canon").join("canon.toml");
+        if user_path.is_file() {
+            return std::fs::canonicalize(&user_path).ok().or(Some(user_path));
+        }
+    }
+    let etc_canon = PathBuf::from("/etc/canon/canon.toml");
+    if etc_canon.is_file() {
+        return std::fs::canonicalize(&etc_canon).ok().or(Some(etc_canon));
+    }
+    let etc_config = PathBuf::from("/etc/canon/config.toml");
+    if etc_config.is_file() {
+        return std::fs::canonicalize(&etc_config).ok().or(Some(etc_config));
+    }
+    None
+}
+
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    for ancestor in path.ancestors() {
+        if let Ok(c_anc) = std::fs::canonicalize(ancestor) {
+            if let Ok(rel) = path.strip_prefix(ancestor) {
+                return c_anc.join(rel);
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 impl CanonConfig {
     /// Loads configuration from a specific file path.
     pub fn load(path: &Path) -> Result<Self, CoreError> {
@@ -496,11 +871,92 @@ impl CanonConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        let config: Self = toml::from_str(&content).map_err(|source| CoreError::ConfigParse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mut config: Self =
+            toml::from_str(&content).map_err(|source| CoreError::ConfigParse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        config.normalize_projects();
         Ok(config)
+    }
+
+    /// Normalizes top-level custom project sections into `self.projects`.
+    pub fn normalize_projects(&mut self) {
+        let reserved = [
+            "general",
+            "slice",
+            "simulate",
+            "verify",
+            "diff_fuzz",
+            "daemon",
+            "typescript",
+            "go",
+            "cross_boundary",
+            "projects",
+        ];
+        let dynamic = std::mem::take(&mut self.dynamic_projects);
+        for (key, val) in dynamic {
+            if !reserved.contains(&key.as_str()) {
+                if let Ok(mut proj_cfg) = val.try_into::<ProjectConfig>() {
+                    proj_cfg.normalize();
+                    self.projects.entry(key).or_insert(proj_cfg);
+                }
+            }
+        }
+        for proj in self.projects.values_mut() {
+            proj.normalize();
+        }
+    }
+
+    /// Finds a declared project configuration that encompasses the given path.
+    pub fn find_project_for_path(&self, target_path: &Path) -> Option<(&str, &ProjectConfig)> {
+        let canonical_target = canonicalize_best_effort(target_path);
+        for (name, proj) in &self.projects {
+            if proj.qualified_path.as_os_str().is_empty() {
+                continue;
+            }
+            let canonical_proj = canonicalize_best_effort(&proj.qualified_path);
+            if canonical_target.starts_with(&canonical_proj) {
+                return Some((name.as_str(), proj));
+            }
+            if let Some(ref wt_path) = proj.custom_worktree_path {
+                let full_wt_path = if wt_path.is_relative() {
+                    canonical_proj.join(wt_path)
+                } else {
+                    wt_path.clone()
+                };
+                let canonical_wt = canonicalize_best_effort(&full_wt_path);
+                if canonical_target.starts_with(&canonical_wt) {
+                    return Some((name.as_str(), proj));
+                }
+            }
+        }
+        None
+    }
+
+    /// Loads configuration specifically for the daemon runtime.
+    ///
+    /// If `custom_path` is provided (via `--config`), loads directly from that file.
+    /// Otherwise, loads strictly from the system path. Never loads or merges CWD configuration.
+    pub fn load_daemon_config(
+        custom_path: Option<&Path>,
+    ) -> Result<(Self, Option<PathBuf>), CoreError> {
+        let (mut cfg, path) = if let Some(path) = custom_path {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let cfg = Self::load(&canonical)?;
+            (cfg, Some(canonical))
+        } else if let Some(system_path) = resolve_system_config_path() {
+            if let Ok(cfg) = Self::load(&system_path) {
+                (cfg, Some(system_path))
+            } else {
+                (Self::default(), None)
+            }
+        } else {
+            (Self::default(), None)
+        };
+
+        cfg.normalize_projects();
+        Ok((cfg, path))
     }
 
     /// Merges an overlay configuration into `self`.
@@ -510,6 +966,14 @@ impl CanonConfig {
         self.merge_sim_and_verify(&overlay, &def);
         self.merge_daemon(&overlay, &def);
         self.merge_polyglot(&overlay, &def);
+        for (name, mut proj) in overlay.projects {
+            proj.normalize();
+            self.projects.insert(name, proj);
+        }
+        for (name, val) in overlay.dynamic_projects {
+            self.dynamic_projects.insert(name, val);
+        }
+        self.normalize_projects();
     }
 
     fn merge_general_and_slice(&mut self, overlay: &CanonConfig, def: &CanonConfig) {
@@ -567,6 +1031,9 @@ impl CanonConfig {
         }
         if overlay.daemon.system_daemon != def.daemon.system_daemon {
             self.daemon.system_daemon = overlay.daemon.system_daemon;
+        }
+        if overlay.daemon.lazy_indexing != def.daemon.lazy_indexing {
+            self.daemon.lazy_indexing = overlay.daemon.lazy_indexing;
         }
         if overlay.daemon.global_socket.is_some() {
             self.daemon.global_socket = overlay.daemon.global_socket.clone();
@@ -643,50 +1110,60 @@ impl CanonConfig {
         }
     }
 
-    /// Discovers configuration for a specific workspace root or worktree path.
-    pub fn discover_for_workspace(root: &Path) -> Self {
+    /// Discovers configuration for a specific workspace root or worktree path,
+    /// returning both the merged configuration and the provenance of all loaded layers.
+    pub fn discover_for_workspace_with_provenance(root: &Path) -> (Self, ConfigProvenance) {
         let mut config = Self::default();
+        let mut provenance = ConfigProvenance::default();
 
-        let global_path = resolve_global_config_path();
-        if global_path.is_file() {
+        if let Some(global_path) = resolve_system_config_path() {
             if let Ok(global_cfg) = Self::load(&global_path) {
                 config.merge(global_cfg);
+                provenance.global_path = Some(global_path);
             }
         }
 
         if let Some(parent_repo) = crate::workspace::detect_worktree_parent_repo(root) {
-            for file_name in &[".canon.toml", ".groundtruth.toml"] {
-                let parent_cfg_path = parent_repo.join(file_name);
-                if parent_cfg_path.is_file() {
-                    if let Ok(parent_cfg) = Self::load(&parent_cfg_path) {
-                        config.merge(parent_cfg);
-                        break;
-                    }
+            if let Some(parent_cfg_path) = find_config_in_dir(&parent_repo) {
+                if let Ok(parent_cfg) = Self::load(&parent_cfg_path) {
+                    config.merge(parent_cfg);
+                    provenance.parent_repo_path = Some(parent_cfg_path);
                 }
             }
         }
 
         let workspace_root = crate::workspace::resolve_workspace_root(root);
-        for file_name in &[".canon.toml", ".groundtruth.toml"] {
-            let local_cfg_path = workspace_root.join(file_name);
-            if local_cfg_path.is_file() {
+        if let Some(local_cfg_path) = find_config_in_dir(&workspace_root) {
+            if provenance.parent_repo_path.as_ref() != Some(&local_cfg_path) {
                 if let Ok(local_cfg) = Self::load(&local_cfg_path) {
                     config.merge(local_cfg);
-                    break;
                 }
             }
+            provenance.local_workspace_path = Some(local_cfg_path);
         }
 
-        config
+        config.normalize_projects();
+        (config, provenance)
+    }
+
+    /// Discovers configuration for a specific workspace root or worktree path.
+    pub fn discover_for_workspace(root: &Path) -> Self {
+        Self::discover_for_workspace_with_provenance(root).0
+    }
+
+    /// Automatically discovers workspace configuration from the current directory
+    /// or its ancestors, returning both the configuration and its provenance.
+    pub fn discover_with_provenance() -> (Self, ConfigProvenance) {
+        if let Ok(current_dir) = std::env::current_dir() {
+            return Self::discover_for_workspace_with_provenance(&current_dir);
+        }
+        (Self::default(), ConfigProvenance::default())
     }
 
     /// Automatically discovers `.canon.toml` or `.groundtruth.toml` from the current
     /// directory or its ancestors. Falls back to default settings if neither exists.
     pub fn discover() -> Self {
-        if let Ok(current_dir) = std::env::current_dir() {
-            return Self::discover_for_workspace(&current_dir);
-        }
-        Self::default()
+        Self::discover_with_provenance().0
     }
 }
 
@@ -900,5 +1377,109 @@ watch_paths = ["crates", "src"]
     fn test_resolve_global_config_path() {
         let path = resolve_global_config_path();
         assert!(path.to_str().unwrap().contains("canon.toml"));
+    }
+
+    #[test]
+    fn test_project_config_deserialization_and_lookup() {
+        use std::io::Write;
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[daemon]
+system_daemon = true
+lazy_indexing = true
+
+[acme-web]
+qualified_path = "/workspace/projects/acme-web"
+has_worktrees = true
+has_custom_worktree_path = "/workspace/projects/acme-web/.claude/worktrees"
+lang = "rust,typescript"
+codebase_scale = "massive"
+watch_paths = ["crates", "frontend/src"]
+ignored_dirs = [".claude", ".cursor"]
+max_call_depth = 3
+strip_comments = true
+include_private_types = false
+custom_ignored_dirs = ["dist"]
+
+[acme-web.typescript]
+enabled = true
+tsconfig_path = "frontend/tsconfig.json"
+
+[acme-web.cross_boundary]
+rust_models = "crates/shared-types/src"
+ts_types = "frontend/src/types"
+
+[acme-web.simulate]
+default_seeds = 9000
+
+[payment-gateway]
+qualified_path = "/workspace/projects/payment-gateway"
+has_worktrees = false
+lang = ["go"]
+codebase_scale = "medium"
+watch_paths = ["backend", "pkg"]
+ignored_dirs = ["vendor"]
+
+[payment-gateway.go]
+enabled = true
+module_root = "backend"
+"#
+        )
+        .unwrap();
+
+        let (cfg, loaded_path) = CanonConfig::load_daemon_config(Some(file.path())).unwrap();
+        assert!(loaded_path.is_some());
+        assert!(cfg.daemon.lazy_indexing);
+        assert_eq!(cfg.projects.len(), 2);
+
+        let acme = cfg.projects.get("acme-web").unwrap();
+        assert!(acme.has_worktrees);
+        assert_eq!(acme.lang, vec!["rust", "typescript"]);
+        assert_eq!(acme.slice.max_call_depth, 3);
+        assert!(acme.slice.strip_comments);
+        assert!(!acme.slice.include_private_types);
+        assert_eq!(acme.slice.custom_ignored_dirs, vec!["dist"]);
+        assert_eq!(acme.simulate.default_seeds, 9000);
+        assert!(acme.is_extension_enabled("rs"));
+        assert!(acme.is_extension_enabled("tsx"));
+        assert!(!acme.is_extension_enabled("go"));
+        assert!(acme.is_relative_path_ignored(Path::new(".claude/logs.txt")));
+        assert!(acme.is_relative_path_ignored(Path::new("target/debug/main")));
+        assert!(acme.is_relative_path_ignored(Path::new("dist/bundle.js")));
+        assert!(!acme.is_relative_path_ignored(Path::new("crates/core/src/lib.rs")));
+
+        let pg = cfg.projects.get("payment-gateway").unwrap();
+        assert_eq!(pg.lang, vec!["go"]);
+        assert!(pg.is_extension_enabled("go"));
+        assert!(!pg.is_extension_enabled("rs"));
+
+        let (matched_name, _) = cfg
+            .find_project_for_path(Path::new(
+                "/workspace/projects/acme-web/.claude/worktrees/wt-1/src/lib.rs",
+            ))
+            .unwrap();
+        assert_eq!(matched_name, "acme-web");
+    }
+
+    #[test]
+    fn test_discover_for_workspace_with_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_file = cfg_dir.join("canon.toml");
+        std::fs::write(&cfg_file, "[general]\ncodebase_scale = \"small\"\n").unwrap();
+
+        let sub = dir.path().join("crates/core");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let (cfg, prov) = CanonConfig::discover_for_workspace_with_provenance(&sub);
+        assert_eq!(cfg.general.codebase_scale, "small");
+        assert_eq!(
+            prov.local_workspace_path.as_deref(),
+            Some(std::fs::canonicalize(&cfg_file).unwrap().as_path())
+        );
+        assert!(prov.primary_path().is_some());
     }
 }

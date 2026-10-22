@@ -16,7 +16,10 @@ pub mod output;
 pub mod span;
 pub mod workspace;
 
-pub use config::CanonConfig;
+pub use config::{
+    CanonConfig, ConfigProvenance, ProjectConfig, STANDARD_IGNORED_DIRS,
+    WORKSPACE_CONFIG_CANDIDATES, find_config_in_dir, resolve_system_config_path,
+};
 pub use error::CoreError;
 pub use logging::init_logging;
 pub use model::SliceMode;

@@ -116,6 +116,8 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
             watcher_active: false,
             log_dir: Some(s_log),
             idle_ttl_secs: 7200,
+            daemon_config: Default::default(),
+            config_path: None,
         };
         let _ = run_server_with_options(opts, dummy_index, server_token).await;
     });

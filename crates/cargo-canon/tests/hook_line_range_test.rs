@@ -53,6 +53,8 @@ impl TestHarness {
             watcher_active: false,
             log_dir: Some(log_dir),
             idle_ttl_secs: 60,
+            daemon_config: Default::default(),
+            config_path: None,
         };
 
         let server_token = token.clone();

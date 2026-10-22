@@ -52,7 +52,7 @@ pub fn resolve_workspace_root(start_dir: &Path) -> PathBuf {
 
     // 2. Check for config file boundary
     for ancestor in canonical_start.ancestors() {
-        if ancestor.join(".canon.toml").exists() || ancestor.join(".groundtruth.toml").exists() {
+        if crate::config::find_config_in_dir(ancestor).is_some() {
             return ancestor.to_path_buf();
         }
     }

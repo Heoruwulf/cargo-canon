@@ -46,6 +46,12 @@ pub enum DaemonRequest {
 pub struct WorkspaceSummary {
     /// Canonical workspace root directory.
     pub root: PathBuf,
+    /// Matched declarative project name from configuration, if any.
+    #[serde(default)]
+    pub project_name: Option<String>,
+    /// Canonical path to the configuration file governing this workspace, if any.
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
     /// Indicates whether this workspace is a Git worktree.
     pub is_worktree: bool,
     /// Parent repository root if this workspace is a worktree.
@@ -71,6 +77,15 @@ pub struct DaemonStatusInfo {
     pub uptime_secs: u64,
     /// Bound socket path.
     pub socket_path: PathBuf,
+    /// Operational mode of the daemon ("System-Wide Multi-Tenant" or "Isolated Workspace").
+    #[serde(default)]
+    pub daemon_mode: String,
+    /// Canonical path of the loaded daemon configuration file, if any.
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
+    /// Number of declarative project sections loaded in the daemon configuration.
+    #[serde(default)]
+    pub declared_projects_count: usize,
     /// Absolute path to the active timestamped daemon log file.
     #[serde(default)]
     pub main_log_path: PathBuf,
@@ -128,6 +143,7 @@ pub struct DaemonStatusInfo {
 }
 
 /// IPC response sent from daemon back to agent tool or CLI client.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonResponse {
     /// Heartbeat response.
@@ -223,11 +239,16 @@ mod tests {
             pid: 12345,
             uptime_secs: 42,
             socket_path: PathBuf::from("/tmp/canon-test.sock"),
+            daemon_mode: "System-Wide Multi-Tenant".to_string(),
+            config_path: Some(PathBuf::from("/etc/canon/canon.toml")),
+            declared_projects_count: 2,
             main_log_path: PathBuf::from("/tmp/logs/daemon-20261020-120000.log"),
             memory_rss_mb: 48.5,
             active_workspaces_count: 1,
             workspaces: vec![WorkspaceSummary {
                 root: PathBuf::from("/home/user/project"),
+                project_name: Some("acme-web".to_string()),
+                config_path: Some(PathBuf::from("/etc/canon/canon.toml")),
                 is_worktree: false,
                 parent_repo: None,
                 indexed_files: 10,
@@ -280,6 +301,9 @@ mod tests {
 
         let decoded: DaemonStatusInfo = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(decoded.pid, 12345);
+        assert_eq!(decoded.daemon_mode, "");
+        assert_eq!(decoded.config_path, None);
+        assert_eq!(decoded.declared_projects_count, 0);
         assert_eq!(decoded.main_log_path, PathBuf::new());
         assert_eq!(decoded.memory_rss_mb, 0.0);
         assert_eq!(decoded.active_workspaces_count, 0);

@@ -17,6 +17,12 @@ use tokio::sync::RwLock;
 pub struct WorkspaceEntry {
     /// Canonical workspace root directory.
     pub root: PathBuf,
+    /// Matched declarative project name from configuration, if any.
+    pub project_name: Option<String>,
+    /// Canonical path to the configuration file governing this workspace, if any.
+    pub config_path: Option<PathBuf>,
+    /// Resolved per-project configuration applied to this workspace.
+    pub config: canon_core::ProjectConfig,
     /// Whether this workspace is a linked Git worktree.
     pub is_worktree: bool,
     /// Parent repository root if this workspace is a worktree.
@@ -43,6 +49,9 @@ impl WorkspaceEntry {
     ) -> Self {
         Self {
             root,
+            project_name: None,
+            config_path: None,
+            config: canon_core::ProjectConfig::default(),
             is_worktree,
             parent_repo,
             index,
@@ -50,6 +59,19 @@ impl WorkspaceEntry {
             logger,
             last_accessed: std::sync::Mutex::new(std::time::Instant::now()),
         }
+    }
+
+    /// Attaches resolved project metadata and provenance to this workspace entry.
+    pub fn with_project_metadata(
+        mut self,
+        project_name: Option<String>,
+        config_path: Option<PathBuf>,
+        config: canon_core::ProjectConfig,
+    ) -> Self {
+        self.project_name = project_name;
+        self.config_path = config_path;
+        self.config = config;
+        self
     }
 
     /// Touches this workspace entry, resetting its idle duration timer.
@@ -79,9 +101,13 @@ impl WorkspaceEntry {
 }
 
 /// Detects added or modified files in a worktree relative to its parent repository.
-fn detect_worktree_modified_files(worktree_root: &Path, parent_repo: &Path) -> Vec<PathBuf> {
+fn detect_worktree_modified_files(
+    worktree_root: &Path,
+    parent_repo: &Path,
+    project: &canon_core::ProjectConfig,
+) -> Vec<PathBuf> {
     let dummy_idx = SymbolIndex::new();
-    let wt_files = dummy_idx.collect_source_files(worktree_root);
+    let wt_files = dummy_idx.collect_source_files_for_project(worktree_root, project);
     let mut modified = Vec::new();
 
     for file in wt_files {
@@ -121,15 +147,70 @@ pub struct WorkspaceRegistry {
     entries: Arc<RwLock<HashMap<PathBuf, Arc<WorkspaceEntry>>>>,
     in_flight: Arc<tokio::sync::Mutex<InFlightMap>>,
     log_manager: Arc<DaemonLogManager>,
+    daemon_config: canon_core::CanonConfig,
+    daemon_config_path: Option<PathBuf>,
 }
 
 impl WorkspaceRegistry {
     /// Creates a new workspace registry backed by the given log manager.
     pub fn new(log_manager: Arc<DaemonLogManager>) -> Self {
+        Self::with_config(log_manager, canon_core::CanonConfig::default(), None)
+    }
+
+    /// Creates a workspace registry configured with a loaded daemon configuration and its provenance path.
+    pub fn with_config(
+        log_manager: Arc<DaemonLogManager>,
+        mut daemon_config: canon_core::CanonConfig,
+        daemon_config_path: Option<PathBuf>,
+    ) -> Self {
+        daemon_config.normalize_projects();
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             log_manager,
+            daemon_config,
+            daemon_config_path,
+        }
+    }
+
+    /// Resolves `(project_name, project_config, config_path)` for a workspace root.
+    /// Checks declared projects in `self.daemon_config` first, falling back to workspace discovery.
+    pub fn resolve_project_for_root(
+        &self,
+        canonical_root: &Path,
+        parent_repo: Option<&Path>,
+    ) -> (Option<String>, canon_core::ProjectConfig, Option<PathBuf>) {
+        if let Some((name, proj)) = self
+            .daemon_config
+            .find_project_for_path(canonical_root)
+            .or_else(|| parent_repo.and_then(|p| self.daemon_config.find_project_for_path(p)))
+        {
+            return (
+                Some(name.to_string()),
+                proj.clone(),
+                self.daemon_config_path.clone(),
+            );
+        }
+
+        let (mut ws_cfg, provenance) =
+            canon_core::CanonConfig::discover_for_workspace_with_provenance(canonical_root);
+        ws_cfg.normalize_projects();
+        let cfg_path = provenance
+            .primary_path()
+            .map(Path::to_path_buf)
+            .or_else(|| self.daemon_config_path.clone());
+
+        if let Some((name, proj)) = ws_cfg
+            .find_project_for_path(canonical_root)
+            .or_else(|| parent_repo.and_then(|p| ws_cfg.find_project_for_path(p)))
+        {
+            (Some(name.to_string()), proj.clone(), cfg_path)
+        } else {
+            (
+                None,
+                canon_core::ProjectConfig::from_canon_config(canonical_root.to_path_buf(), &ws_cfg),
+                cfg_path,
+            )
         }
     }
 
@@ -229,16 +310,27 @@ impl WorkspaceRegistry {
         let start_time = std::time::Instant::now();
         let parent_repo = canon_core::workspace::detect_worktree_parent_repo(canonical_root);
         let is_worktree = parent_repo.is_some();
+        let (project_name, project_config, config_path) =
+            self.resolve_project_for_root(canonical_root, parent_repo.as_deref());
 
         let logger = Arc::new(self.log_manager.create_workspace_logger(canonical_root)?);
+        let proj_label = project_name.as_deref().unwrap_or("<discovered>");
+        let cfg_label = config_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "built-in defaults".to_string());
         self.log_manager.log_daemon(&format!(
-            "Cold start indexing initiated for '{}' (is_worktree: {})",
+            "Cold start indexing initiated for '{}' (is_worktree: {}, project: '{}', config: '{}')",
             canonical_root.display(),
-            is_worktree
+            is_worktree,
+            proj_label,
+            cfg_label
         ));
         logger.log(&format!(
-            "Initial indexing started for '{}'",
-            canonical_root.display()
+            "Initial indexing started for '{}' (project: '{}', config: '{}')",
+            canonical_root.display(),
+            proj_label,
+            cfg_label
         ));
 
         let (index, base_index) = if let Some(ref parent) = parent_repo {
@@ -246,7 +338,8 @@ impl WorkspaceRegistry {
             let parent_entry = Box::pin(self.get_or_init(parent)).await?;
             let base = parent_entry.index.clone();
 
-            let modified_files = detect_worktree_modified_files(canonical_root, parent);
+            let modified_files =
+                detect_worktree_modified_files(canonical_root, parent, &project_config);
             let overlay = {
                 let base_guard = base.read().await;
                 base_guard.create_overlay(&modified_files)
@@ -262,7 +355,8 @@ impl WorkspaceRegistry {
             (Arc::new(RwLock::new(overlay)), Some(base))
         } else {
             let mut idx = SymbolIndex::new();
-            let indexed_files = idx.index_directory(canonical_root)?;
+            let indexed_files =
+                idx.index_directory_with_project(canonical_root, &project_config)?;
 
             let metrics = idx.metrics();
             logger.log(&format!(
@@ -275,14 +369,17 @@ impl WorkspaceRegistry {
             (Arc::new(RwLock::new(idx)), None)
         };
 
-        let entry = Arc::new(WorkspaceEntry::new(
-            canonical_root.to_path_buf(),
-            is_worktree,
-            parent_repo,
-            index,
-            base_index,
-            logger,
-        ));
+        let entry = Arc::new(
+            WorkspaceEntry::new(
+                canonical_root.to_path_buf(),
+                is_worktree,
+                parent_repo,
+                index,
+                base_index,
+                logger,
+            )
+            .with_project_metadata(project_name, config_path, project_config),
+        );
 
         Ok(entry)
     }
@@ -506,5 +603,81 @@ pub mod tests {
             .await;
         assert_eq!(pruned.len(), 1);
         assert_eq!(registry.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_registry_with_declared_project_config() {
+        let log_dir = tempdir().unwrap();
+        let parent_repo = tempdir().unwrap();
+        let canonical_parent = std::fs::canonicalize(parent_repo.path()).unwrap();
+
+        let parent_git = canonical_parent.join(".git");
+        std::fs::create_dir_all(&parent_git).unwrap();
+        let parent_src = canonical_parent.join("src");
+        std::fs::create_dir_all(&parent_src).unwrap();
+        std::fs::write(parent_src.join("lib.rs"), "pub fn parent_fn() {}").unwrap();
+        // Go file should be ignored when lang = ["rust"]
+        std::fs::write(
+            parent_src.join("main.go"),
+            "package main\nfunc GoIgnored() {}",
+        )
+        .unwrap();
+
+        let worktrees_git = parent_git.join("worktrees").join("agent-wt");
+        std::fs::create_dir_all(&worktrees_git).unwrap();
+        std::fs::write(worktrees_git.join("commondir"), "../..\n").unwrap();
+
+        let nested_wt = canonical_parent
+            .join(".claude")
+            .join("worktrees")
+            .join("agent-wt");
+        std::fs::create_dir_all(nested_wt.join("src")).unwrap();
+        std::fs::write(
+            nested_wt.join(".git"),
+            format!("gitdir: {}\n", worktrees_git.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            nested_wt.join("src").join("lib.rs"),
+            "pub fn nested_wt_fn() {}",
+        )
+        .unwrap();
+
+        let mut daemon_cfg = canon_core::CanonConfig::default();
+        daemon_cfg.projects.insert(
+            "acme-web".to_string(),
+            canon_core::ProjectConfig {
+                qualified_path: canonical_parent.clone(),
+                has_worktrees: true,
+                custom_worktree_path: Some(PathBuf::from(".claude/worktrees")),
+                lang: vec!["rust".to_string()],
+                ignored_dirs: vec![".claude".to_string()],
+                ..canon_core::ProjectConfig::default()
+            },
+        );
+        let cfg_path = PathBuf::from("/etc/canon/canon.toml");
+
+        let log_manager = Arc::new(DaemonLogManager::init(log_dir.path()).unwrap());
+        let registry =
+            WorkspaceRegistry::with_config(log_manager, daemon_cfg, Some(cfg_path.clone()));
+
+        let wt_entry = registry
+            .get_or_init(&nested_wt)
+            .await
+            .expect("nested worktree should initialize");
+        assert!(wt_entry.is_worktree);
+        assert_eq!(wt_entry.project_name.as_deref(), Some("acme-web"));
+        assert_eq!(wt_entry.config_path.as_ref(), Some(&cfg_path));
+
+        let wt_guard = wt_entry.index.read().await;
+        assert!(wt_guard.symbols_map.contains_key("nested_wt_fn"));
+        drop(wt_guard);
+
+        let parent_entry = registry.get(&canonical_parent).await.unwrap();
+        assert_eq!(parent_entry.project_name.as_deref(), Some("acme-web"));
+        let p_guard = parent_entry.index.read().await;
+        assert!(p_guard.symbols_map.contains_key("parent_fn"));
+        assert!(!p_guard.symbols_map.contains_key("GoIgnored"));
+        assert!(!p_guard.symbols_map.contains_key("nested_wt_fn"));
     }
 }

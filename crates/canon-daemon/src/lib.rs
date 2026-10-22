@@ -111,6 +111,7 @@ mod tests {
                 watcher_active: true,
                 log_dir: None,
                 idle_ttl_secs: 7200,
+                ..ServerOptions::default()
             };
             let _ = run_server_with_options(opts, index, s_token).await;
         });
@@ -123,6 +124,7 @@ mod tests {
         match response {
             DaemonResponse::Status(status) => {
                 assert_eq!(status.pid, std::process::id());
+                assert_eq!(status.daemon_mode, "Isolated Workspace");
                 assert_eq!(status.workspace_root, PathBuf::from("/test/root"));
                 assert_eq!(status.indexed_files, 1);
                 assert!(status.total_symbols >= 1);
@@ -215,6 +217,7 @@ mod tests {
                 watcher_active: true,
                 log_dir: Some(log_path),
                 idle_ttl_secs: 7200,
+                ..ServerOptions::default()
             };
             let _ = run_server_with_options(opts, index, s_token).await;
         });
@@ -247,6 +250,7 @@ mod tests {
         match status_resp {
             DaemonResponse::Status(status) => {
                 assert_eq!(status.pid, std::process::id());
+                assert_eq!(status.daemon_mode, "System-Wide Multi-Tenant");
                 assert!(status.memory_rss_mb >= 0.0);
                 assert_eq!(status.active_workspaces_count, 1);
                 assert_eq!(status.workspaces.len(), 1);
