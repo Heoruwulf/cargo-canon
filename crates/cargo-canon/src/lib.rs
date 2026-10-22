@@ -21,7 +21,7 @@ use canon_harness::{
     DiffFuzzOptions, InvariantOptions, SimulateOptions, VerifyOptions, run_diff_fuzz,
     run_invariants, run_simulation, run_verify,
 };
-use canon_slice::{SymbolIndex, slice_target};
+use canon_slice::{SymbolIndex, slice_target_for_project};
 use canon_state::{
     FuzzConfig, StateMachine, StateMachineError, TransitionMatrix, fuzz_transitions,
 };
@@ -436,7 +436,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Some(Commands::Slice(args)) => handle_slice(args).await?,
+        Some(Commands::Slice(args)) => handle_slice(args, &cfg).await?,
         Some(Commands::Simulate(args)) => handle_simulate(args).await?,
         Some(Commands::DiffFuzz(args)) => handle_diff_fuzz(args).await?,
         Some(Commands::Verify(args)) => handle_verify(args).await?,
@@ -452,15 +452,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_slice(args: SliceArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_slice(
+    args: SliceArgs,
+    cfg: &CanonConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut index = SymbolIndex::new();
+    let proj = cfg
+        .find_project_for_path(&args.target)
+        .map(|(_, p)| p.clone())
+        .unwrap_or_else(|| {
+            let root = resolve_workspace_root(args.target.parent().unwrap_or(&args.target));
+            canon_core::ProjectConfig::from_canon_config(root, cfg)
+        });
     if let Some(parent) = args.target.parent() {
-        let _ = index.index_directory(parent);
+        let _ = index.index_directory_with_project(parent, &proj);
     }
     if index.symbols_map.is_empty() {
-        let _ = index.index_directory(&PathBuf::from("."));
+        let _ = index.index_directory_with_project(&PathBuf::from("."), &proj);
     }
-    let bundle = slice_target(&args.target, args.mode, Some(&index))?;
+    let bundle =
+        slice_target_for_project(&args.target, args.mode, Some(&index), None, Some(&proj))?;
     let output = bundle.format_with(args.format)?;
     println!("{}", output);
     Ok(())

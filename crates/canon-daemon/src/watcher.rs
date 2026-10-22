@@ -6,7 +6,7 @@
 
 use crate::error::DaemonError;
 use crate::logging::WorkspaceLogger;
-use canon_slice::{SymbolIndex, is_ignored_path};
+use canon_slice::SymbolIndex;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,9 +44,6 @@ impl DynamicWatcherManager {
             if let Ok(event) = res {
                 if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                     for path in event.paths {
-                        if is_ignored_path(&path) {
-                            continue;
-                        }
                         if path.extension().is_some_and(|ext| {
                             matches!(
                                 ext.to_str().unwrap_or(""),
@@ -79,9 +76,6 @@ impl DynamicWatcherManager {
                         let Some(path) = maybe_path else {
                             break;
                         };
-                        if is_ignored_path(&path) {
-                            continue;
-                        }
                         let inner = match weak_inner.upgrade() {
                             Some(i) => i,
                             None => break,
@@ -139,9 +133,8 @@ impl DynamicWatcherManager {
                 {
                     return true;
                 }
-                if let Some(ref wt) = config.custom_worktree_path {
-                    let wt_rel = wt.strip_prefix(target_root).unwrap_or(wt.as_path());
-                    if !wt_rel.as_os_str().is_empty() && rel.starts_with(wt_rel) {
+                if let Some(wt_rel) = config.relative_custom_worktree_path(target_root) {
+                    if rel.starts_with(wt_rel) {
                         return true;
                     }
                 }

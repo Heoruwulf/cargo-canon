@@ -733,6 +733,18 @@ impl ProjectConfig {
         })
     }
 
+    /// Resolves `custom_worktree_path` as a normalized workspace-relative path against `root`
+    /// (stripping `root`, `qualified_path`, and any leading `./` prefix).
+    pub fn relative_custom_worktree_path<'a>(&'a self, root: &Path) -> Option<&'a Path> {
+        let wt = self.custom_worktree_path.as_deref()?;
+        let stripped = wt
+            .strip_prefix(root)
+            .or_else(|_| wt.strip_prefix(&self.qualified_path))
+            .unwrap_or(wt);
+        let normalized = stripped.strip_prefix(".").unwrap_or(stripped);
+        (!normalized.as_os_str().is_empty() && normalized.is_relative()).then_some(normalized)
+    }
+
     /// Checks whether a file extension is enabled by this project's `lang` setting.
     pub fn is_extension_enabled(&self, ext: &str) -> bool {
         if self.lang.is_empty() {
@@ -1572,10 +1584,16 @@ module_root = "backend"
         };
         let sub_proj = ProjectConfig {
             qualified_path: PathBuf::from("/workspace/monorepo/services/payments"),
+            custom_worktree_path: Some(PathBuf::from("./.claude/worktrees")),
             watch_paths: vec!["./src".to_string()],
             ignored_dirs: vec!["./generated/proto".to_string()],
             ..Default::default()
         };
+        assert_eq!(
+            sub_proj
+                .relative_custom_worktree_path(Path::new("/workspace/monorepo/services/payments")),
+            Some(Path::new(".claude/worktrees"))
+        );
         assert!(sub_proj.is_relative_path_ignored(Path::new("generated/proto/api.rs")));
         assert!(sub_proj.is_relative_path_ignored(Path::new("./generated/proto/api.rs")));
         assert!(sub_proj.is_dir_in_watch_paths(Path::new("src/handlers")));

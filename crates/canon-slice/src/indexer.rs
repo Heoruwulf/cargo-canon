@@ -349,11 +349,8 @@ impl SymbolIndex {
                     if rel == Path::new(".worktrees") || rel.starts_with(".worktrees") {
                         return false;
                     }
-                    if let Some(ref wt) = project.custom_worktree_path {
-                        let wt_rel = wt.strip_prefix(root).unwrap_or(wt.as_path());
-                        if !wt_rel.as_os_str().is_empty()
-                            && (rel == wt_rel || rel.starts_with(wt_rel))
-                        {
+                    if let Some(wt_rel) = project.relative_custom_worktree_path(root) {
+                        if rel == wt_rel || rel.starts_with(wt_rel) {
                             return false;
                         }
                     }
