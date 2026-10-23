@@ -5,6 +5,60 @@ use canon_core::model::SliceMode;
 use canon_slice::{SymbolIndex, slice_target_for_project};
 use std::path::Path;
 
+/// Executes non-destructive post-read advisory context injection, returning the raw `SliceBundle`.
+///
+/// CRITICAL INVARIANT: The target file on disk is guaranteed strictly byte-identical
+/// before and after this function executes. Injected context is emitted strictly out-of-band.
+pub fn execute_post_read_bundle(
+    file_path: &Path,
+    index: Option<&SymbolIndex>,
+) -> Result<canon_slice::SliceBundle, DaemonError> {
+    execute_post_read_bundle_for_project(file_path, index, None, None)
+}
+
+/// Executes non-destructive post-read advisory context injection with per-project slicing options,
+/// returning the raw `SliceBundle`.
+///
+/// CRITICAL INVARIANT: The target file on disk is guaranteed strictly byte-identical
+/// before and after this function executes. Injected context is emitted strictly out-of-band.
+pub fn execute_post_read_bundle_for_project(
+    file_path: &Path,
+    base_index: Option<&SymbolIndex>,
+    overlay_index: Option<&SymbolIndex>,
+    project: Option<&canon_core::ProjectConfig>,
+) -> Result<canon_slice::SliceBundle, DaemonError> {
+    if !file_path.is_file() {
+        return Err(DaemonError::Watcher(format!(
+            "target file '{}' does not exist or is not a regular file",
+            file_path.display()
+        )));
+    }
+
+    // Read original bytes to ensure byte-identity invariant
+    let original_bytes = std::fs::read(file_path).map_err(DaemonError::Io)?;
+
+    // Slice out-of-band with optional overlay and project config
+    let bundle = slice_target_for_project(
+        file_path,
+        SliceMode::Bundle,
+        base_index,
+        overlay_index,
+        project,
+    )?;
+
+    // Verify invariant: file bytes on disk remain completely unmodified
+    let check_bytes = std::fs::read(file_path).map_err(DaemonError::Io)?;
+    if original_bytes != check_bytes {
+        // Restore if an external race modified it (defensive invariant protection)
+        let _ = std::fs::write(file_path, &original_bytes);
+        return Err(DaemonError::Watcher(
+            "CRITICAL INVARIANT VIOLATION: target file was modified during post-read hook execution".into()
+        ));
+    }
+
+    Ok(bundle)
+}
+
 /// Executes non-destructive post-read advisory context injection.
 ///
 /// CRITICAL INVARIANT: The target file on disk is guaranteed strictly byte-identical
@@ -39,37 +93,9 @@ pub fn execute_post_read_hook_for_project(
     overlay_index: Option<&SymbolIndex>,
     project: Option<&canon_core::ProjectConfig>,
 ) -> Result<String, DaemonError> {
-    if !file_path.is_file() {
-        return Err(DaemonError::Watcher(format!(
-            "target file '{}' does not exist or is not a regular file",
-            file_path.display()
-        )));
-    }
-
-    // Read original bytes to ensure byte-identity invariant
-    let original_bytes = std::fs::read(file_path).map_err(DaemonError::Io)?;
-
-    // Slice out-of-band with optional overlay and project config
-    let bundle = slice_target_for_project(
-        file_path,
-        SliceMode::Bundle,
-        base_index,
-        overlay_index,
-        project,
-    )?;
-    let advisory_block = bundle.format_markdown();
-
-    // Verify invariant: file bytes on disk remain completely unmodified
-    let check_bytes = std::fs::read(file_path).map_err(DaemonError::Io)?;
-    if original_bytes != check_bytes {
-        // Restore if an external race modified it (defensive invariant protection)
-        let _ = std::fs::write(file_path, &original_bytes);
-        return Err(DaemonError::Watcher(
-            "CRITICAL INVARIANT VIOLATION: target file was modified during post-read hook execution".into()
-        ));
-    }
-
-    Ok(advisory_block)
+    let bundle =
+        execute_post_read_bundle_for_project(file_path, base_index, overlay_index, project)?;
+    Ok(bundle.format_markdown())
 }
 
 #[cfg(test)]

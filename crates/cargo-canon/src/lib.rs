@@ -9,14 +9,18 @@ use canon_core::config::CanonConfig;
 use canon_core::diagnostics::{error, info_banner, success};
 use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
-use canon_core::span::{AgentVendor, ReadSpan, parse_hook_stdin};
+use canon_core::span::{
+    AgentVendor, ReadBudgetEnv, ReadSpan, detect_budget_env, parse_hook_stdin, resolve_read_budget,
+};
 use canon_core::workspace::{
     resolve_active_socket, resolve_connected_socket, resolve_global_socket, resolve_workspace_root,
 };
 use canon_daemon::{
-    DaemonRequest, DaemonResponse, DaemonStatusInfo, ServerOptions, execute_post_read_hook,
+    DaemonRequest, DaemonResponse, ServerOptions, execute_post_read_bundle,
     run_server_with_options, send_daemon_request,
 };
+
+mod status_fmt;
 use canon_harness::{
     DiffFuzzOptions, InvariantOptions, SimulateOptions, VerifyOptions, run_diff_fuzz,
     run_invariants, run_simulation, run_verify,
@@ -27,6 +31,7 @@ use canon_state::{
 };
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+pub(crate) use status_fmt::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1030,196 +1035,6 @@ async fn handle_daemon_status(
     }
 }
 
-fn format_with_commas(n: usize) -> String {
-    let s = n.to_string();
-    let first_len = s.len() % 3;
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    if first_len > 0 {
-        result.push_str(&s[..first_len]);
-    }
-    for (i, chunk) in s.as_bytes()[first_len..].chunks(3).enumerate() {
-        if first_len > 0 || i > 0 {
-            result.push(',');
-        }
-        result.push_str(std::str::from_utf8(chunk).unwrap_or(""));
-    }
-    result
-}
-
-fn format_uptime(secs: u64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    if h > 0 {
-        format!("{}h {}m {}s", h, m, s)
-    } else if m > 0 {
-        format!("{}m {}s", m, s)
-    } else {
-        format!("{}s", s)
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-fn format_time_ago(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s ago", secs)
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else {
-        format!("{}h ago", secs / 3600)
-    }
-}
-
-fn truncate_tail(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count > max_chars {
-        let keep = max_chars.saturating_sub(3);
-        let tail: String = s.chars().skip(count - keep).collect();
-        format!("...{}", tail)
-    } else {
-        s.to_string()
-    }
-}
-
-fn print_daemon_status_table(status: &DaemonStatusInfo) {
-    println!("Canon Daemon Status: Active");
-    println!("PID:            {}", status.pid);
-    println!("Uptime:         {}", format_uptime(status.uptime_secs));
-    if !status.daemon_mode.is_empty() {
-        println!("Daemon Mode:    {}", status.daemon_mode);
-    }
-    let cfg_display = status
-        .config_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "built-in defaults".to_string());
-    println!("Config Path:    {}", cfg_display);
-    println!("Declared Projects: {}", status.declared_projects_count);
-    println!("Socket Path:    {}", status.socket_path.display());
-    if !status.main_log_path.as_os_str().is_empty() {
-        println!("Main Daemon Log: {}", status.main_log_path.display());
-    }
-    println!("Memory RSS:     {:.1} MB", status.memory_rss_mb);
-    println!("Active Workspaces: {}", status.active_workspaces_count);
-    if !status.workspace_root.as_os_str().is_empty() {
-        println!("Workspace Root: {}", status.workspace_root.display());
-    }
-    println!(
-        "Indexed Files:  {} files",
-        format_with_commas(status.indexed_files)
-    );
-    println!(
-        "Total Symbols:  {} declarations",
-        format_with_commas(status.total_symbols)
-    );
-    println!(
-        "Call Edges:     {} edges",
-        format_with_commas(status.total_call_edges)
-    );
-    println!(
-        "Contracts:      {} trait implementations",
-        format_with_commas(status.total_contracts)
-    );
-    println!(
-        "Routes:         {} API endpoints",
-        format_with_commas(status.total_routes)
-    );
-    let watcher_str = if status.watcher_active {
-        "Active (.rs, .ts, .tsx, .js, .jsx, .go)"
-    } else {
-        "Inactive"
-    };
-    println!("File Watcher:   {}", watcher_str);
-
-    if !status.workspaces.is_empty() {
-        print_workspace_registry_table(&status.workspaces);
-    }
-
-    // --- Context Bloat Section ---
-    println!(
-        "Hooks Served:   {} requests",
-        format_with_commas(status.hooks_served as usize)
-    );
-    if status.hooks_served > 0 {
-        println!(
-            "Context Bloat:  {} raw -> {} delivered ({:.1}% reduction)",
-            format_bytes(status.raw_bytes_served),
-            format_bytes(status.delivered_bytes_served),
-            status.token_reduction_pct
-        );
-        println!(
-            "Tokens Saved:   ~{} tokens (est. 4B/token)",
-            format_with_commas(status.est_tokens_saved as usize)
-        );
-    } else {
-        println!("Context Bloat:  0 B (no requests served yet)");
-    }
-}
-
-fn print_workspace_registry_table(workspaces: &[canon_daemon::WorkspaceSummary]) {
-    println!("\nActive Workspace Registry:");
-    println!(
-        "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>10}  {:<24} {:<28} {:>8}",
-        "WORKSPACE",
-        "PROJECT",
-        "TYPE",
-        "FILES",
-        "SYMBOLS",
-        "MEMORY",
-        "CONFIG",
-        "LOG FILE",
-        "ACCESSED"
-    );
-    println!("  {}", "-".repeat(150));
-    for ws in workspaces {
-        let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
-        let root_trunc = truncate_tail(&ws.root.display().to_string(), 28);
-        let proj_trunc = truncate_tail(ws.project_name.as_deref().unwrap_or("-"), 16);
-        let cfg_str = ws
-            .config_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|f| f.to_str())
-            .unwrap_or("-");
-        let cfg_trunc = truncate_tail(cfg_str, 24);
-        let log_str = ws
-            .log_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
-        let log_trunc = truncate_tail(log_str, 28);
-        let accessed_str = format_time_ago(ws.last_accessed_secs_ago);
-        println!(
-            "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>8.1} MB  {:<24} {:<28} {:>8}",
-            root_trunc,
-            proj_trunc,
-            ws_type,
-            format_with_commas(ws.indexed_files),
-            format_with_commas(ws.total_symbols),
-            ws.memory_mb,
-            cfg_trunc,
-            log_trunc,
-            accessed_str
-        );
-    }
-    println!();
-}
-
 async fn handle_daemon_stop(socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     match send_daemon_request(socket_path, DaemonRequest::Shutdown).await {
         Ok(DaemonResponse::ShutdownAck) => {
@@ -1267,6 +1082,7 @@ pub fn resolve_hook_input(
         offset: args.offset,
         limit: args.limit,
         byte_offset: None,
+        allow_large: None,
         vendor: args.vendor,
     };
     let base_span = parsed.as_ref().map(|p| p.span.clone()).unwrap_or_default();
@@ -1283,16 +1099,22 @@ pub fn resolve_hook_input(
 pub fn compute_hook_read_metrics(
     file: &Path,
     span: &ReadSpan,
+    env: &ReadBudgetEnv,
 ) -> (Option<usize>, Option<usize>, Option<u64>) {
-    if !span.is_specified() {
-        return (None, None, None);
-    }
     let Ok(content) = std::fs::read_to_string(file) else {
         return (span.start_line.or(span.offset), span.end_line, None);
     };
     let total_lines = content.split_inclusive('\n').count();
-    let (start, end) = span.effective_range(total_lines);
-    let raw_bytes = span.calculate_read_bytes(&content);
+    let effective_vendor = span.vendor.or(env.env_vendor);
+    let effective_span = if span.vendor.is_none() && effective_vendor.is_some() {
+        let mut s = span.clone();
+        s.vendor = effective_vendor;
+        s
+    } else {
+        span.clone()
+    };
+    let (start, end) = effective_span.effective_range(total_lines);
+    let raw_bytes = resolve_read_budget(span, &content, env);
     (
         (start > 0).then_some(start),
         (end > 0).then_some(end),
@@ -1345,11 +1167,19 @@ async fn handle_daemon_hook_post_read(
     current_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin_payload = read_piped_stdin(args.file.is_some()).await;
+    let parsed_stdin = stdin_payload.as_deref().and_then(parse_hook_stdin);
+    if let Some(ref p) = parsed_stdin {
+        if p.tool_error {
+            return Ok(());
+        }
+    }
     let Some((file, span)) = resolve_hook_input(args, stdin_payload.as_deref()) else {
         error("Daemon", "--file is required when running post-read hook");
         return Ok(());
     };
-    let (start_line, end_line, raw_read_bytes) = compute_hook_read_metrics(&file, &span);
+    let budget_env = detect_budget_env(|k| std::env::var(k).ok());
+    let (start_line, end_line, raw_read_bytes) =
+        compute_hook_read_metrics(&file, &span, &budget_env);
 
     let target_dir = if let Some(parent) = file.parent() {
         if parent.as_os_str().is_empty() {
@@ -1399,11 +1229,10 @@ async fn handle_daemon_hook_post_read(
     let (output, prov) = match advisory {
         Some(adv) => (adv, provenance.unwrap_or_default()),
         None => {
-            tracing::warn!("Daemon offline or unreachable, falling back to in-process slicing");
             let fallback_prov =
                 "<!-- canon-context-provenance: in-process-fallback (daemon unreachable) -->"
                     .to_string();
-            let adv = execute_post_read_hook(&file, None)?;
+            let adv = execute_in_process_fallback(&file, start_line, end_line, raw_read_bytes)?;
             (adv, fallback_prov)
         }
     };
@@ -1415,6 +1244,50 @@ async fn handle_daemon_hook_post_read(
         println!("{}", output);
     }
     Ok(())
+}
+
+fn execute_in_process_fallback(
+    file: &Path,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    raw_read_bytes: Option<u64>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    tracing::warn!("Daemon offline or unreachable, falling back to in-process slicing");
+    let bundle = execute_post_read_bundle(file, None)?;
+    let budget = raw_read_bytes.unwrap_or_else(|| std::fs::metadata(file).map_or(0, |m| m.len()));
+    let fitted = bundle.fit_to_budget(budget);
+    match fitted.stage {
+        canon_slice::BudgetStage::Full => {}
+        canon_slice::BudgetStage::CallGraphPruned => {
+            let full_len = fitted.full_len.unwrap_or(fitted.pruned_len);
+            let reduction = if budget > 0 {
+                ((budget as f64 - fitted.pruned_len as f64) / budget as f64) * 100.0
+            } else {
+                0.0
+            };
+            let range_str = format_range(start_line, end_line);
+            tracing::warn!(
+                "PostReadHook pruned call graph: bundle ({} B) >= read request ({} B), retained skeleton ({} B, {:.1}% reduction) for '{}'{}",
+                full_len,
+                budget,
+                fitted.pruned_len,
+                reduction,
+                file.display(),
+                range_str
+            );
+        }
+        canon_slice::BudgetStage::Dropped => {
+            let range_str = format_range(start_line, end_line);
+            tracing::warn!(
+                "PostReadHook dropped all advisory context: skeleton ({} B) >= read request ({} B) for '{}'{}",
+                fitted.pruned_len,
+                budget,
+                file.display(),
+                range_str
+            );
+        }
+    }
+    Ok(fitted.markdown)
 }
 
 async fn handle_daemon_start(
@@ -1505,37 +1378,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1536), "1.5 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-    }
-
-    #[test]
-    fn test_format_uptime() {
-        assert_eq!(format_uptime(30), "30s");
-        assert_eq!(format_uptime(90), "1m 30s");
-        assert_eq!(format_uptime(3665), "1h 1m 5s");
-    }
-
-    #[test]
-    fn test_format_time_ago() {
-        assert_eq!(format_time_ago(5), "5s ago");
-        assert_eq!(format_time_ago(120), "2m ago");
-        assert_eq!(format_time_ago(7200), "2h ago");
-    }
-
-    #[test]
-    fn test_truncate_tail_utf8_safety() {
-        let path = "/home/user/проекты/очень_длинное_имя_репозитория/src";
-        let truncated = truncate_tail(path, 32);
-        assert_eq!(truncated.chars().count(), 32);
-        assert!(truncated.starts_with("..."));
-    }
-
-    #[test]
     fn test_resolve_hook_input_merges_stdin_and_cli() {
         let stdin_json = r#"{
             "tool_name": "Read",
@@ -1612,5 +1454,16 @@ mod tests {
         let out = read_json_from_reader(NonClosingPipe { delivered: false })
             .expect("should return JSON payload without waiting for EOF");
         assert!(out.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_compute_hook_read_metrics_bare_span_returns_file_bytes() {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), "line 1\nline 2\nline 3\n").expect("write file");
+        let (start, end, raw_bytes) =
+            compute_hook_read_metrics(tmp.path(), &ReadSpan::default(), &ReadBudgetEnv::default());
+        assert_eq!(start, Some(1));
+        assert_eq!(end, Some(3));
+        assert_eq!(raw_bytes, Some(21));
     }
 }

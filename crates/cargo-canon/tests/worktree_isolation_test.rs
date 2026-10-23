@@ -37,7 +37,32 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
     let alpha_file = main_repo.join("src").join("lib.rs");
     std::fs::write(
         &alpha_file,
-        "pub struct AlphaService {\n    pub id: u64,\n}\n",
+        r#"pub struct AlphaService {
+    pub id: u64,
+}
+
+impl AlphaService {
+    pub fn execute(&self) -> bool {
+        let mut ok = false;
+        for i in 0..100 {
+            if i % 7 == 0 {
+                println!("Alpha execute step processing item {}", i);
+                ok = true;
+            }
+        }
+        ok
+    }
+
+    pub fn audit_alpha(&self) -> usize {
+        let mut total = 0;
+        for step in 0..60 {
+            total += step * 5;
+            println!("Auditing alpha service execution cycle {} total {}", step, total);
+        }
+        total
+    }
+}
+"#,
     )
     .unwrap();
 
@@ -55,7 +80,32 @@ async fn test_worktree_daemon_isolation_and_lifecycle() {
     let beta_file = wt_feature.join("src").join("lib.rs");
     std::fs::write(
         &beta_file,
-        "pub struct BetaService {\n    pub token: String,\n}\n",
+        r#"pub struct BetaService {
+    pub token: String,
+}
+
+impl BetaService {
+    pub fn process(&self) -> bool {
+        let mut valid = false;
+        for ch in self.token.chars() {
+            if ch == 'b' {
+                println!("Beta process valid token char matching criteria");
+                valid = true;
+            }
+        }
+        valid
+    }
+
+    pub fn audit_beta(&self) -> usize {
+        let mut count = 0;
+        for idx in 0..70 {
+            count += idx * 11;
+            println!("Auditing beta worker operational loop {} count {}", idx, count);
+        }
+        count
+    }
+}
+"#,
     )
     .unwrap();
 

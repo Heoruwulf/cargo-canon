@@ -10,6 +10,7 @@ use canon_slice::SymbolIndex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -33,6 +34,12 @@ pub struct WorkspaceEntry {
     pub base_index: Option<Arc<RwLock<SymbolIndex>>>,
     /// Dedicated file logger for this workspace.
     pub logger: Arc<WorkspaceLogger>,
+    /// Total successful advisory context submissions for this workspace.
+    pub submissions: AtomicU64,
+    /// Total times advisory call graph was pruned due to bloat.
+    pub callgraph_drops: AtomicU64,
+    /// Total times advisory context was completely omitted due to bloat.
+    pub ast_drops: AtomicU64,
     /// Timestamp of last activity or hook evaluation.
     last_accessed: std::sync::Mutex<std::time::Instant>,
 }
@@ -57,6 +64,9 @@ impl WorkspaceEntry {
             index,
             base_index,
             logger,
+            submissions: AtomicU64::new(0),
+            callgraph_drops: AtomicU64::new(0),
+            ast_drops: AtomicU64::new(0),
             last_accessed: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -97,6 +107,36 @@ impl WorkspaceEntry {
     /// Estimates total in-memory heap footprint of the workspace's symbol index in Megabytes.
     pub async fn estimate_memory_mb(&self) -> f64 {
         self.index.read().await.estimate_memory_mb()
+    }
+
+    /// Increments the count of successful advisory context submissions.
+    pub fn record_submission(&self) {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of call graph pruning events.
+    pub fn record_callgraph_drop(&self) {
+        self.callgraph_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of total advisory context omissions.
+    pub fn record_ast_drop(&self) {
+        self.ast_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the total successful submissions count for this workspace.
+    pub fn submissions(&self) -> u64 {
+        self.submissions.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total call graph pruning count for this workspace.
+    pub fn callgraph_drops(&self) -> u64 {
+        self.callgraph_drops.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total AST context omission count for this workspace.
+    pub fn ast_drops(&self) -> u64 {
+        self.ast_drops.load(Ordering::Relaxed)
     }
 }
 
@@ -705,5 +745,39 @@ pub mod tests {
                 .symbols_map
                 .contains_key("undeclared_fn")
         );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_entry_metrics_counters() {
+        let log_dir = tempdir().unwrap();
+        let log_manager = Arc::new(DaemonLogManager::init(log_dir.path()).unwrap());
+        let logger = Arc::new(
+            log_manager
+                .create_workspace_logger(Path::new("/tmp/test-metrics"))
+                .unwrap(),
+        );
+        let idx = Arc::new(RwLock::new(SymbolIndex::new()));
+
+        let entry = WorkspaceEntry::new(
+            PathBuf::from("/tmp/test-metrics"),
+            false,
+            None,
+            idx,
+            None,
+            logger,
+        );
+
+        assert_eq!(entry.submissions(), 0);
+        assert_eq!(entry.callgraph_drops(), 0);
+        assert_eq!(entry.ast_drops(), 0);
+
+        entry.record_submission();
+        entry.record_submission();
+        entry.record_callgraph_drop();
+        entry.record_ast_drop();
+
+        assert_eq!(entry.submissions(), 2);
+        assert_eq!(entry.callgraph_drops(), 1);
+        assert_eq!(entry.ast_drops(), 1);
     }
 }

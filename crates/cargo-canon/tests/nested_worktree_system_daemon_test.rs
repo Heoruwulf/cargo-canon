@@ -65,7 +65,32 @@ async fn test_nested_dot_worktrees_overlay_and_post_read_hook() {
     let repo = base_path.join("auth-service");
     let parent_lib = init_repo(
         &repo,
-        "pub struct ParentAuth {\n    pub id: u64,\n}\n\npub fn verify_parent() -> bool {\n    true\n}\n",
+        r#"pub struct ParentAuth {
+    pub id: u64,
+}
+
+impl ParentAuth {
+    pub fn verify_parent(&self) -> bool {
+        let mut check = true;
+        for i in 0..100 {
+            if i % 2 == 1 {
+                println!("Verifying parent authentication sequence step {}", i);
+                check = !check;
+            }
+        }
+        check
+    }
+
+    pub fn audit_parent(&self) -> usize {
+        let mut total = 0;
+        for step in 0..50 {
+            total += step * 3;
+            println!("Auditing parent step {} total {}", step, total);
+        }
+        total
+    }
+}
+"#,
     );
 
     let wt_dir = repo.join(".worktrees/agent-auth");
@@ -84,7 +109,32 @@ async fn test_nested_dot_worktrees_overlay_and_post_read_hook() {
     let wt_lib = wt_dir.join("src/lib.rs");
     std::fs::write(
         &wt_lib,
-        "pub struct WorktreeAuth {\n    pub token: String,\n}\n\npub fn verify_worktree() -> bool {\n    true\n}\n",
+        r#"pub struct WorktreeAuth {
+    pub token: String,
+}
+
+impl WorktreeAuth {
+    pub fn verify_worktree(&self) -> bool {
+        let mut valid = false;
+        for ch in "worktree_auth_token_verification_payload_with_extended_validation_chain".chars() {
+            if ch == 'a' {
+                println!("Validating worktree auth token character match");
+                valid = true;
+            }
+        }
+        valid
+    }
+
+    pub fn audit_worktree(&self) -> usize {
+        let mut counter = 0;
+        for idx in 0..60 {
+            counter += idx * 7;
+            println!("Auditing worktree verification cycle {} count {}", idx, counter);
+        }
+        counter
+    }
+}
+"#,
     )
     .unwrap();
 
@@ -183,7 +233,33 @@ async fn test_nested_claude_worktree_with_ignored_dirs_and_live_watcher_routing(
 
     // 1. Initialize parent repo and nested worktree at `<repo>/.claude/worktrees/agent-feat`
     let repo = base_path.join("acme-web");
-    let parent_lib = init_repo(&repo, "pub struct ParentMain {\n    pub v: u32,\n}\n");
+    let parent_lib = init_repo(
+        &repo,
+        r#"pub struct ParentMain {
+    pub v: u32,
+}
+
+impl ParentMain {
+    pub fn routine(&self) -> bool {
+        let mut sum = 0u64;
+        for i in 0..100 {
+            sum = sum.wrapping_add(i * 13);
+            println!("Parent routine step {}", sum);
+        }
+        sum > 0
+    }
+
+    pub fn audit_parent(&self) -> usize {
+        let mut total = 0;
+        for step in 0..50 {
+            total += step * 3;
+            println!("Auditing parent step {} total {}", step, total);
+        }
+        total
+    }
+}
+"#,
+    );
 
     let wt_dir = repo.join(".claude/worktrees/agent-feat");
     std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
@@ -201,7 +277,32 @@ async fn test_nested_claude_worktree_with_ignored_dirs_and_live_watcher_routing(
     let wt_lib = wt_dir.join("src/lib.rs");
     std::fs::write(
         &wt_lib,
-        "pub struct AgentFeatInitial {\n    pub ok: bool,\n}\n",
+        r#"pub struct AgentFeatInitial {
+    pub ok: bool,
+}
+
+impl AgentFeatInitial {
+    pub fn feat_step(&self) -> bool {
+        let mut check = false;
+        for step in 0..100 {
+            if step % 5 == 0 {
+                println!("Executing agent feat step {}", step);
+                check = true;
+            }
+        }
+        check
+    }
+
+    pub fn audit_feat(&self) -> usize {
+        let mut counter = 0;
+        for idx in 0..60 {
+            counter += idx * 7;
+            println!("Auditing feat cycle {} count {}", idx, counter);
+        }
+        counter
+    }
+}
+"#,
     )
     .unwrap();
 
@@ -322,7 +423,40 @@ ignored_dirs = [".claude"]
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     std::fs::write(
         &wt_lib,
-        "pub struct AgentFeatInitial {\n    pub ok: bool,\n}\npub struct LiveEditedOne {\n    pub a: u64,\n}\npub struct LiveEditedTwo {\n    pub b: u64,\n}\n",
+        r#"pub struct AgentFeatInitial {
+    pub ok: bool,
+}
+
+impl AgentFeatInitial {
+    pub fn feat_step(&self) -> bool {
+        let mut check = false;
+        for step in 0..100 {
+            if step % 5 == 0 {
+                println!("Executing agent feat step {}", step);
+                check = true;
+            }
+        }
+        check
+    }
+
+    pub fn audit_feat(&self) -> usize {
+        let mut counter = 0;
+        for idx in 0..60 {
+            counter += idx * 7;
+            println!("Auditing feat cycle {} count {}", idx, counter);
+        }
+        counter
+    }
+}
+
+pub struct LiveEditedOne {
+    pub a: u64,
+}
+
+pub struct LiveEditedTwo {
+    pub b: u64,
+}
+"#,
     )
     .unwrap();
 

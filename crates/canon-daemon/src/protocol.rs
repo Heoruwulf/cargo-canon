@@ -66,6 +66,15 @@ pub struct WorkspaceSummary {
     pub log_path: PathBuf,
     /// Seconds elapsed since last activity or query.
     pub last_accessed_secs_ago: u64,
+    /// Total successful advisory context submissions for this workspace.
+    #[serde(default)]
+    pub submissions: u64,
+    /// Total times advisory call graph was pruned due to bloat.
+    #[serde(default)]
+    pub callgraph_drops: u64,
+    /// Total times advisory context was completely omitted due to bloat.
+    #[serde(default)]
+    pub ast_drops: u64,
 }
 
 /// Detailed runtime statistics and index telemetry.
@@ -125,6 +134,15 @@ pub struct DaemonStatusInfo {
     /// Total number of advisory tool hook requests served since daemon startup.
     #[serde(default)]
     pub hooks_served: u64,
+    /// Total successful advisory context submissions across all workspaces.
+    #[serde(default)]
+    pub submissions: u64,
+    /// Total times advisory call graph was pruned due to bloat across all workspaces.
+    #[serde(default)]
+    pub callgraph_drops: u64,
+    /// Total times advisory context was completely omitted due to bloat across all workspaces.
+    #[serde(default)]
+    pub ast_drops: u64,
     /// Total raw source bytes processed prior to slicing.
     #[serde(default)]
     pub raw_bytes_served: u64,
@@ -256,6 +274,9 @@ mod tests {
                 memory_mb: 12.3,
                 log_path: PathBuf::from("/tmp/logs/workspaces/project-abc123.log"),
                 last_accessed_secs_ago: 5,
+                submissions: 3,
+                callgraph_drops: 1,
+                ast_drops: 0,
             }],
             workspace_root: PathBuf::from("/home/user/project"),
             indexed_files: 10,
@@ -265,6 +286,9 @@ mod tests {
             total_routes: 2,
             watcher_active: true,
             hooks_served: 4,
+            submissions: 3,
+            callgraph_drops: 1,
+            ast_drops: 0,
             raw_bytes_served: 10000,
             delivered_bytes_served: 2000,
             bytes_saved: 8000,
@@ -309,11 +333,33 @@ mod tests {
         assert_eq!(decoded.active_workspaces_count, 0);
         assert!(decoded.workspaces.is_empty());
         assert_eq!(decoded.hooks_served, 0);
+        assert_eq!(decoded.submissions, 0);
+        assert_eq!(decoded.callgraph_drops, 0);
+        assert_eq!(decoded.ast_drops, 0);
         assert_eq!(decoded.raw_bytes_served, 0);
         assert_eq!(decoded.delivered_bytes_served, 0);
         assert_eq!(decoded.bytes_saved, 0);
         assert_eq!(decoded.token_reduction_pct, 0.0);
         assert_eq!(decoded.est_tokens_saved, 0);
+    }
+
+    #[test]
+    fn test_protocol_workspace_summary_backward_compatibility() {
+        let legacy_json = r#"{
+            "root": "/home/user/project",
+            "is_worktree": false,
+            "indexed_files": 10,
+            "total_symbols": 100,
+            "memory_mb": 12.3,
+            "log_path": "/tmp/logs/project.log",
+            "last_accessed_secs_ago": 5
+        }"#;
+
+        let decoded: WorkspaceSummary = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(decoded.root, PathBuf::from("/home/user/project"));
+        assert_eq!(decoded.submissions, 0);
+        assert_eq!(decoded.callgraph_drops, 0);
+        assert_eq!(decoded.ast_drops, 0);
     }
 
     #[test]

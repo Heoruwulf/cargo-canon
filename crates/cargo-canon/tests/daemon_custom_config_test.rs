@@ -15,6 +15,14 @@ fn run_git(cwd: &Path, args: &[&str]) {
     assert!(status.success(), "git {:?} failed", args);
 }
 
+fn canon_cmd(bin: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_CHILD_SESSION")
+        .env_remove("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS");
+    cmd
+}
+
 fn setup_fullstack_project(project_dir: &Path) -> PathBuf {
     std::fs::create_dir_all(project_dir.join("crates/core")).unwrap();
     std::fs::create_dir_all(project_dir.join("unwatched_rust")).unwrap();
@@ -29,7 +37,35 @@ fn setup_fullstack_project(project_dir: &Path) -> PathBuf {
     let core_rs = project_dir.join("crates/core/lib.rs");
     std::fs::write(
         &core_rs,
-        "pub struct AcmeEngine {\n    pub ready: bool,\n}\n\npub trait AcmeService {\n    fn execute(&self) -> bool;\n}\n",
+        r#"pub struct AcmeEngine {
+    pub ready: bool,
+}
+
+pub trait AcmeService {
+    fn execute(&self) -> bool;
+    fn calculate_metric(&self, seed: u64) -> u64;
+}
+
+impl AcmeService for AcmeEngine {
+    fn execute(&self) -> bool {
+        if self.ready {
+            println!("AcmeEngine execution confirmed");
+            true
+        } else {
+            eprintln!("AcmeEngine not ready");
+            false
+        }
+    }
+
+    fn calculate_metric(&self, seed: u64) -> u64 {
+        let mut score = seed;
+        for i in 0..50 {
+            score = score.wrapping_add(i * 17);
+        }
+        score
+    }
+}
+"#,
     )
     .unwrap();
 
@@ -131,7 +167,7 @@ lang = "go"
 
     // 4. Spawn `canon daemon --config <custom_toml>` from inside `poisoned_cwd`
     let socket_path = base_path.join("custom_daemon.sock");
-    let mut daemon_child = tokio::process::Command::new(canon_bin)
+    let mut daemon_child = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--config",
@@ -148,7 +184,7 @@ lang = "go"
     wait_for_socket(&socket_path).await;
 
     // 5. Verify cold-start status: 0 active workspaces, 0 indexed files, 2 declared projects
-    let status_out = tokio::process::Command::new(canon_bin)
+    let status_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -171,7 +207,7 @@ lang = "go"
     assert_eq!(status.daemon_mode, "System-Wide Multi-Tenant");
 
     // 6. Trigger lazy indexing for `acme-web` and verify ProjectConfig rules
-    let hook_out = tokio::process::Command::new(canon_bin)
+    let hook_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--hook-post-read",
@@ -190,7 +226,7 @@ lang = "go"
     assert!(hook_stdout.contains("AcmeService"));
 
     // 7. Re-query status and verify project_name, config_path, and filtered file count
-    let status_after_out = tokio::process::Command::new(canon_bin)
+    let status_after_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -213,7 +249,7 @@ lang = "go"
     assert_eq!(ws.indexed_files, 1);
 
     // Verify human status table output includes PROJECT (`acme-web`) and CONFIG (`custom_daemon.toml`)
-    let status_human_out = tokio::process::Command::new(canon_bin)
+    let status_human_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -232,7 +268,7 @@ lang = "go"
     assert!(status_human_stdout.contains("custom_daemon.toml"));
 
     // 8. Stop daemon cleanly
-    let stop_out = tokio::process::Command::new(canon_bin)
+    let stop_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--stop",

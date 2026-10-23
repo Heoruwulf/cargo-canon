@@ -9,6 +9,14 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+fn canon_cmd(bin: &str) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_CHILD_SESSION")
+        .env_remove("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS");
+    cmd
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_daemon_observability_lifecycle() {
     let canon_bin = env!("CARGO_BIN_EXE_canon");
@@ -91,7 +99,7 @@ impl Runner for Service {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 1. Probe liveness via --ping
-    let ping_out = Command::new(canon_bin)
+    let ping_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--ping",
@@ -108,7 +116,7 @@ impl Runner for Service {
     assert!(ping_str.contains("round-trip:"));
 
     // 2. Query initial status via --status (human table)
-    let status_out = Command::new(canon_bin)
+    let status_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -130,7 +138,7 @@ impl Runner for Service {
     assert!(status_str.contains("Context Bloat:  0 B (no requests served yet)"));
 
     // 3. Query initial status via --status --json: verify 0 hooks served initially
-    let status_json_out = Command::new(canon_bin)
+    let status_json_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -155,7 +163,7 @@ impl Runner for Service {
     assert_eq!(status_info.est_tokens_saved, 0);
 
     // 4. Hook post-read with live daemon (provenance: daemon)
-    let hook_daemon_out = Command::new(canon_bin)
+    let hook_daemon_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--hook-post-read",
@@ -178,7 +186,7 @@ impl Runner for Service {
     assert!(hook_daemon_str.contains("# Canon Context Slice:"));
 
     // 5. Query status post-hook via --status --json: verify telemetry incremented
-    let status_post_json_out = Command::new(canon_bin)
+    let status_post_json_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -202,7 +210,7 @@ impl Runner for Service {
     assert!(post_status_info.est_tokens_saved > 0);
 
     // 6. Query status post-hook via human table: verify formatted bloat lines
-    let status_post_table_out = Command::new(canon_bin)
+    let status_post_table_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -221,7 +229,7 @@ impl Runner for Service {
     assert!(post_table_str.contains("reduction)"));
 
     // 7. Graceful shutdown via --stop
-    let stop_out = Command::new(canon_bin)
+    let stop_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--stop",
@@ -241,7 +249,7 @@ impl Runner for Service {
 
     // 6. Hook post-read post-shutdown (provenance: in-process-fallback)
     let file_bytes_before = std::fs::read(&test_file).unwrap();
-    let hook_fallback_out = Command::new(canon_bin)
+    let hook_fallback_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--hook-post-read",
@@ -273,7 +281,7 @@ impl Runner for Service {
     );
 
     // 7. Ping failure when daemon is offline
-    let ping_offline_out = Command::new(canon_bin)
+    let ping_offline_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--ping",
@@ -287,5 +295,103 @@ impl Runner for Service {
     assert!(
         !ping_offline_out.status.success(),
         "ping should fail when offline"
+    );
+}
+
+#[tokio::test]
+async fn test_in_process_fallback_bloat_guard() {
+    let canon_bin = env!("CARGO_BIN_EXE_canon");
+    let base = tempdir().unwrap();
+    let src_dir = base.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let nonexistent_socket = base.path().join("nonexistent.sock");
+
+    // Case 1: Micro-read on tiny file drops context completely (Stage 2)
+    let tiny_file = src_dir.join("tiny.rs");
+    let tiny_content = b"pub fn a() {}\npub fn b() {}\n";
+    std::fs::write(&tiny_file, tiny_content).unwrap();
+
+    let file_bytes_before = std::fs::read(&tiny_file).unwrap();
+    let out_tiny = canon_cmd(canon_bin)
+        .args([
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            tiny_file.to_str().unwrap(),
+            "--start-line",
+            "1",
+            "--end-line",
+            "2",
+            "--socket",
+            nonexistent_socket.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("failed to execute canon daemon --hook-post-read");
+
+    assert!(out_tiny.status.success());
+    let stdout_tiny = String::from_utf8_lossy(&out_tiny.stdout);
+    assert!(
+        stdout_tiny.trim().is_empty(),
+        "expected empty stdout when micro-read < skeleton in fallback, got:\n{}",
+        stdout_tiny
+    );
+
+    let file_bytes_after = std::fs::read(&tiny_file).unwrap();
+    assert_eq!(
+        file_bytes_before, file_bytes_after,
+        "CRITICAL INVARIANT: target file on disk modified during hook execution"
+    );
+
+    // Case 2: Realistic file with unbounded Generic budget delivers skeleton
+    let realistic_file = src_dir.join("service.rs");
+    let mut realistic_content =
+        String::from("pub struct Worker {\n    pub id: u64,\n}\n\nimpl Worker {\n");
+    for i in 0..30 {
+        use std::fmt::Write;
+        let _ = writeln!(
+            realistic_content,
+            "    pub fn task_{i}(&self) -> u64 {{\n        let x = {i} * 2;\n        println!(\"task {i}\");\n        x\n    }}"
+        );
+    }
+    realistic_content.push_str("}\n");
+    std::fs::write(&realistic_file, realistic_content.as_bytes()).unwrap();
+
+    let real_bytes_before = std::fs::read(&realistic_file).unwrap();
+    let out_real = canon_cmd(canon_bin)
+        .args([
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            realistic_file.to_str().unwrap(),
+            "--socket",
+            nonexistent_socket.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("failed to execute canon daemon --hook-post-read");
+
+    assert!(out_real.status.success());
+    let stdout_real = String::from_utf8_lossy(&out_real.stdout);
+    assert!(
+        stdout_real.contains(
+            "<!-- canon-context-provenance: in-process-fallback (daemon unreachable) -->"
+        ),
+        "expected in-process fallback header, got:\n{}",
+        stdout_real
+    );
+    assert!(
+        stdout_real.contains("pub struct Worker"),
+        "expected stripped skeleton in output, got:\n{}",
+        stdout_real
+    );
+
+    let real_bytes_after = std::fs::read(&realistic_file).unwrap();
+    assert_eq!(
+        real_bytes_before, real_bytes_after,
+        "CRITICAL INVARIANT: target file on disk modified during hook execution"
     );
 }

@@ -27,6 +27,14 @@ fn run_git(cwd: &Path, args: &[&str]) {
     assert!(status.success(), "git command {:?} failed", args);
 }
 
+fn canon_cmd(bin: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_CHILD_SESSION")
+        .env_remove("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS");
+    cmd
+}
+
 fn init_test_repo(path: &Path, file_name: &str, content: &str) -> PathBuf {
     std::fs::create_dir_all(path.join("src")).unwrap();
     run_git(path, &["init"]);
@@ -73,14 +81,98 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     let alpha_file = init_test_repo(
         &repo_alpha,
         "lib.rs",
-        "pub struct AlphaService {\n    pub id: u64,\n}\n\npub trait AlphaRunner {\n    fn run_alpha(&self) -> bool;\n}\n",
+        r#"pub struct AlphaService {
+    pub id: u64,
+}
+
+pub trait AlphaRunner {
+    fn run_alpha(&self) -> bool;
+    fn process_record(&self, key: &str, value: &[u8]) -> Result<usize, String>;
+    fn compute_checksum(&self, seed: u64) -> u64;
+}
+
+impl AlphaRunner for AlphaService {
+    fn run_alpha(&self) -> bool {
+        let active = self.id > 0;
+        if active {
+            println!("AlphaService {} running active pipeline", self.id);
+            true
+        } else {
+            eprintln!("AlphaService zero-id inactive");
+            false
+        }
+    }
+
+    fn process_record(&self, key: &str, value: &[u8]) -> Result<usize, String> {
+        if key.is_empty() {
+            return Err("Empty key provided to alpha pipeline".to_string());
+        }
+        let mut total = 0usize;
+        for &byte in value {
+            total = total.wrapping_add(byte as usize);
+            if total > 1_000_000 {
+                println!("Large payload processed for key {}", key);
+            }
+        }
+        Ok(total)
+    }
+
+    fn compute_checksum(&self, seed: u64) -> u64 {
+        let mut hash = seed ^ self.id;
+        for i in 0..64 {
+            hash = hash.rotate_left(3).wrapping_add(i as u64);
+        }
+        hash
+    }
+}
+"#,
     );
 
     let repo_beta = base_path.join("repo_beta");
     let beta_file = init_test_repo(
         &repo_beta,
         "lib.rs",
-        "pub struct BetaService {\n    pub name: String,\n}\n\npub trait BetaRunner {\n    fn run_beta(&self) -> bool;\n}\n",
+        r#"pub struct BetaService {
+    pub name: String,
+}
+
+pub trait BetaRunner {
+    fn run_beta(&self) -> bool;
+    fn execute_query(&self, query: &str) -> Result<Vec<String>, String>;
+    fn summarize_state(&self) -> String;
+}
+
+impl BetaRunner for BetaService {
+    fn run_beta(&self) -> bool {
+        let valid = !self.name.is_empty();
+        if valid {
+            println!("BetaService {} running active worker", self.name);
+            true
+        } else {
+            eprintln!("Invalid BetaService configuration");
+            false
+        }
+    }
+
+    fn execute_query(&self, query: &str) -> Result<Vec<String>, String> {
+        if query.trim().is_empty() {
+            return Err("Empty query specified for beta runner".to_string());
+        }
+        let mut results = Vec::new();
+        for part in query.split_whitespace() {
+            results.push(format!("{}:{}", self.name, part));
+            if results.len() > 100 {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    fn summarize_state(&self) -> String {
+        format!("BetaWorker[name={}, len={}]", self.name, self.name.len())
+    }
+}
+"#,
     );
 
     // 2. Create nested Git worktree at repo_alpha/.claude/worktrees/feat1
@@ -96,7 +188,41 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     let feat1_file = wt_feat1.join("src").join("lib.rs");
     std::fs::write(
         &feat1_file,
-        "pub struct AlphaService {\n    pub id: u64,\n    pub extra: bool,\n}\n\npub struct FeatOneService {\n    pub flag: bool,\n}\n",
+        r#"pub struct AlphaService {
+    pub id: u64,
+    pub extra: bool,
+}
+
+pub struct FeatOneService {
+    pub flag: bool,
+}
+
+pub trait FeatRunner {
+    fn execute_feat(&self) -> bool;
+    fn audit_status(&self, tag: &str) -> Result<String, String>;
+}
+
+impl FeatRunner for FeatOneService {
+    fn execute_feat(&self) -> bool {
+        if self.flag {
+            println!("Feature 1 execution active");
+            true
+        } else {
+            println!("Feature 1 disabled by flag");
+            false
+        }
+    }
+
+    fn audit_status(&self, tag: &str) -> Result<String, String> {
+        if tag.is_empty() {
+            return Err("Missing audit tag".to_string());
+        }
+        let report = format!("FeatOne[flag={}, tag={}]", self.flag, tag);
+        println!("Audit log generated: {}", report);
+        Ok(report)
+    }
+}
+"#,
     )
     .unwrap();
 
@@ -126,7 +252,7 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
     // Probe liveness via --ping
-    let ping_out = tokio::process::Command::new(canon_bin)
+    let ping_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--ping",
@@ -140,7 +266,7 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     assert!(ping_out.status.success(), "daemon ping must succeed");
 
     // 4. Issue post-read hook for repo_alpha file -> assert lazy cold-start and context slice
-    let hook_alpha = tokio::process::Command::new(canon_bin)
+    let hook_alpha = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--hook-post-read",
@@ -160,7 +286,7 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     assert!(hook_alpha_str.contains("AlphaRunner"));
 
     // 5. Issue post-read hook for repo_beta file -> assert lazy cold-start and context slice
-    let hook_beta = tokio::process::Command::new(canon_bin)
+    let hook_beta = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--hook-post-read",
@@ -180,7 +306,7 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     assert!(hook_beta_str.contains("BetaRunner"));
 
     // 6. Issue post-read hook for worktree feat1 -> assert worktree overlay resolution
-    let hook_wt = tokio::process::Command::new(canon_bin)
+    let hook_wt = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--hook-post-read",
@@ -200,7 +326,7 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     assert!(hook_wt_str.contains("extra"));
 
     // 7. Query daemon status via JSON to verify telemetry and workspace breakdown
-    let status_json_out = tokio::process::Command::new(canon_bin)
+    let status_json_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -218,6 +344,9 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
         serde_json::from_str(&json_str).expect("status output must be valid JSON");
 
     assert_eq!(status.hooks_served, 3);
+    assert_eq!(status.submissions, 3);
+    assert_eq!(status.callgraph_drops, 0);
+    assert_eq!(status.ast_drops, 0);
     assert!(
         status.memory_rss_mb > 0.0,
         "process RSS memory must be > 0.0 MB"
@@ -250,6 +379,9 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
         .expect("repo_alpha must be registered in workspace summary");
     assert!(!alpha_summary.is_worktree);
     assert_eq!(alpha_summary.parent_repo, None);
+    assert_eq!(alpha_summary.submissions, 1);
+    assert_eq!(alpha_summary.callgraph_drops, 0);
+    assert_eq!(alpha_summary.ast_drops, 0);
     assert!(
         alpha_summary.memory_mb > 0.0,
         "alpha memory must be > 0.0 MB"
@@ -265,6 +397,9 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
         .expect("repo_beta must be registered in workspace summary");
     assert!(!beta_summary.is_worktree);
     assert_eq!(beta_summary.parent_repo, None);
+    assert_eq!(beta_summary.submissions, 1);
+    assert_eq!(beta_summary.callgraph_drops, 0);
+    assert_eq!(beta_summary.ast_drops, 0);
     assert!(beta_summary.memory_mb > 0.0, "beta memory must be > 0.0 MB");
     assert!(beta_summary.log_path.exists(), "beta log file must exist");
     assert_file_contains_eventually(&beta_summary.log_path, "Initial indexing started").await;
@@ -277,6 +412,9 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
         .expect("feat1 worktree must be registered in workspace summary");
     assert!(wt_summary.is_worktree);
     assert_eq!(wt_summary.parent_repo, Some(canonical_alpha.clone()));
+    assert_eq!(wt_summary.submissions, 1);
+    assert_eq!(wt_summary.callgraph_drops, 0);
+    assert_eq!(wt_summary.ast_drops, 0);
     assert!(
         wt_summary.memory_mb > 0.0,
         "worktree memory must be > 0.0 MB"
@@ -286,7 +424,7 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     assert_file_contains_eventually(&wt_summary.log_path, "PostReadHook served").await;
 
     // 8. Query daemon status via formatted human table
-    let status_table_out = tokio::process::Command::new(canon_bin)
+    let status_table_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--status",
@@ -305,9 +443,14 @@ async fn test_system_daemon_multi_tenant_lifecycle() {
     assert!(table_str.contains("Active Workspace Registry:"));
     assert!(table_str.contains("Repo"));
     assert!(table_str.contains("WkTr"));
+    assert!(table_str.contains("SUBMIT"));
+    assert!(table_str.contains("CG_DROP"));
+    assert!(table_str.contains("AST_DROP"));
+    assert!(table_str.contains("Hooks Served:   3 requests (3 submitted, 0 omitted)"));
+    assert!(table_str.contains("Drop Telemetry: 0 call graphs pruned, 0 AST skeletons dropped"));
 
     // 9. Gracefully shutdown daemon via --stop
-    let stop_out = tokio::process::Command::new(canon_bin)
+    let stop_out = canon_cmd(canon_bin)
         .args([
             "daemon",
             "--stop",

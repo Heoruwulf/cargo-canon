@@ -1,7 +1,7 @@
 //! Unix domain socket IPC server.
 
 use crate::error::DaemonError;
-use crate::hook::{execute_post_read_hook, execute_post_read_hook_for_project};
+use crate::hook::{execute_post_read_bundle, execute_post_read_bundle_for_project};
 use crate::logging::DaemonLogManager;
 use crate::protocol::{
     DaemonRequest, DaemonResponse, DaemonStatusInfo, WorkspaceSummary, read_message, write_message,
@@ -22,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Default)]
 pub struct ServerTelemetry {
     pub hooks_served: AtomicU64,
+    pub submissions: AtomicU64,
+    pub callgraph_drops: AtomicU64,
+    pub ast_drops: AtomicU64,
     pub raw_bytes_served: AtomicU64,
     pub delivered_bytes_served: AtomicU64,
     pub bytes_saved: AtomicU64,
@@ -44,6 +47,21 @@ impl ServerTelemetry {
         }
     }
 
+    /// Increments the count of successful advisory context submissions.
+    pub fn record_submission(&self) {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of call graph pruning events.
+    pub fn record_callgraph_drop(&self) {
+        self.callgraph_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count of total advisory context omissions.
+    pub fn record_ast_drop(&self) {
+        self.ast_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns a snapshot of cumulative telemetry computed directly from `raw` vs `delivered`:
     /// (hooks_served, raw_bytes, delivered_bytes, bytes_saved, reduction_pct, est_tokens_saved).
     pub fn snapshot(&self) -> (u64, u64, u64, u64, f64, u64) {
@@ -56,7 +74,7 @@ impl ServerTelemetry {
         } else {
             0.0
         };
-        let est_tokens = saved / 4;
+        let est_tokens = saved / canon_core::span::EST_BYTES_PER_TOKEN;
         (hooks, raw, delivered, saved, pct, est_tokens)
     }
 }
@@ -318,6 +336,100 @@ struct PostReadParams<'a> {
     raw_read_bytes: Option<u64>,
 }
 
+/// Per-request context for applying a bloat-guard outcome.
+struct GuardContext<'a> {
+    state: &'a ServerState,
+    entry: Option<&'a WorkspaceEntry>,
+    file: &'a Path,
+    range_str: &'a str,
+    raw_len: u64,
+}
+
+fn log_guard_warning(ctx: &GuardContext<'_>, msg: &str) {
+    tracing::warn!("{}", msg);
+    let file_log = format!("[WARN] {}", msg);
+    ctx.state.log_manager.log_daemon(&file_log);
+    if let Some(ws) = ctx.entry {
+        ws.logger.log(&file_log);
+    }
+}
+
+/// Applies bloat-guard telemetry and logging based on the degradation outcome.
+///
+/// Returns `(delivered_len, action_label)`.
+///
+/// # Delivered Length Semantics
+/// For `Full` and `CallGraphPruned`, `delivered_len` is the exact byte length of the
+/// generated markdown payload. For `Dropped`, `delivered_len` is set equal to `raw_len`
+/// (representing that only the agent's raw read was consumed, with zero advisory bloat),
+/// ensuring token reduction calculations yield 0% rather than negative bloat.
+fn apply_guard_outcome(
+    ctx: &GuardContext<'_>,
+    outcome: &canon_slice::bundle::BudgetedAdvisory,
+) -> (u64, &'static str) {
+    match outcome.stage {
+        canon_slice::bundle::BudgetStage::Full => {
+            ctx.state.telemetry.record_submission();
+            if let Some(ws) = ctx.entry {
+                ws.record_submission();
+            }
+            (outcome.markdown.len() as u64, "PostReadHook served (full)")
+        }
+        canon_slice::bundle::BudgetStage::CallGraphPruned => {
+            ctx.state.telemetry.record_submission();
+            ctx.state.telemetry.record_callgraph_drop();
+            if let Some(ws) = ctx.entry {
+                ws.record_submission();
+                ws.record_callgraph_drop();
+            }
+            let full_len = outcome.full_len.unwrap_or(outcome.pruned_len);
+            let reduction = if ctx.raw_len > 0 {
+                ((ctx.raw_len as f64 - outcome.pruned_len as f64) / ctx.raw_len as f64) * 100.0
+            } else {
+                0.0
+            };
+            let warn_msg = format!(
+                "PostReadHook pruned call graph: bundle ({} B) >= read request ({} B), retained skeleton ({} B, {:.1}% reduction) for '{}'{}",
+                full_len,
+                ctx.raw_len,
+                outcome.pruned_len,
+                reduction,
+                ctx.file.display(),
+                ctx.range_str
+            );
+            log_guard_warning(ctx, &warn_msg);
+            (
+                outcome.markdown.len() as u64,
+                "PostReadHook served (pruned call graph)",
+            )
+        }
+        canon_slice::bundle::BudgetStage::Dropped => {
+            ctx.state.telemetry.record_ast_drop();
+            if let Some(ws) = ctx.entry {
+                ws.record_ast_drop();
+            }
+            let warn_msg = format!(
+                "PostReadHook dropped all advisory context: skeleton ({} B) >= read request ({} B) for '{}'{}",
+                outcome.pruned_len,
+                ctx.raw_len,
+                ctx.file.display(),
+                ctx.range_str
+            );
+            log_guard_warning(ctx, &warn_msg);
+            (ctx.raw_len, "PostReadHook skipped (micro-read < skeleton)")
+        }
+    }
+}
+
+fn format_range(start: Option<usize>, end: Option<usize>) -> String {
+    match (start, end) {
+        (Some(s), Some(e)) => format!(" (lines {}..{})", s, e),
+        (Some(s), None) => format!(" (lines {}..)", s),
+        (None, Some(e)) => format!(" (lines ..{})", e),
+        (None, None) => String::new(),
+    }
+}
+
 async fn handle_post_read_request(
     params: PostReadParams<'_>,
     req_start: std::time::Instant,
@@ -355,7 +467,7 @@ async fn handle_post_read_request(
         if let Some(ref base) = ws.base_index {
             let base_guard = base.read().await;
             let ov_guard = ws.index.read().await;
-            execute_post_read_hook_for_project(
+            execute_post_read_bundle_for_project(
                 file,
                 Some(&*base_guard),
                 Some(&*ov_guard),
@@ -363,37 +475,29 @@ async fn handle_post_read_request(
             )
         } else {
             let guard = ws.index.read().await;
-            execute_post_read_hook_for_project(file, Some(&*guard), None, Some(&ws.config))
+            execute_post_read_bundle_for_project(file, Some(&*guard), None, Some(&ws.config))
         }
     } else {
         let guard = state.legacy_index.read().await;
-        execute_post_read_hook(file, Some(&*guard))
+        execute_post_read_bundle(file, Some(&*guard))
     };
 
     match advisory_res {
-        Ok(mut advisory_block) => {
+        Ok(bundle) => {
             let elapsed_us = req_start.elapsed().as_micros();
-            let candidate_len = advisory_block.len() as u64;
-            // Skip injecting full-file advisory context when a bounded read is smaller than the skeleton.
-            let (delivered_len, skipped) =
-                if params.raw_read_bytes.is_some() && raw_len > 0 && candidate_len >= raw_len {
-                    advisory_block.clear();
-                    (raw_len, true)
-                } else {
-                    (candidate_len, false)
-                };
+            let range_str = format_range(params.start_line, params.end_line);
+
+            let outcome = bundle.fit_to_budget(raw_len);
+            let ctx = GuardContext {
+                state,
+                entry: entry.as_deref(),
+                file,
+                range_str: &range_str,
+                raw_len,
+            };
+            let (delivered_len, action) = apply_guard_outcome(&ctx, &outcome);
+
             let pct = state.telemetry.record_reduction(raw_len, delivered_len);
-            let range_str = match (params.start_line, params.end_line) {
-                (Some(s), Some(e)) => format!(" (lines {}..{})", s, e),
-                (Some(s), None) => format!(" (lines {}..)", s),
-                (None, Some(e)) => format!(" (lines ..{})", e),
-                (None, None) => String::new(),
-            };
-            let action = if skipped {
-                "PostReadHook skipped (micro-read < skeleton)"
-            } else {
-                "PostReadHook served"
-            };
             let log_msg = format!(
                 "{action}: '{}'{range_str} | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
                 file.display(),
@@ -408,7 +512,7 @@ async fn handle_post_read_request(
             }
             DaemonResponse::AdvisoryContext {
                 file: file.display().to_string(),
-                advisory_block,
+                advisory_block: outcome.markdown,
             }
         }
         Err(e) => {
@@ -542,6 +646,9 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
             memory_mb: mem_mb,
             log_path: entry.logger.log_path().to_path_buf(),
             last_accessed_secs_ago: entry.last_accessed_secs_ago(),
+            submissions: entry.submissions(),
+            callgraph_drops: entry.callgraph_drops(),
+            ast_drops: entry.ast_drops(),
         });
     }
 
@@ -581,6 +688,9 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         total_routes: agg_routes,
         watcher_active: state.options.watcher_active,
         hooks_served: hooks,
+        submissions: state.telemetry.submissions.load(Ordering::Relaxed),
+        callgraph_drops: state.telemetry.callgraph_drops.load(Ordering::Relaxed),
+        ast_drops: state.telemetry.ast_drops.load(Ordering::Relaxed),
         raw_bytes_served: raw,
         delivered_bytes_served: delivered,
         bytes_saved: saved,
@@ -693,5 +803,130 @@ mod tests {
         assert_eq!(saved, 128_000);
         assert!((pct - 80.0).abs() < 0.001);
         assert_eq!(tokens, 32_000);
+    }
+
+    #[tokio::test]
+    async fn test_server_telemetry_atomic_counters() {
+        let telemetry = ServerTelemetry::default();
+        assert_eq!(telemetry.submissions.load(Ordering::Relaxed), 0);
+        assert_eq!(telemetry.callgraph_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(telemetry.ast_drops.load(Ordering::Relaxed), 0);
+
+        telemetry.record_submission();
+        telemetry.record_submission();
+        telemetry.record_callgraph_drop();
+        telemetry.record_ast_drop();
+
+        assert_eq!(telemetry.submissions.load(Ordering::Relaxed), 2);
+        assert_eq!(telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.ast_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_apply_guard_outcome_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let opts = ServerOptions {
+            socket_path: dir.path().join("test.sock"),
+            workspace_root: dir.path().to_path_buf(),
+            log_dir: Some(log_dir),
+            ..Default::default()
+        };
+        let index = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token = CancellationToken::new();
+        let state = init_server_state(opts, index, token, std::time::Instant::now())
+            .await
+            .expect("init server state");
+
+        let bundle = canon_slice::SliceBundle {
+            target: "src/test.rs".to_string(),
+            skeleton: "pub fn small() {}".to_string(),
+            contracts: vec![],
+            callers: vec![canon_slice::CallEdge {
+                caller: "caller_fn".into(),
+                callee: "small".into(),
+                file: "src/caller.rs".into(),
+            }],
+            callees: vec![],
+            token_reduction_pct: 50.0,
+            cross_boundary: None,
+        };
+
+        let full_md = bundle.format_markdown();
+        let pruned_md = bundle.without_call_graph().format_markdown();
+        let full_len = full_md.len() as u64;
+        let pruned_len = pruned_md.len() as u64;
+        assert!(pruned_len < full_len);
+
+        let test_file = Path::new("src/test.rs");
+
+        // Stage 0: raw_len > full_len -> Deliver full bundle
+        let raw0 = full_len + 50;
+        let outcome0 = bundle.fit_to_budget(raw0);
+        let ctx0 = GuardContext {
+            state: &state,
+            entry: None,
+            file: test_file,
+            range_str: "",
+            raw_len: raw0,
+        };
+        let (out_len, action) = apply_guard_outcome(&ctx0, &outcome0);
+        assert_eq!(action, "PostReadHook served (full)");
+        assert_eq!(out_len, full_len);
+        assert_eq!(outcome0.markdown, full_md);
+        assert_eq!(state.telemetry.submissions.load(Ordering::Relaxed), 1);
+        assert_eq!(state.telemetry.callgraph_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 0);
+
+        // Stage 1: pruned_len < raw_len <= full_len -> Deliver pruned skeleton
+        let target_raw = pruned_len + 1;
+        let outcome1 = bundle.fit_to_budget(target_raw);
+        let ctx1 = GuardContext {
+            state: &state,
+            entry: None,
+            file: test_file,
+            range_str: "",
+            raw_len: target_raw,
+        };
+        let (out_len, action) = apply_guard_outcome(&ctx1, &outcome1);
+        assert_eq!(action, "PostReadHook served (pruned call graph)");
+        assert_eq!(out_len, pruned_len);
+        assert_eq!(outcome1.markdown, pruned_md);
+        assert_eq!(state.telemetry.submissions.load(Ordering::Relaxed), 2);
+        assert_eq!(state.telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 0);
+
+        // Stage 2: raw_len <= pruned_len on bounded micro-read -> Total drop (empty string)
+        let raw2 = pruned_len - 1;
+        let outcome2 = bundle.fit_to_budget(raw2);
+        let ctx2 = GuardContext {
+            state: &state,
+            entry: None,
+            file: test_file,
+            range_str: " (lines 1..5)",
+            raw_len: raw2,
+        };
+        let (out_len, action) = apply_guard_outcome(&ctx2, &outcome2);
+        assert_eq!(action, "PostReadHook skipped (micro-read < skeleton)");
+        assert_eq!(out_len, raw2);
+        assert!(outcome2.markdown.is_empty());
+        assert_eq!(state.telemetry.submissions.load(Ordering::Relaxed), 2);
+        assert_eq!(state.telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 1);
+
+        // Explicit 0-byte budget -> Total drop
+        let outcome_zero = bundle.fit_to_budget(0);
+        let ctx_zero = GuardContext {
+            state: &state,
+            entry: None,
+            file: test_file,
+            range_str: "",
+            raw_len: 0,
+        };
+        let (out_len, action) = apply_guard_outcome(&ctx_zero, &outcome_zero);
+        assert_eq!(action, "PostReadHook skipped (micro-read < skeleton)");
+        assert_eq!(out_len, 0);
+        assert!(outcome_zero.markdown.is_empty());
+        assert_eq!(state.telemetry.ast_drops.load(Ordering::Relaxed), 2);
     }
 }

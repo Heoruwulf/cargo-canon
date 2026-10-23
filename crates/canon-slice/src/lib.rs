@@ -14,7 +14,7 @@ pub mod indexer;
 pub mod skeleton;
 pub mod ts_skeleton;
 
-pub use bundle::SliceBundle;
+pub use bundle::{BudgetStage, BudgetedAdvisory, SliceBundle, decide_stage};
 pub use error::SliceError;
 pub use go_skeleton::{
     extract_go_file_skeleton, extract_go_skeleton, extract_go_skeleton_with_options,

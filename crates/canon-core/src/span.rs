@@ -11,19 +11,39 @@ use serde_json::Value;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Default maximum token count returned by Claude Code `Read` tool invocations.
+///
+/// Source: <https://code.claude.com/docs/en/tools-reference#large-files>
+pub const DEFAULT_CLAUDE_MAX_READ_TOKENS: u64 = 25_000;
+
+/// Maximum file size (256 KB) allowed by Claude Code `Read` tool for whole-file reads.
+/// Files exceeding this limit are refused unless `allow_large` is enabled.
+///
+/// Source: <https://code.claude.com/docs/en/tools-reference#large-files>
+pub const CLAUDE_WHOLE_FILE_MAX_BYTES: u64 = 262_144;
+
+/// Estimated bytes per token (4 bytes/token) used for LLM context budget estimates.
+pub const EST_BYTES_PER_TOKEN: u64 = 4;
+
 /// Default 1-indexed starting line for Claude Code `Read` tool invocations.
 pub const DEFAULT_CLAUDE_OFFSET: usize = 1;
 
 /// Default line count limit for Claude Code `Read` tool invocations when omitted.
+///
+/// Note: first-party tool schema; not published on vendor website as of 2026-10-23; applied as a secondary cap.
 pub const DEFAULT_CLAUDE_LIMIT: usize = 2000;
 
 /// Default 1-indexed starting line for Antigravity (AGY) `read_file` invocations.
 pub const DEFAULT_AGY_START_LINE: usize = 1;
 
 /// Default 1-indexed ending line for Antigravity (AGY) `read_file` invocations when omitted.
+///
+/// Note: first-party tool schema; not published on vendor website as of 2026-10-23; applied as a secondary cap.
 pub const DEFAULT_AGY_END_LINE: usize = 800;
 
 /// Maximum byte cap per `read_file` call in Antigravity (AGY) (`46,080` bytes / 45 KiB).
+///
+/// Note: first-party tool schema; not published on vendor website as of 2026-10-23; applied as a secondary cap.
 pub const DEFAULT_AGY_BYTE_LIMIT: u64 = 46_080;
 
 /// AI coding agent vendor identity used to apply default read window bounds.
@@ -61,6 +81,9 @@ pub struct ReadSpan {
     pub limit: Option<usize>,
     /// Byte offset into the selected line range (AGY `ByteOffset`).
     pub byte_offset: Option<u64>,
+    /// Whether large file reads are allowed beyond standard limits (Claude `allow_large`).
+    #[serde(default)]
+    pub allow_large: Option<bool>,
     /// Detected or explicitly specified agent vendor.
     pub vendor: Option<AgentVendor>,
 }
@@ -74,6 +97,7 @@ impl ReadSpan {
             || self.offset.is_some()
             || self.limit.is_some()
             || self.byte_offset.is_some()
+            || self.allow_large.is_some()
             || self.vendor.is_some()
     }
 
@@ -94,6 +118,9 @@ impl ReadSpan {
         }
         if overrides.byte_offset.is_some() {
             self.byte_offset = overrides.byte_offset;
+        }
+        if overrides.allow_large.is_some() {
+            self.allow_large = overrides.allow_large;
         }
         if overrides.vendor.is_some() {
             self.vendor = overrides.vendor;
@@ -196,6 +223,9 @@ pub struct ParsedHookInput {
     pub file_path: Option<PathBuf>,
     /// Extracted line/byte span and detected vendor.
     pub span: ReadSpan,
+    /// Whether the tool execution resulted in an error (e.g. Antigravity PostToolUse error).
+    #[serde(default)]
+    pub tool_error: bool,
 }
 
 /// Parses a JSON hook payload from Claude Code or Antigravity (AGY) `stdin`.
@@ -251,7 +281,12 @@ fn parse_agy_tool_call(
         .or_else(|| extract_explicit_vendor(root))
         .or(Some(AgentVendor::Agy));
 
-    Some(ParsedHookInput { file_path, span })
+    let tool_error = has_error(root) || has_error(tool_call) || has_error(args);
+    Some(ParsedHookInput {
+        file_path,
+        span,
+        tool_error,
+    })
 }
 
 fn parse_tool_input_envelope(
@@ -267,6 +302,8 @@ fn parse_tool_input_envelope(
     let is_agy_tool = tool_name.eq_ignore_ascii_case("read_file")
         || tool_name.ends_with(":read_file")
         || tool_name.eq_ignore_ascii_case("view_file")
+        || tool_name.ends_with(":view_file")
+        || tool_input.contains_key("AbsolutePath")
         || tool_input.contains_key("Path")
         || tool_input.contains_key("StartLine")
         || tool_input.contains_key("EndLine")
@@ -282,7 +319,12 @@ fn parse_tool_input_envelope(
             AgentVendor::Claude
         }));
 
-    Some(ParsedHookInput { file_path, span })
+    let tool_error = has_error(root) || has_error(tool_input);
+    Some(ParsedHookInput {
+        file_path,
+        span,
+        tool_error,
+    })
 }
 
 fn parse_flat_object(obj: &serde_json::Map<String, Value>) -> Option<ParsedHookInput> {
@@ -302,11 +344,13 @@ fn parse_flat_object(obj: &serde_json::Map<String, Value>) -> Option<ParsedHookI
             if name.eq_ignore_ascii_case("read_file")
                 || name.ends_with(":read_file")
                 || name.eq_ignore_ascii_case("view_file")
+                || name.ends_with(":view_file")
             {
                 return Some(AgentVendor::Agy);
             }
         }
-        if obj.contains_key("Path")
+        if obj.contains_key("AbsolutePath")
+            || obj.contains_key("Path")
             || obj.contains_key("StartLine")
             || obj.contains_key("EndLine")
             || obj.contains_key("ByteOffset")
@@ -324,19 +368,44 @@ fn parse_flat_object(obj: &serde_json::Map<String, Value>) -> Option<ParsedHookI
 
     span.vendor = inferred_vendor;
 
-    if file_path.is_none() && !span.is_specified() {
+    let tool_error = has_error(obj);
+    if file_path.is_none() && !span.is_specified() && !tool_error {
         return None;
     }
 
-    Some(ParsedHookInput { file_path, span })
+    Some(ParsedHookInput {
+        file_path,
+        span,
+        tool_error,
+    })
 }
 
 fn extract_path(map: &serde_json::Map<String, Value>) -> Option<PathBuf> {
-    ["file_path", "Path", "path", "filePath", "file"]
-        .iter()
-        .find_map(|key| map.get(*key).and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    [
+        "file_path",
+        "AbsolutePath",
+        "Path",
+        "path",
+        "filePath",
+        "file",
+    ]
+    .iter()
+    .find_map(|key| map.get(*key).and_then(Value::as_str))
+    .filter(|s| !s.is_empty())
+    .map(PathBuf::from)
+}
+
+fn extract_bool(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        let val = map.get(*key)?;
+        val.as_bool().or_else(|| val.as_str()?.parse::<bool>().ok())
+    })
+}
+
+fn has_error(map: &serde_json::Map<String, Value>) -> bool {
+    map.get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 fn extract_usize(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<usize> {
@@ -375,7 +444,111 @@ fn extract_span_fields(map: &serde_json::Map<String, Value>) -> ReadSpan {
         offset: extract_usize(map, &["offset", "Offset"]),
         limit: extract_usize(map, &["limit", "Limit"]),
         byte_offset: extract_u64(map, &["ByteOffset", "byte_offset", "byteOffset"]),
+        allow_large: extract_bool(map, &["allow_large", "allowLarge"]),
         vendor: None,
+    }
+}
+
+/// Caller-resolved environment inputs for read-budget calculation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadBudgetEnv {
+    /// Vendor detected from the process environment (lowest-precedence signal).
+    pub env_vendor: Option<AgentVendor>,
+    /// `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` override, if set and > 0.
+    pub claude_max_read_tokens: Option<u64>,
+}
+
+/// Detects [`ReadBudgetEnv`] from process environment variables using a closure.
+#[must_use]
+pub fn detect_budget_env(get: impl Fn(&str) -> Option<String>) -> ReadBudgetEnv {
+    let env_vendor = if get("CLAUDE_CODE_CHILD_SESSION").as_deref() == Some("1")
+        || get("CLAUDECODE").as_deref() == Some("1")
+    {
+        Some(AgentVendor::Claude)
+    } else {
+        None
+    };
+
+    let claude_max_read_tokens = get("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS")
+        .and_then(|val| val.trim().parse::<u64>().ok())
+        .filter(|&tokens| tokens > 0);
+
+    ReadBudgetEnv {
+        env_vendor,
+        claude_max_read_tokens,
+    }
+}
+
+fn claude_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
+    let file_bytes = content.len() as u64;
+    let has_bounds = span.offset.is_some()
+        || span.limit.is_some()
+        || span.start_line.is_some()
+        || span.end_line.is_some();
+
+    if span.allow_large == Some(true) {
+        return if has_bounds {
+            span.calculate_read_bytes(content)
+        } else {
+            file_bytes
+        };
+    }
+
+    let claude_max_tokens = env
+        .claude_max_read_tokens
+        .unwrap_or(DEFAULT_CLAUDE_MAX_READ_TOKENS);
+    let token_byte_cap = claude_max_tokens.saturating_mul(EST_BYTES_PER_TOKEN);
+
+    if !has_bounds {
+        if file_bytes > CLAUDE_WHOLE_FILE_MAX_BYTES {
+            0
+        } else {
+            let mut claude_span = span.clone();
+            claude_span.vendor = Some(AgentVendor::Claude);
+            claude_span
+                .calculate_read_bytes(content)
+                .min(token_byte_cap)
+        }
+    } else {
+        let mut claude_span = span.clone();
+        claude_span.vendor = Some(AgentVendor::Claude);
+        let window_bytes = claude_span.calculate_read_bytes(content);
+        if window_bytes > token_byte_cap {
+            0
+        } else {
+            window_bytes
+        }
+    }
+}
+
+/// Resolves the effective byte read budget requested by an agent file read.
+///
+/// Implements vendor-specific defaults and caps:
+/// - **Claude**: 25,000 tokens (or override), 256 KB refusal limit for unbounded reads.
+/// - **Antigravity**: 800 lines default, 46,080 byte maximum cap.
+/// - **Generic**: Full file size (or explicit line window).
+#[must_use]
+pub fn resolve_read_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
+    if content.is_empty() {
+        return 0;
+    }
+
+    let vendor = span
+        .vendor
+        .or(env.env_vendor)
+        .unwrap_or(AgentVendor::Generic);
+    match vendor {
+        AgentVendor::Claude => claude_budget(span, content, env),
+        AgentVendor::Agy => {
+            let mut agy_span = span.clone();
+            agy_span.vendor = Some(AgentVendor::Agy);
+            agy_span.calculate_read_bytes(content)
+        }
+        AgentVendor::Generic => {
+            let mut gen_span = span.clone();
+            gen_span.vendor = Some(AgentVendor::Generic);
+            gen_span.calculate_read_bytes(content)
+        }
     }
 }
 
@@ -571,5 +744,173 @@ mod tests {
         assert_eq!(span.effective_range(500), (0, 0));
         let content = build_sample_file(500, 40);
         assert_eq!(span.calculate_read_bytes(&content), 0);
+    }
+
+    #[test]
+    fn test_detect_budget_env() {
+        let env_claude_1 = detect_budget_env(|k| match k {
+            "CLAUDECODE" => Some("1".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_claude_1.env_vendor, Some(AgentVendor::Claude));
+        assert_eq!(env_claude_1.claude_max_read_tokens, None);
+
+        let env_child_1 = detect_budget_env(|k| match k {
+            "CLAUDE_CODE_CHILD_SESSION" => Some("1".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_child_1.env_vendor, Some(AgentVendor::Claude));
+
+        let env_zero = detect_budget_env(|k| match k {
+            "CLAUDECODE" => Some("0".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_zero.env_vendor, None);
+
+        let env_tokens = detect_budget_env(|k| match k {
+            "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS" => Some("40000".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_tokens.claude_max_read_tokens, Some(40_000));
+
+        for invalid in ["0", "-5", "abc", ""] {
+            let env_inv = detect_budget_env(|k| match k {
+                "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS" => Some(invalid.to_string()),
+                _ => None,
+            });
+            assert_eq!(env_inv.claude_max_read_tokens, None);
+        }
+    }
+
+    #[test]
+    fn test_resolve_read_budget_matrix() {
+        let empty_env = ReadBudgetEnv::default();
+
+        // Empty file -> 0
+        let span_generic = ReadSpan::default();
+        assert_eq!(resolve_read_budget(&span_generic, "", &empty_env), 0);
+
+        // Claude unbounded on 300 KB file (> 256 KB) -> 0 (refused)
+        let large_300k = build_sample_file(6000, 50); // 300,000 bytes > 262,144
+        let claude_unbounded = ReadSpan {
+            vendor: Some(AgentVendor::Claude),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_read_budget(&claude_unbounded, &large_300k, &empty_env),
+            0
+        );
+
+        // Claude unbounded on 3,000-line x 50 B file (150 KB) -> min(2000*50, 100,000) = 100,000
+        let medium_150k = build_sample_file(3000, 50);
+        assert_eq!(
+            resolve_read_budget(&claude_unbounded, &medium_150k, &empty_env),
+            100_000
+        );
+
+        // Claude with allow_large: true on 300 KB file -> 300,000 bytes
+        let claude_large = ReadSpan {
+            vendor: Some(AgentVendor::Claude),
+            allow_large: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_read_budget(&claude_large, &large_300k, &empty_env),
+            large_300k.len() as u64
+        );
+
+        // Claude offset=1, limit=5000 x 50 B (250 KB > 100 KB cap) -> 0
+        let claude_too_big = ReadSpan {
+            offset: Some(1),
+            limit: Some(5000),
+            vendor: Some(AgentVendor::Claude),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_read_budget(&claude_too_big, &large_300k, &empty_env),
+            0
+        );
+
+        // Claude with token override 10,000 -> cap 40,000
+        let env_10k = ReadBudgetEnv {
+            env_vendor: None,
+            claude_max_read_tokens: Some(10_000),
+        };
+        assert_eq!(
+            resolve_read_budget(&claude_unbounded, &medium_150k, &env_10k),
+            40_000
+        );
+
+        // Agy with no lines on 2,000 x 100 B -> 46,080
+        let agy_unbounded = ReadSpan {
+            vendor: Some(AgentVendor::Agy),
+            ..Default::default()
+        };
+        let agy_200k = build_sample_file(2000, 100);
+        assert_eq!(
+            resolve_read_budget(&agy_unbounded, &agy_200k, &empty_env),
+            DEFAULT_AGY_BYTE_LIMIT
+        );
+
+        // Generic on any file -> file_bytes
+        let gen_span = ReadSpan {
+            vendor: Some(AgentVendor::Generic),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_read_budget(&gen_span, &medium_150k, &empty_env),
+            medium_150k.len() as u64
+        );
+
+        // Explicit --vendor beats env_vendor
+        let env_claude = ReadBudgetEnv {
+            env_vendor: Some(AgentVendor::Claude),
+            claude_max_read_tokens: None,
+        };
+        let span_explicit_generic = ReadSpan {
+            vendor: Some(AgentVendor::Generic),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_read_budget(&span_explicit_generic, &large_300k, &env_claude),
+            large_300k.len() as u64
+        );
+    }
+
+    #[test]
+    fn parse_agy_view_file_payload_and_error() {
+        let json_ok = r#"{
+            "toolCall": {
+                "name": "view_file",
+                "args": {
+                    "AbsolutePath": "/abs/a.rs",
+                    "StartLine": 1,
+                    "EndLine": 20
+                }
+            },
+            "stepIdx": 3
+        }"#;
+        let parsed_ok = parse_hook_stdin(json_ok).expect("parse view_file payload");
+        assert_eq!(parsed_ok.file_path, Some(PathBuf::from("/abs/a.rs")));
+        assert_eq!(parsed_ok.span.vendor, Some(AgentVendor::Agy));
+        assert_eq!(parsed_ok.span.start_line, Some(1));
+        assert_eq!(parsed_ok.span.end_line, Some(20));
+        assert!(!parsed_ok.tool_error);
+
+        let json_err = r#"{
+            "toolCall": {
+                "name": "view_file",
+                "args": {
+                    "AbsolutePath": "/abs/a.rs",
+                    "StartLine": 1,
+                    "EndLine": 20
+                }
+            },
+            "stepIdx": 3,
+            "error": "ENOENT"
+        }"#;
+        let parsed_err = parse_hook_stdin(json_err).expect("parse view_file payload with error");
+        assert_eq!(parsed_err.file_path, Some(PathBuf::from("/abs/a.rs")));
+        assert!(parsed_err.tool_error);
     }
 }
