@@ -9,6 +9,88 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use walkdir::WalkDir;
 
+/// Compact identifier for an interned string in `StringPool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SymbolId(pub u32);
+
+/// Compact representation of a call graph edge using interned string identifiers (12 bytes, zero heap allocations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CompactCallEdge {
+    /// Upstream caller symbol identifier.
+    pub caller: SymbolId,
+    /// Downstream callee symbol identifier.
+    pub callee: SymbolId,
+    /// Source file path identifier.
+    pub file: SymbolId,
+}
+
+impl CompactCallEdge {
+    /// Resolves an interned CompactCallEdge back into an owned CallEdge using the StringPool.
+    pub fn resolve(&self, pool: &StringPool) -> Option<CallEdge> {
+        Some(CallEdge {
+            caller: pool.resolve(self.caller)?.to_string(),
+            callee: pool.resolve(self.callee)?.to_string(),
+            file: pool.resolve(self.file)?.to_string(),
+        })
+    }
+}
+
+/// Contiguous string pool for deduplicating symbols, functions, and file paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StringPool {
+    /// Contiguous array of interned strings indexed by SymbolId.
+    pub strings: Vec<String>,
+    /// Fast deduplication lookup mapping string slice to SymbolId.
+    pub lookup: HashMap<String, SymbolId>,
+}
+
+impl StringPool {
+    /// Creates an empty string pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an empty string pool with pre-allocated capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            strings: Vec::with_capacity(capacity),
+            lookup: HashMap::with_capacity(capacity),
+        }
+    }
+
+    /// Interns a string slice, returning its unique `SymbolId`.
+    pub fn intern(&mut self, s: &str) -> SymbolId {
+        if let Some(&id) = self.lookup.get(s) {
+            return id;
+        }
+        let id = SymbolId(self.strings.len() as u32);
+        let owned = s.to_string();
+        self.strings.push(owned.clone());
+        self.lookup.insert(owned, id);
+        id
+    }
+
+    /// Resolves a `SymbolId` back to its string slice.
+    pub fn resolve(&self, id: SymbolId) -> Option<&str> {
+        self.strings.get(id.0 as usize).map(|s| s.as_str())
+    }
+
+    /// Returns the `SymbolId` for an existing string without interning it.
+    pub fn get_id(&self, s: &str) -> Option<SymbolId> {
+        self.lookup.get(s).copied()
+    }
+
+    /// Returns the number of unique strings interned in the pool.
+    pub fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// Returns true if the pool contains no interned strings.
+    pub fn is_empty(&self) -> bool {
+        self.strings.is_empty()
+    }
+}
+
 /// Represents a caller-to-callee relation in the indexed call graph.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallEdge {
@@ -136,10 +218,15 @@ pub struct SymbolIndexMetrics {
 /// In-memory semantic index across a codebase.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SymbolIndex {
+    /// Contiguous string pool for deduplicating symbols, functions, and file paths.
+    #[serde(default)]
+    pub pool: StringPool,
     /// Call-graph edges indexed by callee -> callers.
-    pub callers_map: HashMap<String, Vec<CallEdge>>,
+    #[serde(default)]
+    pub callers_map: HashMap<SymbolId, Vec<CompactCallEdge>>,
     /// Call-graph edges indexed by caller -> callees.
-    pub callees_map: HashMap<String, Vec<CallEdge>>,
+    #[serde(default)]
+    pub callees_map: HashMap<SymbolId, Vec<CompactCallEdge>>,
     /// Trait implementations indexed by target type name.
     pub contracts_map: HashMap<String, Vec<ContractInfo>>,
     /// Declared symbols indexed by name.
@@ -150,6 +237,9 @@ pub struct SymbolIndex {
     /// Recorded API routes and client fetch calls.
     #[serde(default)]
     pub routes: Vec<RouteBinding>,
+    /// Fast file-name (basename) to file-path mapping for O(1) candidate lookup.
+    #[serde(skip)]
+    pub file_name_to_paths: HashMap<String, Vec<String>>,
 }
 
 impl SymbolIndex {
@@ -158,7 +248,44 @@ impl SymbolIndex {
         Self::default()
     }
 
+    /// Records a caller -> callee edge with source file into the interned call graph.
+    pub fn record_call_edge(&mut self, caller: &str, callee: &str, file: &str) {
+        let caller_id = self.pool.intern(caller);
+        let callee_id = self.pool.intern(callee);
+        let file_id = self.pool.intern(file);
+
+        let edge = CompactCallEdge {
+            caller: caller_id,
+            callee: callee_id,
+            file: file_id,
+        };
+
+        let caller_entry = self.callers_map.entry(callee_id).or_default();
+        if !caller_entry.contains(&edge) {
+            caller_entry.push(edge);
+        }
+
+        let callee_entry = self.callees_map.entry(caller_id).or_default();
+        if !callee_entry.contains(&edge) {
+            callee_entry.push(edge);
+        }
+    }
+
+    /// Records a CallEdge into the interned call graph.
+    pub fn add_call_edge(&mut self, edge: CallEdge) {
+        self.record_call_edge(&edge.caller, &edge.callee, &edge.file);
+    }
+
     fn record_symbol(&mut self, sym: SymbolDef) {
+        if let Some(file_name) = Path::new(&sym.file).file_name().and_then(|n| n.to_str()) {
+            let paths = self
+                .file_name_to_paths
+                .entry(file_name.to_string())
+                .or_default();
+            if !paths.iter().any(|p| p == &sym.file) {
+                paths.push(sym.file.clone());
+            }
+        }
         self.file_to_symbols
             .entry(sym.file.clone())
             .or_default()
@@ -196,19 +323,22 @@ impl SymbolIndex {
     pub fn estimate_memory_mb(&self) -> f64 {
         let mut bytes = std::mem::size_of::<Self>();
 
-        for (caller, edges) in &self.callers_map {
-            bytes += caller.len() + 32;
-            bytes += edges.capacity() * std::mem::size_of::<CallEdge>();
-            for edge in edges {
-                bytes += edge.caller.len() + edge.callee.len() + edge.file.len();
-            }
+        // String pool allocation
+        bytes += self.pool.strings.capacity() * std::mem::size_of::<String>();
+        for s in &self.pool.strings {
+            bytes += s.len();
         }
-        for (callee, edges) in &self.callees_map {
-            bytes += callee.len() + 32;
-            bytes += edges.capacity() * std::mem::size_of::<CallEdge>();
-            for edge in edges {
-                bytes += edge.caller.len() + edge.callee.len() + edge.file.len();
-            }
+        bytes += self.pool.lookup.capacity()
+            * (std::mem::size_of::<String>() + std::mem::size_of::<SymbolId>() + 16);
+
+        // Compact call-graph maps
+        for edges in self.callers_map.values() {
+            bytes += std::mem::size_of::<SymbolId>() + 16;
+            bytes += edges.capacity() * std::mem::size_of::<CompactCallEdge>();
+        }
+        for edges in self.callees_map.values() {
+            bytes += std::mem::size_of::<SymbolId>() + 16;
+            bytes += edges.capacity() * std::mem::size_of::<CompactCallEdge>();
         }
         for (target, contracts) in &self.contracts_map {
             bytes += target.len() + 32;
@@ -232,6 +362,13 @@ impl SymbolIndex {
             bytes += syms.capacity() * std::mem::size_of::<String>();
             for s in syms {
                 bytes += s.len();
+            }
+        }
+        for (name, paths) in &self.file_name_to_paths {
+            bytes += name.len() + 32;
+            bytes += paths.capacity() * std::mem::size_of::<String>();
+            for p in paths {
+                bytes += p.len();
             }
         }
         bytes += self.routes.capacity() * std::mem::size_of::<RouteBinding>();
@@ -276,11 +413,40 @@ impl SymbolIndex {
 
     /// Merges another SymbolIndex into this one in-place.
     pub fn merge(&mut self, other: SymbolIndex) {
-        for (k, v) in other.callers_map {
-            self.callers_map.entry(k).or_default().extend(v);
+        let id_map: Vec<SymbolId> = other
+            .pool
+            .strings
+            .iter()
+            .map(|s| self.pool.intern(s))
+            .collect();
+
+        for (k, edges) in other.callers_map {
+            let mapped_k = id_map[k.0 as usize];
+            let target = self.callers_map.entry(mapped_k).or_default();
+            for e in edges {
+                let mapped_edge = CompactCallEdge {
+                    caller: id_map[e.caller.0 as usize],
+                    callee: id_map[e.callee.0 as usize],
+                    file: id_map[e.file.0 as usize],
+                };
+                if !target.contains(&mapped_edge) {
+                    target.push(mapped_edge);
+                }
+            }
         }
-        for (k, v) in other.callees_map {
-            self.callees_map.entry(k).or_default().extend(v);
+        for (k, edges) in other.callees_map {
+            let mapped_k = id_map[k.0 as usize];
+            let target = self.callees_map.entry(mapped_k).or_default();
+            for e in edges {
+                let mapped_edge = CompactCallEdge {
+                    caller: id_map[e.caller.0 as usize],
+                    callee: id_map[e.callee.0 as usize],
+                    file: id_map[e.file.0 as usize],
+                };
+                if !target.contains(&mapped_edge) {
+                    target.push(mapped_edge);
+                }
+            }
         }
         for (k, v) in other.contracts_map {
             self.contracts_map.entry(k).or_default().extend(v);
@@ -292,6 +458,14 @@ impl SymbolIndex {
             self.file_to_symbols.entry(k).or_default().extend(v);
         }
         self.routes.extend(other.routes);
+        for (k, v) in other.file_name_to_paths {
+            let entry = self.file_name_to_paths.entry(k).or_default();
+            for p in v {
+                if !entry.iter().any(|existing| existing == &p) {
+                    entry.push(p);
+                }
+            }
+        }
     }
 
     /// Discovers candidate source files filtering ignored directories and nested worktrees.
@@ -545,14 +719,7 @@ impl SymbolIndex {
         visitor.visit_file(&ast);
 
         for edge in visitor.edges {
-            self.callers_map
-                .entry(edge.callee.clone())
-                .or_default()
-                .push(edge.clone());
-            self.callees_map
-                .entry(edge.caller.clone())
-                .or_default()
-                .push(edge);
+            self.record_call_edge(&edge.caller, &edge.callee, &edge.file);
         }
 
         for contract in visitor.contracts {
@@ -674,21 +841,7 @@ impl SymbolIndex {
                                 ) => s.local.name.to_string(),
                             };
                             if !imported_name.is_empty() {
-                                let edge = CallEdge {
-                                    caller: file_path.to_string(),
-                                    callee: imported_name,
-                                    file: file_path.to_string(),
-                                };
-                                let caller_entry =
-                                    self.callers_map.entry(edge.callee.clone()).or_default();
-                                if !caller_entry.iter().any(|e| e.caller == edge.caller) {
-                                    caller_entry.push(edge.clone());
-                                }
-                                let callee_entry =
-                                    self.callees_map.entry(edge.caller.clone()).or_default();
-                                if !callee_entry.iter().any(|e| e.callee == edge.callee) {
-                                    callee_entry.push(edge);
-                                }
+                                self.record_call_edge(file_path, &imported_name, file_path);
                             }
                         }
                     }
@@ -875,44 +1028,151 @@ impl SymbolIndex {
         }
     }
 
+    /// Looks up declared symbol names for a file path, checking exact match first,
+    /// then fast candidate match via `file_name_to_paths`, and finally fallback.
+    pub fn get_file_symbols<'a>(&'a self, target_path: &Path) -> Option<&'a [String]> {
+        let file_str = target_path.to_string_lossy();
+        if let Some(syms) = self.file_to_symbols.get(file_str.as_ref()) {
+            return Some(syms.as_slice());
+        }
+        if let Some(trimmed) = file_str.strip_prefix("./") {
+            if let Some(syms) = self.file_to_symbols.get(trimmed) {
+                return Some(syms.as_slice());
+            }
+        }
+        let target_file_name = target_path.file_name()?.to_str()?;
+        if let Some(candidates) = self.file_name_to_paths.get(target_file_name) {
+            for candidate in candidates {
+                if crate::path_matches(target_path, Path::new(candidate)) {
+                    if let Some(syms) = self.file_to_symbols.get(candidate) {
+                        return Some(syms.as_slice());
+                    }
+                }
+            }
+        }
+        // Fallback: in case file_name_to_paths was not populated
+        self.file_to_symbols.iter().find_map(|(f, s)| {
+            let p = Path::new(f);
+            if p.file_name().and_then(|n| n.to_str()) == Some(target_file_name)
+                && crate::path_matches(target_path, p)
+            {
+                Some(s.as_slice())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Retrieves upstream callers of a symbol up to the requested depth.
     pub fn get_callers(&self, symbol: &str, depth: usize) -> Vec<CallEdge> {
         let mut results = Vec::new();
+        let Some(start_id) = self.pool.get_id(symbol) else {
+            return results;
+        };
         let mut visited = HashSet::new();
-        let mut queue = vec![(symbol.to_string(), 0)];
+        let mut queue = vec![(start_id, 0)];
 
         while let Some((curr, d)) = queue.pop() {
-            if d >= depth || !visited.insert(curr.clone()) {
+            if d >= depth || !visited.insert(curr) {
                 continue;
             }
             if let Some(edges) = self.callers_map.get(&curr) {
                 for edge in edges {
-                    results.push(edge.clone());
-                    queue.push((edge.caller.clone(), d + 1));
+                    if let Some(resolved) = edge.resolve(&self.pool) {
+                        results.push(resolved);
+                        queue.push((edge.caller, d + 1));
+                    }
                 }
             }
         }
         results
     }
 
+    /// Collects upstream callers directly into a results vector, deduplicating against `seen`.
+    pub fn collect_callers_into(
+        &self,
+        symbol: &str,
+        depth: usize,
+        results: &mut Vec<CallEdge>,
+        seen: &mut HashSet<CallEdge>,
+    ) {
+        let Some(start_id) = self.pool.get_id(symbol) else {
+            return;
+        };
+        let mut visited = HashSet::new();
+        let mut queue = vec![(start_id, 0)];
+
+        while let Some((curr, d)) = queue.pop() {
+            if d >= depth || !visited.insert(curr) {
+                continue;
+            }
+            if let Some(edges) = self.callers_map.get(&curr) {
+                for edge in edges {
+                    if let Some(resolved) = edge.resolve(&self.pool) {
+                        if seen.insert(resolved.clone()) {
+                            results.push(resolved);
+                        }
+                        queue.push((edge.caller, d + 1));
+                    }
+                }
+            }
+        }
+    }
+
     /// Retrieves downstream callees called by a symbol up to the requested depth.
     pub fn get_callees(&self, symbol: &str, depth: usize) -> Vec<CallEdge> {
         let mut results = Vec::new();
+        let Some(start_id) = self.pool.get_id(symbol) else {
+            return results;
+        };
         let mut visited = HashSet::new();
-        let mut queue = vec![(symbol.to_string(), 0)];
+        let mut queue = vec![(start_id, 0)];
 
         while let Some((curr, d)) = queue.pop() {
-            if d >= depth || !visited.insert(curr.clone()) {
+            if d >= depth || !visited.insert(curr) {
                 continue;
             }
             if let Some(edges) = self.callees_map.get(&curr) {
                 for edge in edges {
-                    results.push(edge.clone());
-                    queue.push((edge.callee.clone(), d + 1));
+                    if let Some(resolved) = edge.resolve(&self.pool) {
+                        results.push(resolved);
+                        queue.push((edge.callee, d + 1));
+                    }
                 }
             }
         }
         results
+    }
+
+    /// Collects downstream callees directly into a results vector, deduplicating against `seen`.
+    pub fn collect_callees_into(
+        &self,
+        symbol: &str,
+        depth: usize,
+        results: &mut Vec<CallEdge>,
+        seen: &mut HashSet<CallEdge>,
+    ) {
+        let Some(start_id) = self.pool.get_id(symbol) else {
+            return;
+        };
+        let mut visited = HashSet::new();
+        let mut queue = vec![(start_id, 0)];
+
+        while let Some((curr, d)) = queue.pop() {
+            if d >= depth || !visited.insert(curr) {
+                continue;
+            }
+            if let Some(edges) = self.callees_map.get(&curr) {
+                for edge in edges {
+                    if let Some(resolved) = edge.resolve(&self.pool) {
+                        if seen.insert(resolved.clone()) {
+                            results.push(resolved);
+                        }
+                        queue.push((edge.callee, d + 1));
+                    }
+                }
+            }
+        }
     }
 
     /// Retrieves trait contracts associated with a target type.

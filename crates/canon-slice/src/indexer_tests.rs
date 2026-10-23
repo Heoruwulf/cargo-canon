@@ -276,6 +276,18 @@ fn test_parallel_indexing_equivalence() {
         par_metrics.total_routes_count
     );
 
+    let seq_callers = seq_idx.get_callers("helper", 1);
+    let par_callers = par_idx.get_callers("helper", 1);
+    assert_eq!(seq_callers, par_callers);
+    assert!(!par_callers.is_empty());
+    assert_eq!(par_callers[0].caller, "compute");
+
+    let seq_callees = seq_idx.get_callees("compute", 1);
+    let par_callees = par_idx.get_callees("compute", 1);
+    assert_eq!(seq_callees, par_callees);
+    assert!(!par_callees.is_empty());
+    assert_eq!(par_callees[0].callee, "helper");
+
     assert!(!par_idx.symbols_map.contains_key("generated"));
     assert!(!seq_idx.symbols_map.contains_key("generated"));
 }
@@ -507,4 +519,312 @@ fn test_workspace_under_ignored_ancestor_and_watch_paths_scoping() {
     let unwatched_sub =
         idx.collect_source_files_for_project(&ws_root.join("unwatched/src"), &scoped_proj);
     assert!(unwatched_sub.is_empty());
+}
+
+#[test]
+fn test_get_file_symbols_fast_path_and_normalization() {
+    let mut idx = SymbolIndex::new();
+    let file1 = "/home/user/project/crates/core/src/service.rs";
+    let file2 = "/home/user/project/crates/api/src/service.rs";
+
+    idx.record_symbol(SymbolDef {
+        name: "CoreService".to_string(),
+        kind: "struct".to_string(),
+        file: file1.to_string(),
+        line: 10,
+        language: "rust".to_string(),
+    });
+    idx.record_symbol(SymbolDef {
+        name: "ApiService".to_string(),
+        kind: "struct".to_string(),
+        file: file2.to_string(),
+        line: 15,
+        language: "rust".to_string(),
+    });
+
+    // 1. Exact path lookup
+    let syms1 = idx.get_file_symbols(Path::new(file1)).unwrap();
+    assert_eq!(syms1, &["CoreService"]);
+
+    // 2. Relative prefix "./" lookup
+    let syms_rel_dot = idx
+        .get_file_symbols(Path::new(&format!("./{file1}")))
+        .unwrap();
+    assert_eq!(syms_rel_dot, &["CoreService"]);
+
+    // 3. Fast lookup via file_name_to_paths with suffix match
+    let syms_suffix = idx
+        .get_file_symbols(Path::new("crates/core/src/service.rs"))
+        .unwrap();
+    assert_eq!(syms_suffix, &["CoreService"]);
+
+    let syms_suffix2 = idx
+        .get_file_symbols(Path::new("crates/api/src/service.rs"))
+        .unwrap();
+    assert_eq!(syms_suffix2, &["ApiService"]);
+
+    // 4. Missing path returns None
+    assert!(idx.get_file_symbols(Path::new("non_existent.rs")).is_none());
+
+    // 5. Fallback when file_name_to_paths is empty
+    let mut fallback_idx = SymbolIndex::new();
+    fallback_idx.file_to_symbols = idx.file_to_symbols.clone();
+    // file_name_to_paths is empty in fallback_idx
+    let syms_fb = fallback_idx
+        .get_file_symbols(Path::new("crates/core/src/service.rs"))
+        .unwrap();
+    assert_eq!(syms_fb, &["CoreService"]);
+}
+
+#[test]
+fn test_collect_callers_and_callees_equivalence_and_dedup() {
+    let mut idx = SymbolIndex::new();
+    let file = "/project/src/lib.rs";
+
+    idx.record_symbol(SymbolDef {
+        name: "entrypoint".to_string(),
+        kind: "fn".to_string(),
+        file: file.to_string(),
+        line: 1,
+        language: "rust".to_string(),
+    });
+    idx.record_symbol(SymbolDef {
+        name: "helper".to_string(),
+        kind: "fn".to_string(),
+        file: file.to_string(),
+        line: 10,
+        language: "rust".to_string(),
+    });
+
+    let edge_a = CallEdge {
+        caller: "caller_a".into(),
+        callee: "entrypoint".into(),
+        file: "/project/src/caller_a.rs".into(),
+    };
+    let edge_b = CallEdge {
+        caller: "caller_b".into(),
+        callee: "helper".into(),
+        file: "/project/src/caller_b.rs".into(),
+    };
+    let edge_shared = CallEdge {
+        caller: "caller_shared".into(),
+        callee: "helper".into(),
+        file: "/project/src/caller_shared.rs".into(),
+    };
+
+    // Add callers
+    let id_entrypoint = idx.pool.intern("entrypoint");
+    let id_helper = idx.pool.intern("helper");
+    let c_edge_a = CompactCallEdge {
+        caller: idx.pool.intern(&edge_a.caller),
+        callee: idx.pool.intern(&edge_a.callee),
+        file: idx.pool.intern(&edge_a.file),
+    };
+    let c_edge_b = CompactCallEdge {
+        caller: idx.pool.intern(&edge_b.caller),
+        callee: idx.pool.intern(&edge_b.callee),
+        file: idx.pool.intern(&edge_b.file),
+    };
+    let c_edge_shared = CompactCallEdge {
+        caller: idx.pool.intern(&edge_shared.caller),
+        callee: idx.pool.intern(&edge_shared.callee),
+        file: idx.pool.intern(&edge_shared.file),
+    };
+
+    idx.callers_map
+        .entry(id_entrypoint)
+        .or_default()
+        .extend(vec![c_edge_a, c_edge_shared]);
+    idx.callers_map
+        .entry(id_helper)
+        .or_default()
+        .extend(vec![c_edge_b, c_edge_shared]);
+
+    let mut callers = Vec::new();
+    let mut seen = HashSet::new();
+    idx.collect_callers_into("entrypoint", 2, &mut callers, &mut seen);
+    assert_eq!(callers.len(), 2);
+
+    // Subsequent collect into callers deduplicates edge_shared
+    idx.collect_callers_into("helper", 2, &mut callers, &mut seen);
+    assert_eq!(callers.len(), 3);
+    assert_eq!(callers, vec![edge_a.clone(), edge_shared.clone(), edge_b]);
+
+    // Verify get_callers directly
+    let direct_callers = idx.get_callers("entrypoint", 1);
+    assert_eq!(direct_callers, vec![edge_a.clone(), edge_shared.clone()]);
+
+    // Populate callees map and verify collect_callees_into & get_callees
+    let id_caller_a = idx.pool.intern("caller_a");
+    let id_caller_shared = idx.pool.intern("caller_shared");
+    idx.callees_map
+        .entry(id_caller_a)
+        .or_default()
+        .push(c_edge_a);
+    idx.callees_map
+        .entry(id_caller_shared)
+        .or_default()
+        .extend(vec![c_edge_a, c_edge_shared]);
+
+    let mut callees = Vec::new();
+    let mut seen_callees = HashSet::new();
+    idx.collect_callees_into("caller_shared", 2, &mut callees, &mut seen_callees);
+    assert_eq!(callees.len(), 2);
+    assert_eq!(callees, vec![edge_a.clone(), edge_shared.clone()]);
+
+    // Subsequent collect into callees deduplicates edge_a
+    idx.collect_callees_into("caller_a", 2, &mut callees, &mut seen_callees);
+    assert_eq!(callees.len(), 2);
+
+    let direct_callees = idx.get_callees("caller_a", 1);
+    assert_eq!(direct_callees, vec![edge_a]);
+}
+
+#[test]
+fn test_string_pool() {
+    let mut pool = StringPool::new();
+    assert!(pool.is_empty());
+    assert_eq!(pool.len(), 0);
+
+    let id_a = pool.intern("my_func");
+    let id_b = pool.intern("my_func");
+    assert_eq!(
+        id_a, id_b,
+        "Duplicate interning must return identical SymbolId"
+    );
+
+    let id_c = pool.intern("other_func");
+    assert_ne!(id_a, id_c);
+
+    assert_eq!(pool.resolve(id_a), Some("my_func"));
+    assert_eq!(pool.resolve(id_c), Some("other_func"));
+    assert_eq!(pool.resolve(SymbolId(9999)), None);
+
+    assert_eq!(pool.get_id("my_func"), Some(id_a));
+    assert_eq!(pool.get_id("non_existent"), None);
+
+    assert_eq!(pool.len(), 2);
+    assert!(!pool.is_empty());
+
+    // Verify CompactCallEdge size is exactly 12 bytes
+    assert_eq!(std::mem::size_of::<CompactCallEdge>(), 12);
+    let edge = CompactCallEdge {
+        caller: id_a,
+        callee: id_c,
+        file: id_a,
+    };
+    assert_eq!(edge.caller, id_a);
+    assert_eq!(edge.callee, id_c);
+    assert_eq!(edge.file, id_a);
+}
+
+#[test]
+fn test_call_edge_fidelity_cycles_overlay_and_parallel_merge() {
+    // 1. Cyclic Call Graph String Fidelity
+    let mut idx_cycle = SymbolIndex::new();
+    let edge_ab = CallEdge {
+        caller: "node_a".to_string(),
+        callee: "node_b".to_string(),
+        file: "src/file_a.rs".to_string(),
+    };
+    let edge_bc = CallEdge {
+        caller: "node_b".to_string(),
+        callee: "node_c".to_string(),
+        file: "src/file_b.rs".to_string(),
+    };
+    let edge_ca = CallEdge {
+        caller: "node_c".to_string(),
+        callee: "node_a".to_string(),
+        file: "src/file_c.rs".to_string(),
+    };
+
+    idx_cycle.add_call_edge(edge_ab.clone());
+    idx_cycle.add_call_edge(edge_bc.clone());
+    idx_cycle.add_call_edge(edge_ca.clone());
+
+    // BFS callers of node_a with depth 5 must terminate and retain exact strings
+    let callers = idx_cycle.get_callers("node_a", 5);
+    assert_eq!(callers.len(), 3, "Must find exactly 3 edges in the cycle");
+    assert!(callers.contains(&edge_ca));
+    assert!(callers.contains(&edge_bc));
+    assert!(callers.contains(&edge_ab));
+
+    // BFS callees of node_a with depth 5 must terminate and retain exact strings
+    let callees = idx_cycle.get_callees("node_a", 5);
+    assert_eq!(callees.len(), 3, "Must find exactly 3 edges in the cycle");
+    assert!(callees.contains(&edge_ab));
+    assert!(callees.contains(&edge_bc));
+    assert!(callees.contains(&edge_ca));
+
+    // 2. Overlay Fallback Fidelity
+    let mut base_idx = SymbolIndex::new();
+    let base_edge = CallEdge {
+        caller: "fn_base_caller".to_string(),
+        callee: "fn_shared".to_string(),
+        file: "src/base.rs".to_string(),
+    };
+    base_idx.add_call_edge(base_edge.clone());
+
+    let mut overlay_idx = SymbolIndex::new();
+    let overlay_edge = CallEdge {
+        caller: "fn_overlay_caller".to_string(),
+        callee: "fn_overlay_target".to_string(),
+        file: "src/overlay.rs".to_string(),
+    };
+    overlay_idx.add_call_edge(overlay_edge.clone());
+
+    // Query overlay for symbol only in base
+    let fallback_callers = overlay_idx.get_callers_with_fallback(Some(&base_idx), "fn_shared", 1);
+    assert_eq!(fallback_callers, vec![base_edge.clone()]);
+
+    let fallback_callees =
+        overlay_idx.get_callees_with_fallback(Some(&base_idx), "fn_base_caller", 1);
+    assert_eq!(fallback_callees, vec![base_edge]);
+
+    // Query overlay for symbol present in overlay
+    let overlay_callers =
+        overlay_idx.get_callers_with_fallback(Some(&base_idx), "fn_overlay_target", 1);
+    assert_eq!(overlay_callers, vec![overlay_edge]);
+
+    // 3. Parallel Merge Translation Fidelity
+    let mut idx1 = SymbolIndex::new();
+    let edge_x = CallEdge {
+        caller: "caller_x".to_string(),
+        callee: "common_fn".to_string(),
+        file: "src/x.rs".to_string(),
+    };
+    let edge_leaf1 = CallEdge {
+        caller: "common_fn".to_string(),
+        callee: "leaf_1".to_string(),
+        file: "src/x.rs".to_string(),
+    };
+    idx1.add_call_edge(edge_x.clone());
+    idx1.add_call_edge(edge_leaf1.clone());
+
+    let mut idx2 = SymbolIndex::new();
+    let edge_y = CallEdge {
+        caller: "caller_y".to_string(),
+        callee: "common_fn".to_string(),
+        file: "src/y.rs".to_string(),
+    };
+    let edge_leaf2 = CallEdge {
+        caller: "common_fn".to_string(),
+        callee: "leaf_2".to_string(),
+        file: "src/y.rs".to_string(),
+    };
+    idx2.add_call_edge(edge_y.clone());
+    idx2.add_call_edge(edge_leaf2.clone());
+
+    // Merge idx2 into idx1
+    idx1.merge(idx2);
+
+    let merged_callers = idx1.get_callers("common_fn", 1);
+    assert_eq!(merged_callers.len(), 2);
+    assert!(merged_callers.contains(&edge_x));
+    assert!(merged_callers.contains(&edge_y));
+
+    let merged_callees = idx1.get_callees("common_fn", 1);
+    assert_eq!(merged_callees.len(), 2);
+    assert!(merged_callees.contains(&edge_leaf1));
+    assert!(merged_callees.contains(&edge_leaf2));
 }

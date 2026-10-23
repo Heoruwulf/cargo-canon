@@ -20,8 +20,8 @@ pub use go_skeleton::{
     extract_go_file_skeleton, extract_go_skeleton, extract_go_skeleton_with_options,
 };
 pub use indexer::{
-    CallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, SymbolDef, SymbolIndex,
-    SymbolIndexMetrics, is_ignored_path,
+    CallEdge, CompactCallEdge, ContractInfo, CrossBoundaryImpact, RouteBinding, StringPool,
+    SymbolDef, SymbolId, SymbolIndex, SymbolIndexMetrics, is_ignored_path,
 };
 pub use skeleton::{SkeletonStripper, extract_file_skeleton, extract_skeleton, strip_file_ast};
 pub use ts_skeleton::{
@@ -30,6 +30,7 @@ pub use ts_skeleton::{
 };
 
 use canon_core::model::SliceMode;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Slices a file or target symbol according to the requested SliceMode.
@@ -155,7 +156,7 @@ pub fn slice_target_for_project(
     })
 }
 
-fn path_matches(p1: &Path, p2: &Path) -> bool {
+pub(crate) fn path_matches(p1: &Path, p2: &Path) -> bool {
     p1 == p2 || p1.ends_with(p2) || p2.ends_with(p1)
 }
 
@@ -166,23 +167,10 @@ fn collect_callers(
     depth: usize,
 ) -> Vec<CallEdge> {
     let mut callers = idx.get_callers(target_name, depth);
-    let file_str = target_path.to_string_lossy();
-    let syms = idx.file_to_symbols.get(file_str.as_ref()).or_else(|| {
-        idx.file_to_symbols.iter().find_map(|(f, s)| {
-            if path_matches(target_path, Path::new(f)) {
-                Some(s)
-            } else {
-                None
-            }
-        })
-    });
-    if let Some(sym_names) = syms {
+    let mut seen: HashSet<CallEdge> = callers.iter().cloned().collect();
+    if let Some(sym_names) = idx.get_file_symbols(target_path) {
         for sym in sym_names {
-            for edge in idx.get_callers(sym, depth) {
-                if !callers.contains(&edge) {
-                    callers.push(edge);
-                }
-            }
+            idx.collect_callers_into(sym, depth, &mut callers, &mut seen);
         }
     }
     callers
@@ -195,23 +183,10 @@ fn collect_callees(
     depth: usize,
 ) -> Vec<CallEdge> {
     let mut callees = idx.get_callees(target_name, depth);
-    let file_str = target_path.to_string_lossy();
-    let syms = idx.file_to_symbols.get(file_str.as_ref()).or_else(|| {
-        idx.file_to_symbols.iter().find_map(|(f, s)| {
-            if path_matches(target_path, Path::new(f)) {
-                Some(s)
-            } else {
-                None
-            }
-        })
-    });
-    if let Some(sym_names) = syms {
+    let mut seen: HashSet<CallEdge> = callees.iter().cloned().collect();
+    if let Some(sym_names) = idx.get_file_symbols(target_path) {
         for sym in sym_names {
-            for edge in idx.get_callees(sym, depth) {
-                if !callees.contains(&edge) {
-                    callees.push(edge);
-                }
-            }
+            idx.collect_callees_into(sym, depth, &mut callees, &mut seen);
         }
     }
     callees
@@ -274,23 +249,11 @@ fn resolve_cross_boundary(
         }
     }
 
-    let file_str = target_path.to_string_lossy();
-    if let Some(sym_names) = idx.file_to_symbols.get(file_str.as_ref()) {
+    if let Some(sym_names) = idx.get_file_symbols(target_path) {
         for sym_name in sym_names {
             if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
                 if is_valid_cross_boundary(&cb, target_path) {
                     return Some(cb);
-                }
-            }
-        }
-    }
-    for (indexed_file, sym_names) in &idx.file_to_symbols {
-        if path_matches(target_path, Path::new(indexed_file)) {
-            for sym_name in sym_names {
-                if let Some(cb) = idx.get_cross_boundary_impact(sym_name) {
-                    if is_valid_cross_boundary(&cb, target_path) {
-                        return Some(cb);
-                    }
                 }
             }
         }
@@ -591,5 +554,63 @@ mod tests {
             Path::new("my_utils.ts"),
             Path::new("/path/to/utils.ts")
         ));
+    }
+
+    #[test]
+    fn test_slice_target_call_graph_equivalence_and_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("service.rs");
+        let caller1_path = dir.path().join("caller1.rs");
+        let caller2_path = dir.path().join("caller2.rs");
+
+        std::fs::write(
+            &service_path,
+            r#"
+            pub fn target_fn() { internal_callee(); }
+            pub fn internal_callee() {}
+            pub fn other_fn() { internal_callee(); }
+            "#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &caller1_path,
+            r#"
+            use crate::service::target_fn;
+            pub fn run_1() { target_fn(); }
+            "#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &caller2_path,
+            r#"
+            use crate::service::{target_fn, other_fn};
+            pub fn run_2() { target_fn(); other_fn(); }
+            "#,
+        )
+        .unwrap();
+
+        let mut index = SymbolIndex::new();
+        index.index_directory(dir.path()).unwrap();
+
+        let bundle = slice_target(&service_path, SliceMode::Bundle, Some(&index)).unwrap();
+
+        // Must preserve non-duplicated callers
+        assert!(!bundle.callers.is_empty());
+        let callers_set: HashSet<_> = bundle.callers.iter().collect();
+        assert_eq!(
+            callers_set.len(),
+            bundle.callers.len(),
+            "Callers must have zero duplicate edges"
+        );
+
+        // Callees must also have zero duplicates
+        let callees_set: HashSet<_> = bundle.callees.iter().collect();
+        assert_eq!(
+            callees_set.len(),
+            bundle.callees.len(),
+            "Callees must have zero duplicate edges"
+        );
     }
 }
