@@ -229,7 +229,7 @@ async fn claude_micro_read_records_exact_slice_bytes() {
 }
 
 #[tokio::test]
-async fn claude_omitted_bounds_apply_default_2000_lines() {
+async fn claude_omitted_bounds_apply_eof_and_token_cap() {
     let harness = TestHarness::start().await;
     let stdin_json = serde_json::json!({
         "hook_event_name": "PostToolUse",
@@ -251,7 +251,7 @@ async fn claude_omitted_bounds_apply_default_2000_lines() {
     let (start_line, end_line, raw_read_bytes) =
         compute_hook_read_metrics(&file, &span, &ReadBudgetEnv::default());
     assert_eq!(start_line, Some(1));
-    assert_eq!(end_line, Some(2000));
+    assert_eq!(end_line, Some(TOTAL_LINES));
     assert_eq!(raw_read_bytes, Some(100_000));
 
     let resp = send_daemon_request(

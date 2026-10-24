@@ -24,6 +24,7 @@ pub use error::CoreError;
 pub use logging::init_logging;
 pub use model::SliceMode;
 pub use output::OutputFormat;
+#[allow(deprecated)]
 pub use span::{
     AgentVendor, CLAUDE_WHOLE_FILE_MAX_BYTES, DEFAULT_AGY_BYTE_LIMIT, DEFAULT_AGY_END_LINE,
     DEFAULT_AGY_START_LINE, DEFAULT_CLAUDE_LIMIT, DEFAULT_CLAUDE_MAX_READ_TOKENS,

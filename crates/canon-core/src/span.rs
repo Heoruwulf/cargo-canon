@@ -30,7 +30,12 @@ pub const DEFAULT_CLAUDE_OFFSET: usize = 1;
 
 /// Default line count limit for Claude Code `Read` tool invocations when omitted.
 ///
-/// Note: first-party tool schema; not published on vendor website as of 2026-10-23; applied as a secondary cap.
+/// Deprecated: Claude Code does not enforce a line cap when omitted; reads default to EOF bounded by token cap.
+#[deprecated(
+    since = "0.3.4",
+    note = "Claude Code does not enforce a line cap when omitted; reads default to EOF bounded by token cap"
+)]
+#[allow(deprecated)]
 pub const DEFAULT_CLAUDE_LIMIT: usize = 2000;
 
 /// Default 1-indexed starting line for Antigravity (AGY) `read_file` invocations.
@@ -152,18 +157,15 @@ impl ReadSpan {
             }
         } else {
             match self.vendor {
-                Some(AgentVendor::Claude) => {
-                    start.saturating_add(DEFAULT_CLAUDE_LIMIT.saturating_sub(1))
-                }
-                Some(AgentVendor::Agy) => {
-                    start.saturating_add(DEFAULT_AGY_END_LINE.saturating_sub(1))
-                }
-                Some(AgentVendor::Generic) | None => {
+                Some(AgentVendor::Claude) | Some(AgentVendor::Generic) | None => {
                     if total_lines > start {
                         total_lines
                     } else {
                         start
                     }
+                }
+                Some(AgentVendor::Agy) => {
+                    start.saturating_add(DEFAULT_AGY_END_LINE.saturating_sub(1))
                 }
             }
         };
@@ -465,6 +467,15 @@ pub fn detect_budget_env(get: impl Fn(&str) -> Option<String>) -> ReadBudgetEnv 
         || get("CLAUDECODE").as_deref() == Some("1")
     {
         Some(AgentVendor::Claude)
+    } else if get("ANTIGRAVITY_AGENT").as_deref() == Some("1")
+        || get("ANTIGRAVITY_CONVERSATION_ID")
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || get("ANTIGRAVITY_AGENTAPI_EXE")
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    {
+        Some(AgentVendor::Agy)
     } else {
         None
     };
@@ -500,15 +511,11 @@ fn claude_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
     let token_byte_cap = claude_max_tokens.saturating_mul(EST_BYTES_PER_TOKEN);
 
     if !has_bounds {
-        if file_bytes > CLAUDE_WHOLE_FILE_MAX_BYTES {
-            0
-        } else {
-            let mut claude_span = span.clone();
-            claude_span.vendor = Some(AgentVendor::Claude);
-            claude_span
-                .calculate_read_bytes(content)
-                .min(token_byte_cap)
-        }
+        let mut claude_span = span.clone();
+        claude_span.vendor = Some(AgentVendor::Claude);
+        claude_span
+            .calculate_read_bytes(content)
+            .min(token_byte_cap)
     } else {
         let mut claude_span = span.clone();
         claude_span.vendor = Some(AgentVendor::Claude);
@@ -524,7 +531,7 @@ fn claude_budget(span: &ReadSpan, content: &str, env: &ReadBudgetEnv) -> u64 {
 /// Resolves the effective byte read budget requested by an agent file read.
 ///
 /// Implements vendor-specific defaults and caps:
-/// - **Claude**: 25,000 tokens (or override), 256 KB refusal limit for unbounded reads.
+/// - **Claude**: 25,000 tokens (or override), auto-paginated up to token cap for unbounded reads.
 /// - **Antigravity**: 800 lines default, 46,080 byte maximum cap.
 /// - **Generic**: Full file size (or explicit line window).
 #[must_use]
@@ -568,16 +575,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_apply_1_to_2000() {
+    fn claude_defaults_read_to_eof_without_line_cap() {
         let span = ReadSpan {
             vendor: Some(AgentVendor::Claude),
             ..Default::default()
         };
-        assert_eq!(span.effective_range(3000), (1, 2000));
+        assert_eq!(span.effective_range(3000), (1, 3000));
         assert_eq!(span.effective_range(500), (1, 500));
 
         let content = build_sample_file(3000, 50);
-        assert_eq!(span.calculate_read_bytes(&content), 2000 * 50);
+        assert_eq!(span.calculate_read_bytes(&content), 3000 * 50);
     }
 
     #[test]
@@ -663,7 +670,7 @@ mod tests {
         assert_eq!(parsed.span.vendor, Some(AgentVendor::Claude));
         assert_eq!(parsed.span.offset, None);
         assert_eq!(parsed.span.limit, None);
-        assert_eq!(parsed.span.effective_range(5000), (1, 2000));
+        assert_eq!(parsed.span.effective_range(5000), (1, 5000));
     }
 
     #[test]
@@ -767,6 +774,32 @@ mod tests {
         });
         assert_eq!(env_zero.env_vendor, None);
 
+        let env_agy_agent = detect_budget_env(|k| match k {
+            "ANTIGRAVITY_AGENT" => Some("1".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_agy_agent.env_vendor, Some(AgentVendor::Agy));
+
+        let env_agy_conv = detect_budget_env(|k| match k {
+            "ANTIGRAVITY_CONVERSATION_ID" => Some("conv-1234-uuid".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_agy_conv.env_vendor, Some(AgentVendor::Agy));
+
+        let env_agy_exe = detect_budget_env(|k| match k {
+            "ANTIGRAVITY_AGENTAPI_EXE" => Some("/home/mark/.local/bin/agy".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_agy_exe.env_vendor, Some(AgentVendor::Agy));
+
+        let env_agy_empty = detect_budget_env(|k| match k {
+            "ANTIGRAVITY_AGENT" => Some("0".to_string()),
+            "ANTIGRAVITY_CONVERSATION_ID" => Some("".to_string()),
+            "ANTIGRAVITY_AGENTAPI_EXE" => Some("".to_string()),
+            _ => None,
+        });
+        assert_eq!(env_agy_empty.env_vendor, None);
+
         let env_tokens = detect_budget_env(|k| match k {
             "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS" => Some("40000".to_string()),
             _ => None,
@@ -790,7 +823,7 @@ mod tests {
         let span_generic = ReadSpan::default();
         assert_eq!(resolve_read_budget(&span_generic, "", &empty_env), 0);
 
-        // Claude unbounded on 300 KB file (> 256 KB) -> 0 (refused)
+        // Claude unbounded on 300 KB file (> 256 KB) -> auto-paginates up to token cap (100,000 bytes)
         let large_300k = build_sample_file(6000, 50); // 300,000 bytes > 262,144
         let claude_unbounded = ReadSpan {
             vendor: Some(AgentVendor::Claude),
@@ -798,10 +831,10 @@ mod tests {
         };
         assert_eq!(
             resolve_read_budget(&claude_unbounded, &large_300k, &empty_env),
-            0
+            100_000
         );
 
-        // Claude unbounded on 3,000-line x 50 B file (150 KB) -> min(2000*50, 100,000) = 100,000
+        // Claude unbounded on 3,000-line x 50 B file (150 KB) -> min(150,000, 100,000) = 100,000
         let medium_150k = build_sample_file(3000, 50);
         assert_eq!(
             resolve_read_budget(&claude_unbounded, &medium_150k, &empty_env),
