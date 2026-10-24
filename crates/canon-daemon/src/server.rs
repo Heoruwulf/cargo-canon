@@ -8,6 +8,7 @@ use crate::protocol::{
 };
 use crate::registry::{WorkspaceEntry, WorkspaceRegistry};
 use crate::watcher::DynamicWatcherManager;
+use canon_core::ReadKind;
 use canon_slice::{SymbolIndex, slice_target, slice_target_for_project};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,8 @@ pub struct ServerTelemetry {
     pub raw_bytes_served: AtomicU64,
     pub delivered_bytes_served: AtomicU64,
     pub bytes_saved: AtomicU64,
+    pub macro_reads: AtomicU64,
+    pub micro_reads: AtomicU64,
 }
 
 impl ServerTelemetry {
@@ -60,6 +63,28 @@ impl ServerTelemetry {
     /// Increments the count of total advisory context omissions.
     pub fn record_ast_drop(&self) {
         self.ast_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the count for the given read kind (macro vs micro).
+    pub fn record_read_kind(&self, kind: ReadKind) {
+        match kind {
+            ReadKind::Macro => {
+                self.macro_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            ReadKind::Micro => {
+                self.micro_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Returns the total macro reads count.
+    pub fn macro_reads(&self) -> u64 {
+        self.macro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total micro reads count.
+    pub fn micro_reads(&self) -> u64 {
+        self.micro_reads.load(Ordering::Relaxed)
     }
 
     /// Returns a snapshot of cumulative telemetry computed directly from `raw` vs `delivered`:
@@ -334,6 +359,22 @@ struct PostReadParams<'a> {
     start_line: Option<usize>,
     end_line: Option<usize>,
     raw_read_bytes: Option<u64>,
+    read_kind: Option<ReadKind>,
+}
+
+fn classify_read(params: &PostReadParams<'_>, file: &Path) -> ReadKind {
+    if let Some(kind) = params.read_kind {
+        return kind;
+    }
+    let span = canon_core::span::ReadSpan {
+        start_line: params.start_line,
+        end_line: params.end_line,
+        ..Default::default()
+    };
+    let total_lines = std::fs::read_to_string(file)
+        .map(|c| c.split_inclusive('\n').count())
+        .unwrap_or(0);
+    span.classify(total_lines)
 }
 
 /// Per-request context for applying a bloat-guard outcome.
@@ -436,8 +477,12 @@ async fn handle_post_read_request(
     state: &ServerState,
 ) -> DaemonResponse {
     let file = params.file;
+    let read_kind = classify_read(&params, file);
+    state.telemetry.record_read_kind(read_kind);
+
     let entry = match state.registry.get_or_init(file).await {
         Ok(e) => {
+            e.record_read(read_kind);
             if let Some(ref watcher) = state.watcher_manager {
                 if !watcher.is_watching(&e.root) {
                     let _ = watcher.watch_workspace_with_config(
@@ -458,6 +503,11 @@ async fn handle_post_read_request(
             );
             None
         }
+    };
+
+    let kind_tag = match read_kind {
+        ReadKind::Macro => "MACRO",
+        ReadKind::Micro => "MICRO",
     };
 
     let raw_len = params
@@ -499,7 +549,7 @@ async fn handle_post_read_request(
 
             let pct = state.telemetry.record_reduction(raw_len, delivered_len);
             let log_msg = format!(
-                "{action}: '{}'{range_str} | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
+                "[{kind_tag}] {action}: '{}'{range_str} | raw: {} B | delivered: {} B | reduction: {:.1}% | latency: {:.1}ms",
                 file.display(),
                 raw_len,
                 delivered_len,
@@ -516,7 +566,11 @@ async fn handle_post_read_request(
             }
         }
         Err(e) => {
-            let err_msg = format!("PostReadHook failed for '{}': {}", file.display(), e);
+            let err_msg = format!(
+                "[{kind_tag}] PostReadHook failed for '{}': {}",
+                file.display(),
+                e
+            );
             state.log_manager.log_daemon(&err_msg);
             if let Some(ref ws) = entry {
                 ws.logger.log(&err_msg);
@@ -649,6 +703,8 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
             submissions: entry.submissions(),
             callgraph_drops: entry.callgraph_drops(),
             ast_drops: entry.ast_drops(),
+            macro_reads: entry.macro_reads(),
+            micro_reads: entry.micro_reads(),
         });
     }
 
@@ -669,6 +725,7 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
     };
 
     let (hooks, raw, delivered, saved, pct, est_tokens) = state.telemetry.snapshot();
+    let supp_tokens = delivered / canon_core::span::EST_BYTES_PER_TOKEN;
     DaemonStatusInfo {
         pid: std::process::id(),
         uptime_secs: state.start_time.elapsed().as_secs(),
@@ -696,6 +753,10 @@ async fn build_status_response(state: &ServerState) -> DaemonStatusInfo {
         bytes_saved: saved,
         token_reduction_pct: pct,
         est_tokens_saved: est_tokens,
+        macro_reads: state.telemetry.macro_reads.load(Ordering::Relaxed),
+        micro_reads: state.telemetry.micro_reads.load(Ordering::Relaxed),
+        supplemental_context_bytes: delivered,
+        supplemental_context_tokens: supp_tokens,
     }
 }
 
@@ -726,12 +787,14 @@ async fn handle_client(mut stream: UnixStream, state: Arc<ServerState>) -> Resul
                 start_line,
                 end_line,
                 raw_read_bytes,
+                read_kind,
             } => {
                 let params = PostReadParams {
                     file: &file,
                     start_line,
                     end_line,
                     raw_read_bytes,
+                    read_kind,
                 };
                 let resp = handle_post_read_request(params, req_start, &state).await;
                 write_message(&mut stream, &resp).await?;
@@ -811,15 +874,95 @@ mod tests {
         assert_eq!(telemetry.submissions.load(Ordering::Relaxed), 0);
         assert_eq!(telemetry.callgraph_drops.load(Ordering::Relaxed), 0);
         assert_eq!(telemetry.ast_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(telemetry.macro_reads(), 0);
+        assert_eq!(telemetry.micro_reads(), 0);
 
         telemetry.record_submission();
         telemetry.record_submission();
         telemetry.record_callgraph_drop();
         telemetry.record_ast_drop();
+        telemetry.record_read_kind(ReadKind::Macro);
+        telemetry.record_read_kind(ReadKind::Micro);
+        telemetry.record_read_kind(ReadKind::Micro);
 
         assert_eq!(telemetry.submissions.load(Ordering::Relaxed), 2);
         assert_eq!(telemetry.callgraph_drops.load(Ordering::Relaxed), 1);
         assert_eq!(telemetry.ast_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.macro_reads(), 1);
+        assert_eq!(telemetry.micro_reads(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_post_read_hook_macro_and_micro_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let opts = ServerOptions {
+            socket_path: dir.path().join("test_telemetry.sock"),
+            workspace_root: dir.path().to_path_buf(),
+            log_dir: Some(log_dir),
+            ..Default::default()
+        };
+        let index = Arc::new(RwLock::new(SymbolIndex::new()));
+        let token = CancellationToken::new();
+        let state = init_server_state(opts, index, token, std::time::Instant::now())
+            .await
+            .expect("init server state");
+
+        let src_file = dir.path().join("main.rs");
+        let mut file_content = String::new();
+        for i in 0..200 {
+            file_content.push_str(&format!("fn f{}() {{}}\n", i));
+        }
+        std::fs::write(&src_file, &file_content).unwrap();
+
+        // 1. Unbounded read -> Macro read
+        let p_macro = PostReadParams {
+            file: &src_file,
+            start_line: None,
+            end_line: None,
+            raw_read_bytes: Some(file_content.len() as u64),
+            read_kind: None,
+        };
+        let _ = handle_post_read_request(p_macro, std::time::Instant::now(), &state).await;
+        assert_eq!(state.telemetry.macro_reads(), 1);
+        assert_eq!(state.telemetry.micro_reads(), 0);
+
+        // 2. Bounded read (lines 10..40, 31 lines <= 150) -> Micro read
+        let p_micro = PostReadParams {
+            file: &src_file,
+            start_line: Some(10),
+            end_line: Some(40),
+            raw_read_bytes: Some(500),
+            read_kind: None,
+        };
+        let _ = handle_post_read_request(p_micro, std::time::Instant::now(), &state).await;
+        assert_eq!(state.telemetry.macro_reads(), 1);
+        assert_eq!(state.telemetry.micro_reads(), 1);
+
+        // 3. Explicit read_kind override
+        let p_explicit = PostReadParams {
+            file: &src_file,
+            start_line: None,
+            end_line: None,
+            raw_read_bytes: Some(500),
+            read_kind: Some(ReadKind::Micro),
+        };
+        let _ = handle_post_read_request(p_explicit, std::time::Instant::now(), &state).await;
+        assert_eq!(state.telemetry.macro_reads(), 1);
+        assert_eq!(state.telemetry.micro_reads(), 2);
+
+        // Check DaemonStatusInfo
+        let status = build_status_response(&state).await;
+        assert_eq!(status.macro_reads, 1);
+        assert_eq!(status.micro_reads, 2);
+        assert!(status.supplemental_context_bytes > 0);
+        assert_eq!(
+            status.supplemental_context_tokens,
+            status.supplemental_context_bytes / canon_core::span::EST_BYTES_PER_TOKEN
+        );
+        assert_eq!(status.workspaces.len(), 1);
+        assert_eq!(status.workspaces[0].macro_reads, 1);
+        assert_eq!(status.workspaces[0].micro_reads, 2);
     }
 
     #[tokio::test]

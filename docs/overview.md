@@ -482,9 +482,11 @@ Call Edges:     1,412 edges
 Contracts:      528 trait implementations
 Routes:         54 API endpoints
 File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
-Hooks Served:   42 requests
-Context Bloat:  1.84 MB raw -> 198.2 KB delivered (89.2% reduction)
-Tokens Saved:   ~410,450 tokens (est. 4B/token)
+Hooks Served:   42 requests (38 submitted, 4 omitted)
+Drop Telemetry: 2 call graphs pruned, 2 AST skeletons dropped
+Read Operations:      42 requests (6 macro, 36 micro, 85.7% micro)
+Supplemental Context: 198.2 KB delivered (~49,550 tokens, est. 4B/token)
+Raw Source Inspected: 1.84 MB (advisory ratio: 10.8%)
 ```
 
 For machine-readable JSON integration in CI or agent sidecars:
@@ -504,6 +506,10 @@ cargo canon daemon --status --json
   "total_symbols": 4230,
   "total_routes": 54,
   "hooks_served": 42,
+  "macro_reads": 6,
+  "micro_reads": 36,
+  "supplemental_context_bytes": 208115,
+  "supplemental_context_tokens": 52028,
   "raw_bytes_served": 1929380,
   "delivered_bytes_served": 208115,
   "bytes_saved": 1721265,
@@ -528,9 +534,11 @@ Call Edges:     0 edges
 Contracts:      4 trait implementations
 Routes:         39 API endpoints
 File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
-Hooks Served:   58 requests
-Context Bloat:  733.1 KB raw -> 94.7 KB delivered (87.1% reduction)
-Tokens Saved:   ~163,415 tokens (est. 4B/token)
+Hooks Served:   58 requests (52 submitted, 6 omitted)
+Drop Telemetry: 4 call graphs pruned, 2 AST skeletons dropped
+Read Operations:      58 requests (8 macro, 50 micro, 86.2% micro)
+Supplemental Context: 94.7 KB delivered (~23,675 tokens, est. 4B/token)
+Raw Source Inspected: 733.1 KB (advisory ratio: 12.9%)
 ```
 
 #### Empirical Analysis

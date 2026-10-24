@@ -10,7 +10,8 @@ use canon_core::diagnostics::{error, info_banner, success};
 use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
 use canon_core::span::{
-    AgentVendor, ReadBudgetEnv, ReadSpan, detect_budget_env, parse_hook_stdin, resolve_read_budget,
+    AgentVendor, ReadBudgetEnv, ReadKind, ReadSpan, detect_budget_env, parse_hook_stdin,
+    resolve_read_budget,
 };
 use canon_core::workspace::{
     resolve_active_socket, resolve_connected_socket, resolve_global_socket, resolve_workspace_root,
@@ -1181,6 +1182,11 @@ async fn handle_daemon_hook_post_read(
     let (start_line, end_line, raw_read_bytes) =
         compute_hook_read_metrics(&file, &span, &budget_env);
 
+    let total_lines = std::fs::read_to_string(&file)
+        .map(|c| c.split_inclusive('\n').count())
+        .unwrap_or(0);
+    let read_kind = span.classify(total_lines);
+
     let target_dir = if let Some(parent) = file.parent() {
         if parent.as_os_str().is_empty() {
             current_dir
@@ -1204,6 +1210,7 @@ async fn handle_daemon_hook_post_read(
                 start_line,
                 end_line,
                 raw_read_bytes,
+                read_kind: Some(read_kind),
             },
         )
         .await
@@ -1232,7 +1239,13 @@ async fn handle_daemon_hook_post_read(
             let fallback_prov =
                 "<!-- canon-context-provenance: in-process-fallback (daemon unreachable) -->"
                     .to_string();
-            let adv = execute_in_process_fallback(&file, start_line, end_line, raw_read_bytes)?;
+            let adv = execute_in_process_fallback(
+                &file,
+                start_line,
+                end_line,
+                raw_read_bytes,
+                read_kind,
+            )?;
             (adv, fallback_prov)
         }
     };
@@ -1251,13 +1264,28 @@ fn execute_in_process_fallback(
     start_line: Option<usize>,
     end_line: Option<usize>,
     raw_read_bytes: Option<u64>,
+    read_kind: ReadKind,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    tracing::warn!("Daemon offline or unreachable, falling back to in-process slicing");
+    let kind_tag = match read_kind {
+        ReadKind::Macro => "MACRO",
+        ReadKind::Micro => "MICRO",
+    };
+    tracing::warn!(
+        "[{kind_tag}] Daemon offline or unreachable, falling back to in-process slicing"
+    );
     let bundle = execute_post_read_bundle(file, None)?;
     let budget = raw_read_bytes.unwrap_or_else(|| std::fs::metadata(file).map_or(0, |m| m.len()));
     let fitted = bundle.fit_to_budget(budget);
     match fitted.stage {
-        canon_slice::BudgetStage::Full => {}
+        canon_slice::BudgetStage::Full => {
+            let range_str = format_range(start_line, end_line);
+            tracing::info!(
+                "[{kind_tag}] PostReadHook served advisory context ({} B) for '{}'{}",
+                fitted.pruned_len,
+                file.display(),
+                range_str
+            );
+        }
         canon_slice::BudgetStage::CallGraphPruned => {
             let full_len = fitted.full_len.unwrap_or(fitted.pruned_len);
             let reduction = if budget > 0 {
@@ -1267,7 +1295,7 @@ fn execute_in_process_fallback(
             };
             let range_str = format_range(start_line, end_line);
             tracing::warn!(
-                "PostReadHook pruned call graph: bundle ({} B) >= read request ({} B), retained skeleton ({} B, {:.1}% reduction) for '{}'{}",
+                "[{kind_tag}] PostReadHook pruned call graph: bundle ({} B) >= read request ({} B), retained skeleton ({} B, {:.1}% reduction) for '{}'{}",
                 full_len,
                 budget,
                 fitted.pruned_len,
@@ -1279,7 +1307,7 @@ fn execute_in_process_fallback(
         canon_slice::BudgetStage::Dropped => {
             let range_str = format_range(start_line, end_line);
             tracing::warn!(
-                "PostReadHook dropped all advisory context: skeleton ({} B) >= read request ({} B) for '{}'{}",
+                "[{kind_tag}] PostReadHook dropped all advisory context: skeleton ({} B) >= read request ({} B) for '{}'{}",
                 fitted.pruned_len,
                 budget,
                 file.display(),
@@ -1465,5 +1493,19 @@ mod tests {
         assert_eq!(start, Some(1));
         assert_eq!(end, Some(3));
         assert_eq!(raw_bytes, Some(21));
+    }
+
+    #[test]
+    fn test_execute_in_process_fallback_runs_cleanly() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".rs")
+            .tempfile()
+            .expect("create temp file");
+        std::fs::write(tmp.path(), "pub fn test_hello() -> bool { true }\n").expect("write file");
+        let result =
+            execute_in_process_fallback(tmp.path(), None, None, Some(10_000), ReadKind::Macro);
+        assert!(result.is_ok());
+        let markdown = result.unwrap();
+        assert!(markdown.contains("test_hello"));
     }
 }

@@ -163,6 +163,7 @@ impl BetaService {
         start_line: None,
         end_line: None,
         raw_read_bytes: None,
+        read_kind: None,
     };
     let resp_main = send_daemon_request(&socket_main, req_main).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_main {
@@ -184,6 +185,7 @@ impl BetaService {
         start_line: None,
         end_line: None,
         raw_read_bytes: None,
+        read_kind: None,
     };
     let resp_wt = send_daemon_request(&socket_wt, req_wt).await.unwrap();
     if let DaemonResponse::AdvisoryContext { advisory_block, .. } = resp_wt {
@@ -224,6 +226,7 @@ impl BetaService {
             start_line: None,
             end_line: None,
             raw_read_bytes: None,
+            read_kind: None,
         },
     )
     .await

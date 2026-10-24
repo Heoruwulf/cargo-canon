@@ -192,6 +192,7 @@ async fn claude_micro_read_records_exact_slice_bytes() {
             start_line,
             end_line,
             raw_read_bytes,
+            read_kind: None,
         },
     )
     .await
@@ -261,6 +262,7 @@ async fn claude_omitted_bounds_apply_eof_and_token_cap() {
             start_line,
             end_line,
             raw_read_bytes,
+            read_kind: None,
         },
     )
     .await
@@ -328,6 +330,7 @@ async fn agy_micro_read_records_exact_slice_bytes() {
             start_line,
             end_line,
             raw_read_bytes,
+            read_kind: None,
         },
     )
     .await
@@ -390,6 +393,7 @@ async fn agy_omitted_lines_apply_default_800_lines_and_46kb_cap() {
             start_line,
             end_line,
             raw_read_bytes,
+            read_kind: None,
         },
     )
     .await
@@ -461,6 +465,7 @@ async fn two_stage_adaptive_bloat_guard_stages() {
             start_line: Some(1),
             end_line: Some(5),
             raw_read_bytes: Some(350),
+            read_kind: None,
         },
     )
     .await
@@ -512,6 +517,7 @@ async fn two_stage_adaptive_bloat_guard_stages() {
             start_line: Some(1),
             end_line: Some(2),
             raw_read_bytes: Some(30),
+            read_kind: None,
         },
     )
     .await
@@ -550,6 +556,7 @@ async fn two_stage_adaptive_bloat_guard_stages() {
             start_line: Some(1),
             end_line: Some(50),
             raw_read_bytes: Some(3000),
+            read_kind: None,
         },
     )
     .await
@@ -603,6 +610,7 @@ async fn test_explicit_zero_byte_budget_drops_advisory() {
             start_line: None,
             end_line: None,
             raw_read_bytes: Some(0),
+            read_kind: None,
         },
     )
     .await
@@ -640,6 +648,7 @@ async fn test_legacy_none_budget_on_tiny_file_drops_advisory() {
             start_line: None,
             end_line: None,
             raw_read_bytes: None,
+            read_kind: None,
         },
     )
     .await
@@ -682,6 +691,7 @@ async fn test_no_call_graph_oversized_bundle_drops_not_prunes() {
             start_line: Some(1),
             end_line: Some(2),
             raw_read_bytes: Some(10),
+            read_kind: None,
         },
     )
     .await

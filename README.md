@@ -292,7 +292,7 @@ cargo canon daemon --config ~/.config/canon/canon.toml
 # Probe running daemon liveness and report round-trip latency
 cargo canon daemon --ping
 
-# Query running daemon status, active workspace registry, memory (MB), and context bloat reduction
+# Query running daemon status, active workspace registry, memory (MB), and supplemental context telemetry
 cargo canon daemon --status
 
 # Export machine-readable status with full workspace breakdown and telemetry in JSON
@@ -313,11 +313,11 @@ cargo canon daemon --hook-post-read --file backend/pkg/service/user.go
 
 #### Multi-Tenant Operational Telemetry & Memory in Megabytes
 
-The daemon tracks Resident Set Size (RSS) memory consumption globally and per-workspace heap consumption in Megabytes, providing ground-truth operational visibility into context savings without adding request latency:
+The daemon tracks Resident Set Size (RSS) memory consumption globally, per-workspace heap consumption in Megabytes, and read categorization (macro vs. micro reads), providing ground-truth operational visibility into supplemental context delivery without adding request latency:
 
-- **Source of Truth:** Exact raw bytes processed vs. delivered advisory context bytes.
-- **Tokens Saved:** Conservative estimate derived from empirical code ratios ($\approx 4\text{ bytes/token}$).
-- **Non-Negative Clamping:** Prevents negative bloat anomalies on small files with headers.
+- **Macro vs. Micro Reads:** Tracks whether file reads are whole-file structural sweeps (Macro) or targeted function/block inspections $\le 150$ lines (Micro).
+- **Supplemental Context Delivered:** Ground-truth measurement of out-of-band advisory context (AST skeletons, trait contracts, call graphs) delivered in bytes and estimated tokens ($\approx 4\text{ bytes/token}$).
+- **Advisory Ratio:** Exact percentage of supplemental context delivered relative to raw source code inspected.
 
 Sample human-readable status table (`cargo canon daemon --status`):
 
@@ -325,6 +325,8 @@ Sample human-readable status table (`cargo canon daemon --status`):
 Canon Daemon Status: Active
 PID:            48210
 Uptime:         12m 45s
+Config Path:    /home/user/.config/canon/canon.toml
+Declared Projects: 2
 Socket Path:    /run/user/1000/canon/daemon.sock
 Main Daemon Log: /home/user/.local/state/canon/logs/daemon-20261020-174724.log
 Memory RSS:     48.2 MB
@@ -337,14 +339,16 @@ Routes:         48 API endpoints
 File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
 
 Active Workspace Registry:
-  WORKSPACE                        TYPE    FILES    SYMBOLS     MEMORY  LOG FILE                           ACCESSED
-  ----------------------------------------------------------------------------------------------------------------
-  /projects/cargo-canon            Repo      142      3,810     2.4 MB  cargo-canon-cbf29ce48422.log         4s ago
-  .../.claude/worktrees/feat1      WkTr       12        210     0.4 MB  feat1-8a9b1c2d3e4f.log              18s ago
+  WORKSPACE                    PROJECT          TYPE    FILES    SYMBOLS     MEMORY  SUBMIT  CG_DROP  AST_DROP   MACRO   MICRO  MICRO%  CONFIG                   LOG FILE                      ACCESSED
+  --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  /projects/cargo-canon        cargo-canon      Repo      142      3,810     2.4 MB      30        2         3       5      30   85.7%  canon.toml               cargo-canon-cbf29ce48422.log    4s ago
+  .../.claude/worktrees/feat1  feat1            WkTr       12        210     0.4 MB       0        0         0       0       0       -  canon.toml               feat1-8a9b1c2d3e4f.log         18s ago
 
-Hooks Served:   35 requests
-Context Bloat:  1.24 MB raw -> 142.6 KB delivered (88.5% reduction)
-Tokens Saved:   ~275,340 tokens (est. 4B/token)
+Hooks Served:   35 requests (30 submitted, 5 omitted)
+Drop Telemetry: 2 call graphs pruned, 3 AST skeletons dropped
+Read Operations:      35 requests (5 macro, 30 micro, 85.7% micro)
+Supplemental Context: 142.6 KB delivered (~35,650 tokens, est. 4B/token)
+Raw Source Inspected: 1.24 MB (advisory ratio: 11.5%)
 ```
 
 #### Multi-Tier Structured Logging

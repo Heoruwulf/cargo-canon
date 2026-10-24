@@ -51,6 +51,30 @@ pub const DEFAULT_AGY_END_LINE: usize = 800;
 /// Note: first-party tool schema; not published on vendor website as of 2026-10-23; applied as a secondary cap.
 pub const DEFAULT_AGY_BYTE_LIMIT: u64 = 46_080;
 
+/// Maximum number of lines in a bounded read to qualify as a [`ReadKind::Micro`] read.
+pub const MICRO_READ_MAX_LINES: usize = 150;
+
+/// Classification of an agent read operation as macro (structural/broad) or micro (focused/bounded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadKind {
+    /// Broad or unbounded structural read sweep.
+    #[serde(alias = "Macro")]
+    Macro,
+    /// Focused or bounded line inspection (<= 150 lines).
+    #[serde(alias = "Micro")]
+    Micro,
+}
+
+impl fmt::Display for ReadKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Macro => write!(f, "macro"),
+            Self::Micro => write!(f, "micro"),
+        }
+    }
+}
+
 /// AI coding agent vendor identity used to apply default read window bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +238,45 @@ impl ReadSpan {
             after_offset.min(DEFAULT_AGY_BYTE_LIMIT)
         } else {
             after_offset
+        }
+    }
+
+    /// Classifies this read operation as either a [`ReadKind::Macro`] sweep or [`ReadKind::Micro`] inspection.
+    ///
+    /// Rules:
+    /// - If `total_lines == 0` or bounds are omitted (`offset`, `limit`, `start_line`, and `end_line` are all `None`), returns [`ReadKind::Macro`].
+    /// - If effective lines read >= `total_lines`, returns [`ReadKind::Macro`].
+    /// - If bounded intent and effective lines read <= [`MICRO_READ_MAX_LINES`], returns [`ReadKind::Micro`].
+    /// - Otherwise (bounded intent > 150 lines), returns [`ReadKind::Macro`].
+    #[must_use]
+    pub fn classify(&self, total_lines: usize) -> ReadKind {
+        if total_lines == 0 {
+            return ReadKind::Macro;
+        }
+
+        let bounds_omitted = self.offset.is_none()
+            && self.limit.is_none()
+            && self.start_line.is_none()
+            && self.end_line.is_none();
+
+        if bounds_omitted {
+            return ReadKind::Macro;
+        }
+
+        let (start, end) = self.effective_range(total_lines);
+        if start == 0 {
+            return ReadKind::Macro;
+        }
+
+        let lines_read = end.saturating_sub(start).saturating_add(1);
+        if lines_read >= total_lines {
+            return ReadKind::Macro;
+        }
+
+        if lines_read <= MICRO_READ_MAX_LINES {
+            ReadKind::Micro
+        } else {
+            ReadKind::Macro
         }
     }
 }
@@ -945,5 +1008,128 @@ mod tests {
         let parsed_err = parse_hook_stdin(json_err).expect("parse view_file payload with error");
         assert_eq!(parsed_err.file_path, Some(PathBuf::from("/abs/a.rs")));
         assert!(parsed_err.tool_error);
+    }
+
+    #[test]
+    fn test_classify_claude_unbounded_and_bounded() {
+        // Claude unbounded read -> Macro
+        let unbounded = ReadSpan {
+            vendor: Some(AgentVendor::Claude),
+            ..Default::default()
+        };
+        assert_eq!(unbounded.classify(1000), ReadKind::Macro);
+        assert_eq!(unbounded.classify(50), ReadKind::Macro);
+
+        // Claude micro-read (offset: 140, limit: 30) on 500-line file -> Micro
+        let micro = ReadSpan {
+            offset: Some(140),
+            limit: Some(30),
+            vendor: Some(AgentVendor::Claude),
+            ..Default::default()
+        };
+        assert_eq!(micro.classify(500), ReadKind::Micro);
+
+        // Claude large bounded read (limit: 2000) on 5000-line file -> Macro
+        let large_bounded = ReadSpan {
+            offset: Some(1),
+            limit: Some(2000),
+            vendor: Some(AgentVendor::Claude),
+            ..Default::default()
+        };
+        assert_eq!(large_bounded.classify(5000), ReadKind::Macro);
+    }
+
+    #[test]
+    fn test_classify_agy_unbounded_and_bounded() {
+        // AGY unbounded read (StartLine/EndLine omitted) -> Macro
+        let unbounded = ReadSpan {
+            vendor: Some(AgentVendor::Agy),
+            ..Default::default()
+        };
+        assert_eq!(unbounded.classify(1000), ReadKind::Macro);
+
+        // AGY micro-read (StartLine: 40, EndLine: 60 = 21 lines) on 200-line file -> Micro
+        let micro = ReadSpan {
+            start_line: Some(40),
+            end_line: Some(60),
+            vendor: Some(AgentVendor::Agy),
+            ..Default::default()
+        };
+        assert_eq!(micro.classify(200), ReadKind::Micro);
+
+        // AGY bounded read exceeding 150 lines (StartLine: 1, EndLine: 160) on 500-line file -> Macro
+        let large = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(160),
+            vendor: Some(AgentVendor::Agy),
+            ..Default::default()
+        };
+        assert_eq!(large.classify(500), ReadKind::Macro);
+    }
+
+    #[test]
+    fn test_classify_small_files_and_edge_cases() {
+        // Whole-file read on small file (15 lines, bounded read 1..=15) -> Macro
+        let small_full = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(15),
+            ..Default::default()
+        };
+        assert_eq!(small_full.classify(15), ReadKind::Macro);
+
+        // Whole-file read via offset/limit on small file (<= 20 lines) -> Macro
+        let small_full_limit = ReadSpan {
+            offset: Some(1),
+            limit: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(small_full_limit.classify(20), ReadKind::Macro);
+        assert_eq!(small_full_limit.classify(10), ReadKind::Macro);
+
+        // Partial bounded read on small file (lines 1..=5 of 20) -> Micro
+        let small_partial = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(small_partial.classify(20), ReadKind::Micro);
+
+        // Zero total lines -> Macro
+        assert_eq!(small_partial.classify(0), ReadKind::Macro);
+        assert_eq!(ReadSpan::default().classify(0), ReadKind::Macro);
+
+        // Exactly 150 lines read on a larger file -> Micro
+        let exactly_150 = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(150),
+            ..Default::default()
+        };
+        assert_eq!(exactly_150.classify(500), ReadKind::Micro);
+
+        // 151 lines read on a larger file -> Macro
+        let exactly_151 = ReadSpan {
+            start_line: Some(1),
+            end_line: Some(151),
+            ..Default::default()
+        };
+        assert_eq!(exactly_151.classify(500), ReadKind::Macro);
+    }
+
+    #[test]
+    fn test_read_kind_serde_and_display() {
+        assert_eq!(ReadKind::Macro.to_string(), "macro");
+        assert_eq!(ReadKind::Micro.to_string(), "micro");
+
+        let json_macro = serde_json::to_string(&ReadKind::Macro).unwrap();
+        assert_eq!(json_macro, "\"macro\"");
+
+        let de_macro: ReadKind = serde_json::from_str("\"macro\"").unwrap();
+        assert_eq!(de_macro, ReadKind::Macro);
+
+        let de_macro_alias: ReadKind = serde_json::from_str("\"Macro\"").unwrap();
+        assert_eq!(de_macro_alias, ReadKind::Macro);
+
+        let de_micro_alias: ReadKind = serde_json::from_str("\"Micro\"").unwrap();
+        assert_eq!(de_micro_alias, ReadKind::Micro);
     }
 }

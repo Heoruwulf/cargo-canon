@@ -40,6 +40,10 @@ pub struct WorkspaceEntry {
     pub callgraph_drops: AtomicU64,
     /// Total times advisory context was completely omitted due to bloat.
     pub ast_drops: AtomicU64,
+    /// Total macro reads (broad or unbounded file sweeps).
+    pub macro_reads: AtomicU64,
+    /// Total micro reads (focused inspections <= 150 lines).
+    pub micro_reads: AtomicU64,
     /// Timestamp of last activity or hook evaluation.
     last_accessed: std::sync::Mutex<std::time::Instant>,
 }
@@ -67,6 +71,8 @@ impl WorkspaceEntry {
             submissions: AtomicU64::new(0),
             callgraph_drops: AtomicU64::new(0),
             ast_drops: AtomicU64::new(0),
+            macro_reads: AtomicU64::new(0),
+            micro_reads: AtomicU64::new(0),
             last_accessed: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -124,6 +130,18 @@ impl WorkspaceEntry {
         self.ast_drops.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the count for the given read kind (macro vs micro).
+    pub fn record_read(&self, kind: canon_core::ReadKind) {
+        match kind {
+            canon_core::ReadKind::Macro => {
+                self.macro_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            canon_core::ReadKind::Micro => {
+                self.micro_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Returns the total successful submissions count for this workspace.
     pub fn submissions(&self) -> u64 {
         self.submissions.load(Ordering::Relaxed)
@@ -137,6 +155,16 @@ impl WorkspaceEntry {
     /// Returns the total AST context omission count for this workspace.
     pub fn ast_drops(&self) -> u64 {
         self.ast_drops.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total macro reads count for this workspace.
+    pub fn macro_reads(&self) -> u64 {
+        self.macro_reads.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total micro reads count for this workspace.
+    pub fn micro_reads(&self) -> u64 {
+        self.micro_reads.load(Ordering::Relaxed)
     }
 }
 
@@ -770,14 +798,21 @@ pub mod tests {
         assert_eq!(entry.submissions(), 0);
         assert_eq!(entry.callgraph_drops(), 0);
         assert_eq!(entry.ast_drops(), 0);
+        assert_eq!(entry.macro_reads(), 0);
+        assert_eq!(entry.micro_reads(), 0);
 
         entry.record_submission();
         entry.record_submission();
         entry.record_callgraph_drop();
         entry.record_ast_drop();
+        entry.record_read(canon_core::ReadKind::Macro);
+        entry.record_read(canon_core::ReadKind::Micro);
+        entry.record_read(canon_core::ReadKind::Micro);
 
         assert_eq!(entry.submissions(), 2);
         assert_eq!(entry.callgraph_drops(), 1);
         assert_eq!(entry.ast_drops(), 1);
+        assert_eq!(entry.macro_reads(), 1);
+        assert_eq!(entry.micro_reads(), 2);
     }
 }

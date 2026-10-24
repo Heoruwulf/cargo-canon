@@ -1,6 +1,7 @@
 //! Length-prefixed IPC messaging protocol for agent sidecar communication.
 
 use crate::error::DaemonError;
+use canon_core::ReadKind;
 use canon_core::model::SliceMode;
 use canon_core::output::OutputFormat;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ pub enum DaemonRequest {
         /// Optional actual byte count read by the agent (after line range & vendor limits).
         #[serde(default)]
         raw_read_bytes: Option<u64>,
+        /// Optional pre-classified read kind (Micro vs Macro read).
+        #[serde(default)]
+        read_kind: Option<ReadKind>,
     },
     /// Request AST slice for file.
     Slice {
@@ -75,6 +79,12 @@ pub struct WorkspaceSummary {
     /// Total times advisory context was completely omitted due to bloat.
     #[serde(default)]
     pub ast_drops: u64,
+    /// Total macro reads (unbounded or >150 lines) served for this workspace.
+    #[serde(default)]
+    pub macro_reads: u64,
+    /// Total micro reads (<= 150 lines bounded) served for this workspace.
+    #[serde(default)]
+    pub micro_reads: u64,
 }
 
 /// Detailed runtime statistics and index telemetry.
@@ -158,6 +168,18 @@ pub struct DaemonStatusInfo {
     /// Estimated LLM tokens saved across all requests (~4 bytes per token).
     #[serde(default)]
     pub est_tokens_saved: u64,
+    /// Total macro reads served across all workspaces.
+    #[serde(default)]
+    pub macro_reads: u64,
+    /// Total micro reads served across all workspaces.
+    #[serde(default)]
+    pub micro_reads: u64,
+    /// Total supplemental context delivered in bytes across all requests.
+    #[serde(default)]
+    pub supplemental_context_bytes: u64,
+    /// Estimated tokens of supplemental context delivered (~4 bytes per token).
+    #[serde(default)]
+    pub supplemental_context_tokens: u64,
 }
 
 /// IPC response sent from daemon back to agent tool or CLI client.
@@ -277,6 +299,8 @@ mod tests {
                 submissions: 3,
                 callgraph_drops: 1,
                 ast_drops: 0,
+                macro_reads: 1,
+                micro_reads: 2,
             }],
             workspace_root: PathBuf::from("/home/user/project"),
             indexed_files: 10,
@@ -294,6 +318,10 @@ mod tests {
             bytes_saved: 8000,
             token_reduction_pct: 80.0,
             est_tokens_saved: 2000,
+            macro_reads: 1,
+            micro_reads: 2,
+            supplemental_context_bytes: 2000,
+            supplemental_context_tokens: 500,
         };
         let resp = DaemonResponse::Status(status.clone());
         write_message(&mut buf, &resp).await.unwrap();
@@ -341,6 +369,10 @@ mod tests {
         assert_eq!(decoded.bytes_saved, 0);
         assert_eq!(decoded.token_reduction_pct, 0.0);
         assert_eq!(decoded.est_tokens_saved, 0);
+        assert_eq!(decoded.macro_reads, 0);
+        assert_eq!(decoded.micro_reads, 0);
+        assert_eq!(decoded.supplemental_context_bytes, 0);
+        assert_eq!(decoded.supplemental_context_tokens, 0);
     }
 
     #[test]
@@ -360,6 +392,8 @@ mod tests {
         assert_eq!(decoded.submissions, 0);
         assert_eq!(decoded.callgraph_drops, 0);
         assert_eq!(decoded.ast_drops, 0);
+        assert_eq!(decoded.macro_reads, 0);
+        assert_eq!(decoded.micro_reads, 0);
     }
 
     #[test]
@@ -372,11 +406,13 @@ mod tests {
                 start_line,
                 end_line,
                 raw_read_bytes,
+                read_kind,
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/test.rs"));
                 assert_eq!(start_line, None);
                 assert_eq!(end_line, None);
                 assert_eq!(raw_read_bytes, None);
+                assert_eq!(read_kind, None);
             }
             _ => panic!("Expected PostReadHook"),
         }
@@ -389,11 +425,31 @@ mod tests {
                 start_line,
                 end_line,
                 raw_read_bytes,
+                read_kind,
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/test.rs"));
                 assert_eq!(start_line, Some(10));
                 assert_eq!(end_line, Some(40));
                 assert_eq!(raw_read_bytes, Some(850));
+                assert_eq!(read_kind, None);
+            }
+            _ => panic!("Expected PostReadHook"),
+        }
+
+        let explicit_kind_json = r#"{"PostReadHook":{"file":"/tmp/test.rs","start_line":10,"end_line":40,"raw_read_bytes":850,"read_kind":"Micro"}}"#;
+        let decoded_kind: DaemonRequest = serde_json::from_str(explicit_kind_json).unwrap();
+        match decoded_kind {
+            DaemonRequest::PostReadHook { read_kind, .. } => {
+                assert_eq!(read_kind, Some(ReadKind::Micro));
+            }
+            _ => panic!("Expected PostReadHook"),
+        }
+
+        let macro_kind_json = r#"{"PostReadHook":{"file":"/tmp/test.rs","read_kind":"Macro"}}"#;
+        let decoded_macro: DaemonRequest = serde_json::from_str(macro_kind_json).unwrap();
+        match decoded_macro {
+            DaemonRequest::PostReadHook { read_kind, .. } => {
+                assert_eq!(read_kind, Some(ReadKind::Macro));
             }
             _ => panic!("Expected PostReadHook"),
         }

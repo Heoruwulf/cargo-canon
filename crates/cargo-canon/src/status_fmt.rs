@@ -99,6 +99,53 @@ pub(crate) fn format_drop_telemetry(cg_drops: u64, ast_drops: u64) -> String {
     )
 }
 
+pub(crate) fn format_read_operations(served: u64, macro_reads: u64, micro_reads: u64) -> String {
+    let total = if served > 0 {
+        served
+    } else {
+        macro_reads + micro_reads
+    };
+    let total_reads = macro_reads + micro_reads;
+    let micro_pct = if total_reads > 0 {
+        (micro_reads as f64 / total_reads as f64) * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "Read Operations:      {} requests ({} macro, {} micro, {:.1}% micro)",
+        format_with_commas(total as usize),
+        format_with_commas(macro_reads as usize),
+        format_with_commas(micro_reads as usize),
+        micro_pct
+    )
+}
+
+pub(crate) fn format_supplemental_context(bytes: u64, tokens: u64) -> String {
+    if bytes > 0 || tokens > 0 {
+        let est_tokens = if tokens > 0 { tokens } else { bytes / 4 };
+        format!(
+            "Supplemental Context: {} delivered (~{} tokens, est. 4B/token)",
+            format_bytes(bytes),
+            format_with_commas(est_tokens as usize)
+        )
+    } else {
+        "Supplemental Context: 0 B (no requests served yet)".to_string()
+    }
+}
+
+pub(crate) fn format_raw_source_inspected(raw_bytes: u64, supp_bytes: u64) -> String {
+    let ratio = if raw_bytes > 0 {
+        (supp_bytes as f64 / raw_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "Raw Source Inspected: {} (advisory ratio: {:.1}%)",
+        format_bytes(raw_bytes),
+        ratio
+    )
+}
+
 pub(crate) fn format_workspace_registry_row(ws: &WorkspaceSummary) -> String {
     let ws_type = if ws.is_worktree { "WkTr" } else { "Repo" };
     let root_trunc = truncate_tail(&ws.root.display().to_string(), 28);
@@ -117,8 +164,15 @@ pub(crate) fn format_workspace_registry_row(ws: &WorkspaceSummary) -> String {
         .unwrap_or("");
     let log_trunc = truncate_tail(log_str, 28);
     let accessed_str = format_time_ago(ws.last_accessed_secs_ago);
+    let total_reads = ws.macro_reads + ws.micro_reads;
+    let micro_pct_str = if total_reads > 0 {
+        let pct = (ws.micro_reads as f64 / total_reads as f64) * 100.0;
+        format!("{:.1}%", pct)
+    } else {
+        "-".to_string()
+    };
     format!(
-        "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>7.1} MB {:>7} {:>8} {:>9}  {:<24} {:<28} {:>8}",
+        "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>7.1} MB {:>7} {:>8} {:>9} {:>7} {:>7} {:>7}  {:<24} {:<28} {:>8}",
         root_trunc,
         proj_trunc,
         ws_type,
@@ -128,6 +182,9 @@ pub(crate) fn format_workspace_registry_row(ws: &WorkspaceSummary) -> String {
         format_with_commas(ws.submissions as usize),
         format_with_commas(ws.callgraph_drops as usize),
         format_with_commas(ws.ast_drops as usize),
+        format_with_commas(ws.macro_reads as usize),
+        format_with_commas(ws.micro_reads as usize),
+        micro_pct_str,
         cfg_trunc,
         log_trunc,
         accessed_str
@@ -188,7 +245,7 @@ pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
         print_workspace_registry_table(&status.workspaces);
     }
 
-    // --- Context Bloat Section ---
+    // --- Context Telemetry Section ---
     println!(
         "{}",
         format_hooks_served(status.hooks_served, status.submissions)
@@ -198,25 +255,34 @@ pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
             "{}",
             format_drop_telemetry(status.callgraph_drops, status.ast_drops)
         );
+        let supp_bytes = if status.supplemental_context_bytes > 0 {
+            status.supplemental_context_bytes
+        } else {
+            status.delivered_bytes_served
+        };
+        let supp_tokens = if status.supplemental_context_tokens > 0 {
+            status.supplemental_context_tokens
+        } else {
+            supp_bytes / 4
+        };
         println!(
-            "Context Bloat:  {} raw -> {} delivered ({:.1}% reduction)",
-            format_bytes(status.raw_bytes_served),
-            format_bytes(status.delivered_bytes_served),
-            status.token_reduction_pct
+            "{}",
+            format_read_operations(status.hooks_served, status.macro_reads, status.micro_reads)
         );
+        println!("{}", format_supplemental_context(supp_bytes, supp_tokens));
         println!(
-            "Tokens Saved:   ~{} tokens (est. 4B/token)",
-            format_with_commas(status.est_tokens_saved as usize)
+            "{}",
+            format_raw_source_inspected(status.raw_bytes_served, supp_bytes)
         );
     } else {
-        println!("Context Bloat:  0 B (no requests served yet)");
+        println!("{}", format_supplemental_context(0, 0));
     }
 }
 
 pub(crate) fn print_workspace_registry_table(workspaces: &[WorkspaceSummary]) {
     println!("\nActive Workspace Registry:");
     println!(
-        "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>10} {:>7} {:>8} {:>9}  {:<24} {:<28} {:>8}",
+        "  {:<28} {:<16} {:<6} {:>8} {:>10} {:>10} {:>7} {:>8} {:>9} {:>7} {:>7} {:>7}  {:<24} {:<28} {:>8}",
         "WORKSPACE",
         "PROJECT",
         "TYPE",
@@ -226,11 +292,14 @@ pub(crate) fn print_workspace_registry_table(workspaces: &[WorkspaceSummary]) {
         "SUBMIT",
         "CG_DROP",
         "AST_DROP",
+        "MACRO",
+        "MICRO",
+        "MICRO%",
         "CONFIG",
         "LOG FILE",
         "ACCESSED"
     );
-    println!("  {}", "-".repeat(176));
+    println!("  {}", "-".repeat(200));
     for ws in workspaces {
         println!("{}", format_workspace_registry_row(ws));
     }
@@ -287,8 +356,44 @@ mod tests {
     }
 
     #[test]
-    fn test_format_workspace_registry_row_includes_drop_columns() {
-        let ws = WorkspaceSummary {
+    fn test_format_read_operations() {
+        assert_eq!(
+            format_read_operations(0, 0, 0),
+            "Read Operations:      0 requests (0 macro, 0 micro, 0.0% micro)"
+        );
+        assert_eq!(
+            format_read_operations(8, 1, 7),
+            "Read Operations:      8 requests (1 macro, 7 micro, 87.5% micro)"
+        );
+    }
+
+    #[test]
+    fn test_format_supplemental_context() {
+        assert_eq!(
+            format_supplemental_context(0, 0),
+            "Supplemental Context: 0 B (no requests served yet)"
+        );
+        assert_eq!(
+            format_supplemental_context(2048, 512),
+            "Supplemental Context: 2.0 KB delivered (~512 tokens, est. 4B/token)"
+        );
+    }
+
+    #[test]
+    fn test_format_raw_source_inspected() {
+        assert_eq!(
+            format_raw_source_inspected(0, 0),
+            "Raw Source Inspected: 0 B (advisory ratio: 0.0%)"
+        );
+        assert_eq!(
+            format_raw_source_inspected(10240, 2048),
+            "Raw Source Inspected: 10.0 KB (advisory ratio: 20.0%)"
+        );
+    }
+
+    #[test]
+    fn test_format_workspace_registry_row_includes_drop_and_read_columns() {
+        let mut ws = WorkspaceSummary {
             root: PathBuf::from("/home/mark/projects/pgrust"),
             project_name: Some("pgrust".to_string()),
             is_worktree: false,
@@ -302,10 +407,20 @@ mod tests {
             submissions: 7,
             callgraph_drops: 8,
             ast_drops: 5,
+            macro_reads: 0,
+            micro_reads: 0,
         };
-        let row = format_workspace_registry_row(&ws);
-        assert!(row.contains("7"));
-        assert!(row.contains("8"));
-        assert!(row.contains("5"));
+        let row_zero = format_workspace_registry_row(&ws);
+        assert!(row_zero.contains("7"));
+        assert!(row_zero.contains("8"));
+        assert!(row_zero.contains("5"));
+        assert!(row_zero.contains("-"));
+
+        ws.macro_reads = 1;
+        ws.micro_reads = 7;
+        let row_active = format_workspace_registry_row(&ws);
+        assert!(row_active.contains("1"));
+        assert!(row_active.contains("7"));
+        assert!(row_active.contains("87.5%"));
     }
 }

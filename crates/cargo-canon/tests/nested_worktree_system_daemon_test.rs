@@ -173,6 +173,7 @@ impl WorktreeAuth {
             start_line: None,
             end_line: None,
             raw_read_bytes: None,
+            read_kind: None,
         },
     )
     .await
@@ -211,6 +212,7 @@ impl WorktreeAuth {
             start_line: None,
             end_line: None,
             raw_read_bytes: None,
+            read_kind: None,
         },
     )
     .await
@@ -368,6 +370,7 @@ ignored_dirs = [".claude"]
             start_line: None,
             end_line: None,
             raw_read_bytes: None,
+            read_kind: None,
         },
     )
     .await
@@ -380,6 +383,7 @@ ignored_dirs = [".claude"]
             start_line: None,
             end_line: None,
             raw_read_bytes: None,
+            read_kind: None,
         },
     )
     .await

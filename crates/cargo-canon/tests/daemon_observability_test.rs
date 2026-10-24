@@ -135,7 +135,7 @@ impl Runner for Service {
     assert!(status_str.contains("Indexed Files:  1 files"));
     assert!(status_str.contains("Total Symbols:"));
     assert!(status_str.contains("Hooks Served:   0 requests"));
-    assert!(status_str.contains("Context Bloat:  0 B (no requests served yet)"));
+    assert!(status_str.contains("Supplemental Context: 0 B (no requests served yet)"));
 
     // 3. Query initial status via --status --json: verify 0 hooks served initially
     let status_json_out = canon_cmd(canon_bin)
@@ -161,6 +161,10 @@ impl Runner for Service {
     assert_eq!(status_info.bytes_saved, 0);
     assert_eq!(status_info.token_reduction_pct, 0.0);
     assert_eq!(status_info.est_tokens_saved, 0);
+    assert_eq!(status_info.macro_reads, 0);
+    assert_eq!(status_info.micro_reads, 0);
+    assert_eq!(status_info.supplemental_context_bytes, 0);
+    assert_eq!(status_info.supplemental_context_tokens, 0);
 
     // 4. Hook post-read with live daemon (provenance: daemon)
     let hook_daemon_out = canon_cmd(canon_bin)
@@ -208,8 +212,12 @@ impl Runner for Service {
     assert!(post_status_info.bytes_saved > 0);
     assert!(post_status_info.token_reduction_pct > 0.0);
     assert!(post_status_info.est_tokens_saved > 0);
+    assert_eq!(post_status_info.macro_reads, 1);
+    assert_eq!(post_status_info.micro_reads, 0);
+    assert!(post_status_info.supplemental_context_bytes > 0);
+    assert!(post_status_info.supplemental_context_tokens > 0);
 
-    // 6. Query status post-hook via human table: verify formatted bloat lines
+    // 6. Query status post-hook via human table: verify formatted telemetry lines
     let status_post_table_out = canon_cmd(canon_bin)
         .args([
             "daemon",
@@ -224,9 +232,56 @@ impl Runner for Service {
     assert!(status_post_table_out.status.success());
     let post_table_str = String::from_utf8_lossy(&status_post_table_out.stdout);
     assert!(post_table_str.contains("Hooks Served:   1 requests"));
-    assert!(post_table_str.contains("Context Bloat:"));
-    assert!(post_table_str.contains("Tokens Saved:"));
-    assert!(post_table_str.contains("reduction)"));
+    assert!(post_table_str.contains("Read Operations:"));
+    assert!(post_table_str.contains("1 macro, 0 micro"));
+    assert!(post_table_str.contains("Supplemental Context:"));
+
+    // 6b. Issue a micro-read hook call (offset: 10, limit: 5) and verify micro_reads increments
+    let hook_micro_out = canon_cmd(canon_bin)
+        .args([
+            "daemon",
+            "--hook-post-read",
+            "--file",
+            test_file.to_str().unwrap(),
+            "--offset",
+            "10",
+            "--limit",
+            "5",
+            "--socket",
+            socket_path.to_str().unwrap(),
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("failed to execute canon daemon --hook-post-read micro");
+    assert!(hook_micro_out.status.success());
+
+    let status_post_micro_json_out = canon_cmd(canon_bin)
+        .args([
+            "daemon",
+            "--status",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(base.path())
+        .output()
+        .await
+        .expect("failed to execute canon daemon --status --json post-micro");
+    assert!(status_post_micro_json_out.status.success());
+    let post_micro_json_str = String::from_utf8_lossy(&status_post_micro_json_out.stdout);
+    let post_micro_status: DaemonStatusInfo =
+        serde_json::from_str(&post_micro_json_str).expect("post-micro status must be valid JSON");
+    assert_eq!(post_micro_status.hooks_served, 2);
+    assert_eq!(post_micro_status.macro_reads, 1);
+    assert_eq!(post_micro_status.micro_reads, 1);
+    assert!(
+        post_micro_status
+            .workspaces
+            .iter()
+            .any(|ws| ws.macro_reads == 1 && ws.micro_reads == 1),
+        "expected at least one workspace to record 1 macro and 1 micro read"
+    );
 
     // 7. Graceful shutdown via --stop
     let stop_out = canon_cmd(canon_bin)
