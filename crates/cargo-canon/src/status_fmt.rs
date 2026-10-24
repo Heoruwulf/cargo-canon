@@ -81,19 +81,21 @@ pub(crate) fn format_hooks_served(served: u64, submissions: u64) -> String {
     if served > 0 {
         let omitted = served.saturating_sub(submissions);
         format!(
-            "Hooks Served:   {} requests ({} submitted, {} omitted)",
+            "{:<22}{} requests ({} submitted, {} omitted)",
+            "Hooks Served:",
             format_with_commas(served as usize),
             format_with_commas(submissions as usize),
             format_with_commas(omitted as usize)
         )
     } else {
-        "Hooks Served:   0 requests".to_string()
+        format!("{:<22}0 requests", "Hooks Served:")
     }
 }
 
 pub(crate) fn format_drop_telemetry(cg_drops: u64, ast_drops: u64) -> String {
     format!(
-        "Drop Telemetry: {} call graphs pruned, {} AST skeletons dropped",
+        "{:<22}{} call graphs pruned, {} AST skeletons dropped",
+        "Drop Telemetry:",
         format_with_commas(cg_drops as usize),
         format_with_commas(ast_drops as usize)
     )
@@ -112,7 +114,8 @@ pub(crate) fn format_read_operations(served: u64, macro_reads: u64, micro_reads:
         0.0
     };
     format!(
-        "Read Operations:      {} requests ({} macro, {} micro, {:.1}% micro)",
+        "{:<22}{} requests ({} macro, {} micro, {:.1}% micro)",
+        "Read Operations:",
         format_with_commas(total as usize),
         format_with_commas(macro_reads as usize),
         format_with_commas(micro_reads as usize),
@@ -124,12 +127,16 @@ pub(crate) fn format_supplemental_context(bytes: u64, tokens: u64) -> String {
     if bytes > 0 || tokens > 0 {
         let est_tokens = if tokens > 0 { tokens } else { bytes / 4 };
         format!(
-            "Supplemental Context: {} delivered (~{} tokens, est. 4B/token)",
+            "{:<22}{} delivered (~{} tokens, est. 4B/token)",
+            "Supplemental Context:",
             format_bytes(bytes),
             format_with_commas(est_tokens as usize)
         )
     } else {
-        "Supplemental Context: 0 B (no requests served yet)".to_string()
+        format!(
+            "{:<22}0 B (no requests served yet)",
+            "Supplemental Context:"
+        )
     }
 }
 
@@ -140,7 +147,8 @@ pub(crate) fn format_raw_source_inspected(raw_bytes: u64, supp_bytes: u64) -> St
         0.0
     };
     format!(
-        "Raw Source Inspected: {} (advisory ratio: {:.1}%)",
+        "{:<22}{} (advisory ratio: {:.1}%)",
+        "Raw Source Inspected:",
         format_bytes(raw_bytes),
         ratio
     )
@@ -192,46 +200,65 @@ pub(crate) fn format_workspace_registry_row(ws: &WorkspaceSummary) -> String {
 }
 
 pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
-    println!("Canon Daemon Status: Active");
-    println!("PID:            {}", status.pid);
-    println!("Uptime:         {}", format_uptime(status.uptime_secs));
+    println!("Canon Daemon Status:  Active");
+    println!("{:<22}{}", "PID:", status.pid);
+    println!("{:<22}{}", "Uptime:", format_uptime(status.uptime_secs));
     if !status.daemon_mode.is_empty() {
-        println!("Daemon Mode:    {}", status.daemon_mode);
+        println!("{:<22}{}", "Daemon Mode:", status.daemon_mode);
     }
     let cfg_display = status
         .config_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "built-in defaults".to_string());
-    println!("Config Path:    {}", cfg_display);
-    println!("Declared Projects: {}", status.declared_projects_count);
-    println!("Socket Path:    {}", status.socket_path.display());
+    println!("{:<22}{}", "Config Path:", cfg_display);
+    println!(
+        "{:<22}{}",
+        "Declared Projects:", status.declared_projects_count
+    );
+    println!("{:<22}{}", "Socket Path:", status.socket_path.display());
     if !status.main_log_path.as_os_str().is_empty() {
-        println!("Main Daemon Log: {}", status.main_log_path.display());
+        println!(
+            "{:<22}{}",
+            "Main Daemon Log:",
+            status.main_log_path.display()
+        );
     }
-    println!("Memory RSS:     {:.1} MB", status.memory_rss_mb);
-    println!("Active Workspaces: {}", status.active_workspaces_count);
+    println!("{:<22}{:.1} MB", "Memory RSS:", status.memory_rss_mb);
+    println!(
+        "{:<22}{}",
+        "Active Workspaces:", status.active_workspaces_count
+    );
     if !status.workspace_root.as_os_str().is_empty() {
-        println!("Workspace Root: {}", status.workspace_root.display());
+        println!(
+            "{:<22}{}",
+            "Workspace Root:",
+            status.workspace_root.display()
+        );
     }
     println!(
-        "Indexed Files:  {} files",
+        "{:<22}{} files",
+        "Indexed Files:",
         format_with_commas(status.indexed_files)
     );
     println!(
-        "Total Symbols:  {} declarations",
+        "{:<22}{} declarations",
+        "Total Symbols:",
         format_with_commas(status.total_symbols)
     );
     println!(
-        "Call Edges:     {} edges",
+        "{:<22}{} edges",
+        "Call Edges:",
         format_with_commas(status.total_call_edges)
     );
     println!(
-        "Contracts:      {} trait implementations",
+        "{:<22}{} trait implementations",
+        "Contracts:",
         format_with_commas(status.total_contracts)
     );
     println!(
-        "Routes:         {} API endpoints",
+        "{:<22}{} API endpoints",
+        "Routes:",
         format_with_commas(status.total_routes)
     );
     let watcher_str = if status.watcher_active {
@@ -239,7 +266,7 @@ pub(crate) fn print_daemon_status_table(status: &DaemonStatusInfo) {
     } else {
         "Inactive"
     };
-    println!("File Watcher:   {}", watcher_str);
+    println!("{:<22}{}", "File Watcher:", watcher_str);
 
     if !status.workspaces.is_empty() {
         print_workspace_registry_table(&status.workspaces);
@@ -344,14 +371,17 @@ mod tests {
 
     #[test]
     fn test_format_hooks_served_and_drop_telemetry() {
-        assert_eq!(format_hooks_served(0, 0), "Hooks Served:   0 requests");
+        assert_eq!(
+            format_hooks_served(0, 0),
+            "Hooks Served:         0 requests"
+        );
         assert_eq!(
             format_hooks_served(23, 18),
-            "Hooks Served:   23 requests (18 submitted, 5 omitted)"
+            "Hooks Served:         23 requests (18 submitted, 5 omitted)"
         );
         assert_eq!(
             format_drop_telemetry(8, 5),
-            "Drop Telemetry: 8 call graphs pruned, 5 AST skeletons dropped"
+            "Drop Telemetry:       8 call graphs pruned, 5 AST skeletons dropped"
         );
     }
 

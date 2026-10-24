@@ -437,17 +437,19 @@ impl FeatRunner for FeatOneService {
         .expect("failed to execute canon daemon --status");
     assert!(status_table_out.status.success());
     let table_str = String::from_utf8_lossy(&status_table_out.stdout);
-    assert!(table_str.contains("Canon Daemon Status: Active"));
+    assert!(table_str.contains("Canon Daemon Status:  Active"));
     assert!(table_str.contains("Memory RSS:"));
-    assert!(table_str.contains("Active Workspaces: 3"));
+    assert!(table_str.contains("Active Workspaces:    3"));
     assert!(table_str.contains("Active Workspace Registry:"));
     assert!(table_str.contains("Repo"));
     assert!(table_str.contains("WkTr"));
     assert!(table_str.contains("SUBMIT"));
     assert!(table_str.contains("CG_DROP"));
     assert!(table_str.contains("AST_DROP"));
-    assert!(table_str.contains("Hooks Served:   3 requests (3 submitted, 0 omitted)"));
-    assert!(table_str.contains("Drop Telemetry: 0 call graphs pruned, 0 AST skeletons dropped"));
+    assert!(table_str.contains("Hooks Served:         3 requests (3 submitted, 0 omitted)"));
+    assert!(
+        table_str.contains("Drop Telemetry:       0 call graphs pruned, 0 AST skeletons dropped")
+    );
 
     // 9. Gracefully shutdown daemon via --stop
     let stop_out = canon_cmd(canon_bin)

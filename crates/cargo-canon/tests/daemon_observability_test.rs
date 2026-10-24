@@ -129,12 +129,12 @@ impl Runner for Service {
         .expect("failed to execute canon daemon --status");
     assert!(status_out.status.success(), "status must succeed");
     let status_str = String::from_utf8_lossy(&status_out.stdout);
-    assert!(status_str.contains("Canon Daemon Status: Active"));
+    assert!(status_str.contains("Canon Daemon Status:  Active"));
     assert!(status_str.contains("PID:"));
     assert!(status_str.contains("Uptime:"));
-    assert!(status_str.contains("Indexed Files:  1 files"));
+    assert!(status_str.contains("Indexed Files:        1 files"));
     assert!(status_str.contains("Total Symbols:"));
-    assert!(status_str.contains("Hooks Served:   0 requests"));
+    assert!(status_str.contains("Hooks Served:         0 requests"));
     assert!(status_str.contains("Supplemental Context: 0 B (no requests served yet)"));
 
     // 3. Query initial status via --status --json: verify 0 hooks served initially
@@ -231,7 +231,7 @@ impl Runner for Service {
         .expect("failed to execute canon daemon --status post-hook");
     assert!(status_post_table_out.status.success());
     let post_table_str = String::from_utf8_lossy(&status_post_table_out.stdout);
-    assert!(post_table_str.contains("Hooks Served:   1 requests"));
+    assert!(post_table_str.contains("Hooks Served:         1 requests"));
     assert!(post_table_str.contains("Read Operations:"));
     assert!(post_table_str.contains("1 macro, 0 micro"));
     assert!(post_table_str.contains("Supplemental Context:"));

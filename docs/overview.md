@@ -471,19 +471,19 @@ cargo canon daemon --status
 ```
 
 ```text
-Canon Daemon Status: Active
-PID:            48210
-Uptime:         24m 12s
-Socket Path:    /tmp/canon-9f8a3c2b1e4d.sock
-Workspace Root: /home/user/project
-Indexed Files:  186 files
-Total Symbols:  4,230 declarations
-Call Edges:     1,412 edges
-Contracts:      528 trait implementations
-Routes:         54 API endpoints
-File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
-Hooks Served:   42 requests (38 submitted, 4 omitted)
-Drop Telemetry: 2 call graphs pruned, 2 AST skeletons dropped
+Canon Daemon Status:  Active
+PID:                  48210
+Uptime:               24m 12s
+Socket Path:          /tmp/canon-9f8a3c2b1e4d.sock
+Workspace Root:       /home/user/project
+Indexed Files:        186 files
+Total Symbols:        4,230 declarations
+Call Edges:           1,412 edges
+Contracts:            528 trait implementations
+Routes:               54 API endpoints
+File Watcher:         Active (.rs, .ts, .tsx, .js, .jsx, .go)
+Hooks Served:         42 requests (38 submitted, 4 omitted)
+Drop Telemetry:       2 call graphs pruned, 2 AST skeletons dropped
 Read Operations:      42 requests (6 macro, 36 micro, 85.7% micro)
 Supplemental Context: 198.2 KB delivered (~49,550 tokens, est. 4B/token)
 Raw Source Inspected: 1.84 MB (advisory ratio: 10.8%)
@@ -523,19 +523,19 @@ cargo canon daemon --status --json
 Telemetry captured during an active 1.5-hour engineering session on `/home/user/workspace/polyglot-service` using the Antigravity CLI (`agy`) with `cargo canon daemon` serving advisory tool hooks:
 
 ```text
-Canon Daemon Status: Active
-PID:            49152
-Uptime:         1h 34m 59s
-Socket Path:    /tmp/canon-e2b1c4d8f0a3.sock
-Workspace Root: /home/user/workspace/polyglot-service
-Indexed Files:  119 files
-Total Symbols:  872 declarations
-Call Edges:     0 edges
-Contracts:      4 trait implementations
-Routes:         39 API endpoints
-File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
-Hooks Served:   58 requests (52 submitted, 6 omitted)
-Drop Telemetry: 4 call graphs pruned, 2 AST skeletons dropped
+Canon Daemon Status:  Active
+PID:                  49152
+Uptime:               1h 34m 59s
+Socket Path:          /tmp/canon-e2b1c4d8f0a3.sock
+Workspace Root:       /home/user/workspace/polyglot-service
+Indexed Files:        119 files
+Total Symbols:        872 declarations
+Call Edges:           0 edges
+Contracts:            4 trait implementations
+Routes:               39 API endpoints
+File Watcher:         Active (.rs, .ts, .tsx, .js, .jsx, .go)
+Hooks Served:         58 requests (52 submitted, 6 omitted)
+Drop Telemetry:       4 call graphs pruned, 2 AST skeletons dropped
 Read Operations:      58 requests (8 macro, 50 micro, 86.2% micro)
 Supplemental Context: 94.7 KB delivered (~23,675 tokens, est. 4B/token)
 Raw Source Inspected: 733.1 KB (advisory ratio: 12.9%)

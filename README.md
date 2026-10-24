@@ -322,21 +322,21 @@ The daemon tracks Resident Set Size (RSS) memory consumption globally, per-works
 Sample human-readable status table (`cargo canon daemon --status`):
 
 ```text
-Canon Daemon Status: Active
-PID:            48210
-Uptime:         12m 45s
-Config Path:    /home/user/.config/canon/canon.toml
-Declared Projects: 2
-Socket Path:    /run/user/1000/canon/daemon.sock
-Main Daemon Log: /home/user/.local/state/canon/logs/daemon-20261020-174724.log
-Memory RSS:     48.2 MB
-Active Workspaces: 2
-Indexed Files:  142 files
-Total Symbols:  3,810 declarations
-Call Edges:     1,124 edges
-Contracts:      456 trait implementations
-Routes:         48 API endpoints
-File Watcher:   Active (.rs, .ts, .tsx, .js, .jsx, .go)
+Canon Daemon Status:  Active
+PID:                  48210
+Uptime:               12m 45s
+Config Path:          /home/user/.config/canon/canon.toml
+Declared Projects:    2
+Socket Path:          /run/user/1000/canon/daemon.sock
+Main Daemon Log:      /home/user/.local/state/canon/logs/daemon-20261020-174724.log
+Memory RSS:           48.2 MB
+Active Workspaces:    2
+Indexed Files:        142 files
+Total Symbols:        3,810 declarations
+Call Edges:           1,124 edges
+Contracts:            456 trait implementations
+Routes:               48 API endpoints
+File Watcher:         Active (.rs, .ts, .tsx, .js, .jsx, .go)
 
 Active Workspace Registry:
   WORKSPACE                    PROJECT          TYPE    FILES    SYMBOLS     MEMORY  SUBMIT  CG_DROP  AST_DROP   MACRO   MICRO  MICRO%  CONFIG                   LOG FILE                      ACCESSED
@@ -344,8 +344,8 @@ Active Workspace Registry:
   /projects/cargo-canon        cargo-canon      Repo      142      3,810     2.4 MB      30        2         3       5      30   85.7%  canon.toml               cargo-canon-cbf29ce48422.log    4s ago
   .../.claude/worktrees/feat1  feat1            WkTr       12        210     0.4 MB       0        0         0       0       0       -  canon.toml               feat1-8a9b1c2d3e4f.log         18s ago
 
-Hooks Served:   35 requests (30 submitted, 5 omitted)
-Drop Telemetry: 2 call graphs pruned, 3 AST skeletons dropped
+Hooks Served:         35 requests (30 submitted, 5 omitted)
+Drop Telemetry:       2 call graphs pruned, 3 AST skeletons dropped
 Read Operations:      35 requests (5 macro, 30 micro, 85.7% micro)
 Supplemental Context: 142.6 KB delivered (~35,650 tokens, est. 4B/token)
 Raw Source Inspected: 1.24 MB (advisory ratio: 11.5%)
