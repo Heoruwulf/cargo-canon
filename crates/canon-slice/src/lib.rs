@@ -290,7 +290,7 @@ mod tests {
 
         let bundle = slice_target(file.path(), SliceMode::Bundle, None).unwrap();
         assert!(bundle.skeleton.contains("pub struct Worker"));
-        assert!(bundle.skeleton.contains("pub fn run (& self)"));
+        assert!(bundle.skeleton.contains("pub fn run(&self)"));
         assert!(!bundle.skeleton.contains("Heavy iteration"));
         assert!(bundle.token_reduction_pct > 30.0);
     }
@@ -440,7 +440,7 @@ mod tests {
         .unwrap();
 
         assert!(bundle.skeleton.contains("pub struct Service"));
-        assert!(bundle.skeleton.contains("pub fn overlay_call ()"));
+        assert!(bundle.skeleton.contains("pub fn overlay_call()"));
 
         // Overlay contracts fallback
         let contracts = overlay_index.get_contracts_with_fallback(Some(&base_index), "Service");
